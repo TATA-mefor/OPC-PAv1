@@ -120,6 +120,189 @@ def test_migration_failure_rolls_back(isolated_env, monkeypatch):
     assert db.current_version(conn) == 1  # m001 已成功独立提交，坏迁移未记录
 
 
+def test_m001_midway_failure_full_rollback(isolated_env, monkeypatch):
+    """M1 审查修复：初始建表迁移中途失败 → 所有业务表/索引/版本记录全部回滚。"""
+    real_stmts = db._m001_statements()
+    assert len(real_stmts) >= 13  # 7 表 + 6 索引
+    cut = len(real_stmts) // 2    # 在 tasks/schedules 等已建、其余未建时炸
+
+    def failing_statements():
+        return real_stmts[:cut] + ["CREATE TABLE boom (id INTEGER"]  # 故意语法错误
+
+    monkeypatch.setattr(db, "_m001_statements", failing_statements)
+    with pytest.raises(sqlite3.OperationalError):
+        db.init_db()
+
+    conn = db.get_conn()
+    assert not conn.in_transaction
+    # 前半截已执行的建表也必须回滚干净
+    assert _tables(conn) == {"schema_version"}
+    idx = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'")}
+    assert idx == set()
+    assert db.current_version(conn) == 0
+
+
+def test_m001_rerun_after_failure_succeeds(isolated_env, monkeypatch):
+    """失败回滚后 init_db 可重新完整执行（审查要求的复跑验证）。"""
+    real_stmts = db._m001_statements()
+    calls = {"n": 0}
+
+    def flaky_statements():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real_stmts[:3] + ["SELECT * FROM no_such_table"]
+        return real_stmts
+
+    monkeypatch.setattr(db, "_m001_statements", flaky_statements)
+    with pytest.raises(sqlite3.OperationalError):
+        db.init_db()
+    assert db.current_version(db.get_conn()) == 0
+
+    v = db.init_db()  # 第二次完整成功
+    assert v == 2
+    conn = db.get_conn()
+    assert EXPECTED_TABLES <= _tables(conn)
+    for table in EXPECTED_TABLES - {"schema_version"}:
+        assert conn.execute(f"SELECT COUNT(*) c FROM {table}").fetchone()["c"] == 0
+
+
+def test_executescript_rejected_before_execution(isolated_env, monkeypatch):
+    """M1 复审修复（第一道防线）：executescript 在执行前被拒绝。
+
+    断言：脚本未执行（无 sneaky 表）、外层事务完整回滚、版本不推进、
+    数据库处于可安全重试状态。
+    """
+    executed = {"script_ran": False}
+
+    def sneaky(conn):
+        # 受控接口应在属性访问时即抛错，脚本根本没有机会执行
+        conn.executescript("CREATE TABLE sneaky (id INTEGER);")
+        executed["script_ran"] = True  # 不应到达
+
+    monkeypatch.setattr(db, "MIGRATIONS", [db.m001_init, sneaky])
+    with pytest.raises(RuntimeError, match="migration_forbidden_api:executescript"):
+        db.init_db()
+
+    conn = db.get_conn()
+    assert executed["script_ran"] is False
+    assert not conn.in_transaction
+    assert "sneaky" not in _tables(conn)          # 无残留
+    assert db.current_version(conn) == 1           # m001 成功，坏迁移未记录
+    # 可安全重试：修复迁移后 init_db 正常完成
+    monkeypatch.setattr(db, "MIGRATIONS", [db.m001_init, db.m002_task_idempotency])
+    assert db.init_db() == 2
+    assert "sneaky" not in _tables(conn)
+
+
+def test_migration_forbidden_apis(isolated_env, monkeypatch):
+    """受控接口：commit/rollback/close/属性写入均在执行前被拒绝，事务可回滚。"""
+    for api in ("commit", "rollback", "close"):
+        def bad(conn, _api=api):
+            getattr(conn, _api)()
+
+        monkeypatch.setattr(db, "MIGRATIONS", [bad])
+        with pytest.raises(RuntimeError, match=f"migration_forbidden_api:{api}"):
+            db.init_db()
+        conn = db.get_conn()
+        assert db.current_version(conn) == 0
+        assert _tables(conn) == {"schema_version"}
+
+    def write_attr(conn):
+        conn.row_factory = None
+
+    monkeypatch.setattr(db, "MIGRATIONS", [write_attr])
+    with pytest.raises(RuntimeError, match="migration_forbidden_attr_write"):
+        db.init_db()
+    assert db.current_version(db.get_conn()) == 0
+
+
+def test_retry_after_forbidden_api_succeeds(isolated_env, monkeypatch):
+    """拒绝后重试完整成功（复审要求的可重试性验证，从空库开始）。"""
+    calls = {"n": 0}
+
+    def flaky(conn):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            conn.executescript("CREATE TABLE sneaky (id INTEGER);")
+        conn.execute(
+            "CREATE TABLE retry_ok (id INTEGER PRIMARY KEY, note TEXT NOT NULL)"
+        )
+
+    monkeypatch.setattr(db, "MIGRATIONS", [flaky])
+    with pytest.raises(RuntimeError, match="migration_forbidden_api"):
+        db.init_db()
+    conn = db.get_conn()
+    assert "sneaky" not in _tables(conn) and "retry_ok" not in _tables(conn)
+    assert db.current_version(conn) == 0
+
+    assert db.init_db() == 1  # 第二次完整成功
+    assert "retry_ok" in _tables(conn)
+    assert "sneaky" not in _tables(conn)
+
+
+def test_bypass_via_private_conn_rejected(isolated_env, monkeypatch):
+    """复审阻断项回归①：conn._conn 取裸连接 → 属性访问即被拒，无残留可重试。"""
+    def bypass(conn):
+        conn._conn.executescript("CREATE TABLE sneaky (id INTEGER);")
+
+    monkeypatch.setattr(db, "MIGRATIONS", [db.m001_init, bypass])
+    with pytest.raises(RuntimeError, match="migration_forbidden_api:_conn"):
+        db.init_db()
+    conn = db.get_conn()
+    assert not conn.in_transaction
+    assert "sneaky" not in _tables(conn)
+    assert db.current_version(conn) == 1
+    # 修复后可安全重试
+    monkeypatch.setattr(db, "MIGRATIONS", [db.m001_init, db.m002_task_idempotency])
+    assert db.init_db() == 2
+    assert "sneaky" not in _tables(conn)
+
+
+def test_bypass_via_cursor_connection_rejected(isolated_env, monkeypatch):
+    """复审阻断项回归②：execute(...).connection 取裸连接 → 访问即被拒。"""
+    def bypass(conn):
+        conn.execute("SELECT 1").connection.executescript(
+            "CREATE TABLE sneaky (id INTEGER);")
+
+    monkeypatch.setattr(db, "MIGRATIONS", [db.m001_init, bypass])
+    with pytest.raises(RuntimeError, match="migration_forbidden_cursor_api:connection"):
+        db.init_db()
+    conn = db.get_conn()
+    assert not conn.in_transaction
+    assert "sneaky" not in _tables(conn)
+    assert db.current_version(conn) == 1
+    monkeypatch.setattr(db, "MIGRATIONS", [db.m001_init, db.m002_task_idempotency])
+    assert db.init_db() == 2
+    assert "sneaky" not in _tables(conn)
+
+
+def test_migration_cursor_proxy_usable(isolated_env, monkeypatch):
+    """受控游标正常接口可用（防过度封锁）：fetchone/fetchall/rowcount/lastrowid。"""
+    seen = {}
+
+    def probe(conn):
+        conn.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY, v TEXT)")
+        cur = conn.execute("INSERT INTO probe(v) VALUES('a')")
+        seen["lastrowid"] = cur.lastrowid
+        seen["rowcount"] = cur.rowcount
+        seen["one"] = conn.execute("SELECT v FROM probe").fetchone()[0]
+        seen["all"] = conn.execute("SELECT v FROM probe").fetchall()
+        # 游标上的危险接口同样被拒（executescript 不在游标白名单）
+        try:
+            conn.execute("SELECT 1").executescript
+            raise AssertionError("游标 executescript 应被拒绝")
+        except RuntimeError:
+            pass
+
+    monkeypatch.setattr(db, "MIGRATIONS", [probe])
+    assert db.init_db() == 1
+    assert seen["lastrowid"] == 1
+    assert seen["rowcount"] == 1
+    assert seen["one"] == "a"
+    assert len(seen["all"]) == 1
+
+
 def test_backup_readable(isolated_env, tmp_path):
     db.init_db()
     conn = db.get_conn()

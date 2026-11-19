@@ -38,8 +38,16 @@ class FakeLLM:
 
 
 @pytest.fixture(autouse=True)
-def isolated_env(tmp_path, monkeypatch):
-    """每个测试独立数据目录/库/vault + mock LLM + 禁网。"""
+def isolated_env(request, tmp_path, monkeypatch):
+    """每个测试独立数据目录/库/vault + mock LLM + 禁外网。
+
+    网络隔离（M1 审查修复）：
+    - 拦截 connect / connect_ex / create_connection 三个入口；
+    - 仅放行真回环 127.0.0.1 / ::1 / localhost（asyncio socketpair 依赖）；
+      0.0.0.0 不是回环地址，不在白名单；
+    - @pytest.mark.live 用例显式解除禁网（仍走 tmp 隔离与 mock 注入点，
+      live 用例自行构造真实客户端）。
+    """
     data_dir = tmp_path / "data"
     vault_dir = tmp_path / "vault"
     data_dir.mkdir()
@@ -54,29 +62,40 @@ def isolated_env(tmp_path, monkeypatch):
     fake = FakeLLM()
     llm_client.set_llm(fake)
 
-    # socket 层禁外网：回环（127.0.0.1/::1/localhost）放行——asyncio/Gradio
-    # 内部 socketpair 依赖它；任何非回环连接直接失败（@live 用例自行解除）。
-    _orig_connect = socket.socket.connect
-    _orig_create = socket.create_connection
-    _LOOPBACK = {"127.0.0.1", "::1", "localhost", "0.0.0.0"}
+    # socket 层禁外网：仅真回环放行；@live 显式解除。
+    is_live = "live" in request.keywords
+    if not is_live:
+        _orig_connect = socket.socket.connect
+        _orig_connect_ex = socket.socket.connect_ex
+        _orig_create = socket.create_connection
+        _LOOPBACK = {"127.0.0.1", "::1", "localhost"}
 
-    def _addr_of(address):
-        if isinstance(address, tuple) and address:
-            return str(address[0])
-        return str(address)
+        def _addr_of(address):
+            if isinstance(address, tuple) and address:
+                return str(address[0])
+            return str(address)
 
-    def _guard_connect(self, address):
-        if _addr_of(address) not in _LOOPBACK:
-            raise RuntimeError(f"测试禁止真实网络调用（目标 {address!r}，@live 除外）")
-        return _orig_connect(self, address)
+        def _blocked(address):
+            return _addr_of(address) not in _LOOPBACK
 
-    def _guard_create(address, *args, **kwargs):
-        if _addr_of(address) not in _LOOPBACK:
-            raise RuntimeError(f"测试禁止真实网络调用（目标 {address!r}，@live 除外）")
-        return _orig_create(address, *args, **kwargs)
+        def _guard_connect(self, address):
+            if _blocked(address):
+                raise RuntimeError(f"测试禁止真实网络调用（目标 {address!r}）")
+            return _orig_connect(self, address)
 
-    monkeypatch.setattr(socket.socket, "connect", _guard_connect)
-    monkeypatch.setattr(socket, "create_connection", _guard_create)
+        def _guard_connect_ex(self, address):
+            if _blocked(address):
+                raise RuntimeError(f"测试禁止真实网络调用（connect_ex 目标 {address!r}）")
+            return _orig_connect_ex(self, address)
+
+        def _guard_create(address, *args, **kwargs):
+            if _blocked(address):
+                raise RuntimeError(f"测试禁止真实网络调用（目标 {address!r}）")
+            return _orig_create(address, *args, **kwargs)
+
+        monkeypatch.setattr(socket.socket, "connect", _guard_connect)
+        monkeypatch.setattr(socket.socket, "connect_ex", _guard_connect_ex)
+        monkeypatch.setattr(socket, "create_connection", _guard_create)
 
     yield {"data_dir": data_dir, "vault_dir": vault_dir, "fake_llm": fake}
 

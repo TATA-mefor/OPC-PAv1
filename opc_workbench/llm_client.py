@@ -31,6 +31,7 @@ class CircuitBreaker:
         self.state = "closed"
         self._failures: list[float] = []
         self._opened_at = 0.0
+        self._probe_inflight = False  # 严格单探针（M1 审查修复）
 
     def allow(self) -> bool:
         with self._lock:
@@ -38,8 +39,15 @@ class CircuitBreaker:
             if self.state == "open":
                 if now - self._opened_at >= self.open_s:
                     self.state = "half_open"
+                    self._probe_inflight = True
                     return True
                 return False
+            if self.state == "half_open":
+                # 半开态只放行一个探针，其余并发请求直接拒绝
+                if self._probe_inflight:
+                    return False
+                self._probe_inflight = True
+                return True
             return True
 
     def record(self, ok: bool) -> None:
@@ -47,9 +55,11 @@ class CircuitBreaker:
             now = time.monotonic()
             if ok:
                 self._failures.clear()
+                self._probe_inflight = False
                 self.state = "closed"
                 return
             if self.state == "half_open":
+                self._probe_inflight = False
                 self._trip(now)
                 return
             self._failures = [t for t in self._failures if now - t <= self.window_s]
@@ -107,7 +117,13 @@ class LLMClient:
                 self.breaker.record(False)
                 if not retryable or attempt + 1 >= config.LLM_ATTEMPTS:
                     break
-                time.sleep(0.8 * (attempt + 1))
+                backoff = 0.8 * (attempt + 1)
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= backoff:
+                        # 退避会越过 deadline：不再等待/重试（M1 审查修复）
+                        raise LLMFailure("deadline_exceeded") from exc
+                time.sleep(backoff)
         raise LLMFailure(f"llm_error:{type(last_err).__name__}") from last_err
 
 
