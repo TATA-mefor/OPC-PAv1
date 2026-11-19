@@ -62,6 +62,11 @@ def isolated_env(request, tmp_path, monkeypatch):
     fake = FakeLLM()
     llm_client.set_llm(fake)
 
+    # 审计日志器重置：确保每个测试的日志落在各自 tmp 目录（M2）
+    from opc_workbench import audit_log
+    monkeypatch.setattr(audit_log, "_logger", None, raising=False)
+    monkeypatch.setattr(audit_log, "_logger_dir", None, raising=False)
+
     # socket 层禁外网：仅真回环放行；@live 显式解除。
     is_live = "live" in request.keywords
     if not is_live:
