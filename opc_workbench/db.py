@@ -209,14 +209,43 @@ def m002_task_idempotency(conn: sqlite3.Connection) -> None:
 MIGRATIONS = [m001_init, m002_task_idempotency]
 
 
+class MigrationConnection:
+    """迁移函数的受控连接接口（M1 复审修复：执行前拒绝，而非事后检查）。
+
+    只暴露 execute()；executescript/commit/rollback/close 等一切其他属性
+    在**访问时**即抛错——脚本根本没有机会执行，外层事务不会被隐式提交，
+    ROLLBACK 可完整撤销，数据库保持可安全重试状态。
+    """
+
+    __slots__ = ("_conn",)
+
+    def __init__(self, conn: sqlite3.Connection):
+        object.__setattr__(self, "_conn", conn)
+
+    def execute(self, sql: str, parameters=()) -> sqlite3.Cursor:
+        return self._conn.execute(sql, parameters)
+
+    def __getattr__(self, name: str):
+        raise RuntimeError(
+            f"migration_forbidden_api:{name}"
+            "（迁移内仅允许 execute；executescript/commit/rollback 等被禁止）"
+        )
+
+    def __setattr__(self, name: str, value):
+        raise RuntimeError(f"migration_forbidden_attr_write:{name}")
+
+
 def init_db(db_path: Path | str | None = None) -> int:
     """建库并按序应用未执行的迁移。零播种。返回当前 schema 版本。
 
-    原子性保障（M1 审查修复）：
+    原子性保障（M1 两轮审查修复）：
+    - 第一道防线：迁移函数拿到的是 MigrationConnection 受控接口，
+      executescript 等破坏事务边界的调用在**执行前**被拒绝，事务可完整回滚，
+      失败后数据库无残留、可安全重试。
     - 显式 BEGIN/COMMIT/ROLLBACK（Python 3.12+ sqlite3 legacy 模式下 DDL
       不在隐式事务内，`with conn` 无法回滚建表）。
-    - 迁移执行后复查 in_transaction：若迁移内部破坏了事务边界（如误用
-      executescript），立即报错并阻止版本推进，避免"半截 schema 被记为成功"。
+    - 第二道防线：迁移执行后复查 in_transaction，任何绕过受控接口破坏
+      事务边界的行为仍会被拦截并阻止版本推进。
     """
     conn = get_conn(db_path)
     _ensure_version_table(conn)
@@ -227,11 +256,10 @@ def init_db(db_path: Path | str | None = None) -> int:
         if not conn.in_transaction:
             raise RuntimeError("migration_transaction_not_started")
         try:
-            fn(conn)
+            fn(MigrationConnection(conn))
             if not conn.in_transaction:
                 raise RuntimeError(
                     f"migration_broke_transaction_boundary:{fn.__name__}"
-                    "（迁移内禁止 executescript/COMMIT）"
                 )
             conn.execute(
                 "INSERT INTO schema_version(version,name,applied_at) VALUES(?,?,?)",

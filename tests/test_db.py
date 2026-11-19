@@ -167,18 +167,78 @@ def test_m001_rerun_after_failure_succeeds(isolated_env, monkeypatch):
         assert conn.execute(f"SELECT COUNT(*) c FROM {table}").fetchone()["c"] == 0
 
 
-def test_executescript_migration_rejected(isolated_env, monkeypatch):
-    """守卫：迁移内误用 executescript 破坏事务边界 → 报错且版本不推进。"""
+def test_executescript_rejected_before_execution(isolated_env, monkeypatch):
+    """M1 复审修复（第一道防线）：executescript 在执行前被拒绝。
+
+    断言：脚本未执行（无 sneaky 表）、外层事务完整回滚、版本不推进、
+    数据库处于可安全重试状态。
+    """
+    executed = {"script_ran": False}
+
     def sneaky(conn):
+        # 受控接口应在属性访问时即抛错，脚本根本没有机会执行
         conn.executescript("CREATE TABLE sneaky (id INTEGER);")
+        executed["script_ran"] = True  # 不应到达
 
     monkeypatch.setattr(db, "MIGRATIONS", [db.m001_init, sneaky])
-    with pytest.raises(RuntimeError, match="broke_transaction_boundary"):
+    with pytest.raises(RuntimeError, match="migration_forbidden_api:executescript"):
+        db.init_db()
+
+    conn = db.get_conn()
+    assert executed["script_ran"] is False
+    assert not conn.in_transaction
+    assert "sneaky" not in _tables(conn)          # 无残留
+    assert db.current_version(conn) == 1           # m001 成功，坏迁移未记录
+    # 可安全重试：修复迁移后 init_db 正常完成
+    monkeypatch.setattr(db, "MIGRATIONS", [db.m001_init, db.m002_task_idempotency])
+    assert db.init_db() == 2
+    assert "sneaky" not in _tables(conn)
+
+
+def test_migration_forbidden_apis(isolated_env, monkeypatch):
+    """受控接口：commit/rollback/close/属性写入均在执行前被拒绝，事务可回滚。"""
+    for api in ("commit", "rollback", "close"):
+        def bad(conn, _api=api):
+            getattr(conn, _api)()
+
+        monkeypatch.setattr(db, "MIGRATIONS", [bad])
+        with pytest.raises(RuntimeError, match=f"migration_forbidden_api:{api}"):
+            db.init_db()
+        conn = db.get_conn()
+        assert db.current_version(conn) == 0
+        assert _tables(conn) == {"schema_version"}
+
+    def write_attr(conn):
+        conn.row_factory = None
+
+    monkeypatch.setattr(db, "MIGRATIONS", [write_attr])
+    with pytest.raises(RuntimeError, match="migration_forbidden_attr_write"):
+        db.init_db()
+    assert db.current_version(db.get_conn()) == 0
+
+
+def test_retry_after_forbidden_api_succeeds(isolated_env, monkeypatch):
+    """拒绝后重试完整成功（复审要求的可重试性验证，从空库开始）。"""
+    calls = {"n": 0}
+
+    def flaky(conn):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            conn.executescript("CREATE TABLE sneaky (id INTEGER);")
+        conn.execute(
+            "CREATE TABLE retry_ok (id INTEGER PRIMARY KEY, note TEXT NOT NULL)"
+        )
+
+    monkeypatch.setattr(db, "MIGRATIONS", [flaky])
+    with pytest.raises(RuntimeError, match="migration_forbidden_api"):
         db.init_db()
     conn = db.get_conn()
-    assert db.current_version(conn) == 1  # m001 独立成功，坏迁移未记录版本
-    # executescript 已隐式提交的内容无法回滚——守卫的价值是阻止其被记为成功，
-    # 并在修复后由下一迁移/人工清理；此处验证版本推进被正确拦截。
+    assert "sneaky" not in _tables(conn) and "retry_ok" not in _tables(conn)
+    assert db.current_version(conn) == 0
+
+    assert db.init_db() == 1  # 第二次完整成功
+    assert "retry_ok" in _tables(conn)
+    assert "sneaky" not in _tables(conn)
 
 
 def test_backup_readable(isolated_env, tmp_path):
