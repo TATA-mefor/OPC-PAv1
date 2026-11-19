@@ -2,6 +2,8 @@
 
 PRD §4/§14 纪律：
 - 表结构变更一律新增迁移函数，禁止手改；每个迁移单事务。
+- **迁移函数禁止 executescript()**：它会先隐式 COMMIT 挂起事务，破坏外层
+  BEGIN/ROLLBACK 的原子性（M1 审查发现的缺口）。一律逐条 conn.execute()。
 - init_db() 零播种（审计红旗：旧 seed_tasks 污染真实链路）。
 - 角色枚举 CHECK 由 config.ROLES 生成，单一来源。
 - 每线程独立连接；写串行由 SQLite WAL + busy_timeout 保证。
@@ -74,10 +76,8 @@ def current_version(conn: sqlite3.Connection) -> int:
     return int(row["v"])
 
 
-def m001_init(conn: sqlite3.Connection) -> None:
-    """PRD §4.2 全部核心表。scope 仅允许 global（session 不落库）；internal 预留不启用。"""
-    roles = _roles_sql()
-    conn.executescript(f"""
+# DDL 文本内不含分号字面量，可安全按 ';' 切分为独立语句逐条执行。
+_M001_SQL = """
 CREATE TABLE tasks (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     title       TEXT NOT NULL,
@@ -87,7 +87,7 @@ CREATE TABLE tasks (
     priority    TEXT NOT NULL DEFAULT 'mid'
                 CHECK(priority IN ('low','mid','high')),
     due_at      TEXT,
-    owner_role  TEXT NOT NULL CHECK(owner_role IN ({roles})),
+    owner_role  TEXT NOT NULL CHECK(owner_role IN ({ROLES})),
     visibility  TEXT NOT NULL DEFAULT 'public'
                 CHECK(visibility IN ('public','private')),
     scope       TEXT NOT NULL DEFAULT 'global'
@@ -105,7 +105,7 @@ CREATE TABLE schedules (
                 CHECK(repeat_rule IN ('none','daily','weekly')),
     status      TEXT NOT NULL DEFAULT 'pending'
                 CHECK(status IN ('pending','notified','done','cancelled')),
-    owner_role  TEXT NOT NULL CHECK(owner_role IN ({roles})),
+    owner_role  TEXT NOT NULL CHECK(owner_role IN ({ROLES})),
     visibility  TEXT NOT NULL DEFAULT 'public'
                 CHECK(visibility IN ('public','private')),
     version     INTEGER NOT NULL DEFAULT 1,
@@ -118,7 +118,7 @@ CREATE TABLE knowledge_docs (
     filename    TEXT NOT NULL,
     stored_path TEXT NOT NULL UNIQUE,
     file_hash   TEXT NOT NULL,
-    owner_role  TEXT NOT NULL CHECK(owner_role IN ({roles})),
+    owner_role  TEXT NOT NULL CHECK(owner_role IN ({ROLES})),
     visibility  TEXT NOT NULL DEFAULT 'public'
                 CHECK(visibility IN ('public','private')),
     chunk_count INTEGER NOT NULL DEFAULT 0,
@@ -141,7 +141,7 @@ CREATE TABLE memory (
     summary     TEXT NOT NULL,
     kind        TEXT NOT NULL DEFAULT 'episode'
                 CHECK(kind IN ('episode','preference')),
-    owner_role  TEXT NOT NULL CHECK(owner_role IN ({roles})),
+    owner_role  TEXT NOT NULL CHECK(owner_role IN ({ROLES})),
     visibility  TEXT NOT NULL DEFAULT 'private'
                 CHECK(visibility IN ('public','private')),
     created_at  TEXT NOT NULL
@@ -153,8 +153,8 @@ CREATE TABLE artifacts (
                 CHECK(kind IN ('daily_report','weekly_report','other')),
     title       TEXT NOT NULL,
     content_md  TEXT NOT NULL,
-    refs_json   TEXT NOT NULL DEFAULT '{{}}',
-    owner_role  TEXT NOT NULL CHECK(owner_role IN ({roles})),
+    refs_json   TEXT NOT NULL DEFAULT '{}',
+    owner_role  TEXT NOT NULL CHECK(owner_role IN ({ROLES})),
     visibility  TEXT NOT NULL DEFAULT 'private'
                 CHECK(visibility IN ('public','private')),
     period_key  TEXT NOT NULL,
@@ -179,7 +179,22 @@ CREATE INDEX idx_sched_remind ON schedules(status, remind_at);
 CREATE INDEX idx_chunks_doc ON knowledge_chunks(doc_id);
 CREATE INDEX idx_memory_owner_vis ON memory(owner_role, visibility);
 CREATE INDEX idx_approvals_status ON approvals(status);
-""")
+"""
+
+
+def _m001_statements() -> list[str]:
+    """把 DDL 文本切为独立语句（测试可注入中途失败）。"""
+    sql = _M001_SQL.replace("{ROLES}", _roles_sql())
+    return [s.strip() for s in sql.split(";") if s.strip()]
+
+
+def m001_init(conn: sqlite3.Connection) -> None:
+    """PRD §4.2 全部核心表。逐条 execute，保持在外层迁移事务内。
+
+    scope 仅允许 global（session 不落库）；internal 预留不启用。
+    """
+    for stmt in _m001_statements():
+        conn.execute(stmt)
 
 
 def m002_task_idempotency(conn: sqlite3.Connection) -> None:
@@ -195,24 +210,37 @@ MIGRATIONS = [m001_init, m002_task_idempotency]
 
 
 def init_db(db_path: Path | str | None = None) -> int:
-    """建库并按序应用未执行的迁移。零播种。返回当前 schema 版本。"""
+    """建库并按序应用未执行的迁移。零播种。返回当前 schema 版本。
+
+    原子性保障（M1 审查修复）：
+    - 显式 BEGIN/COMMIT/ROLLBACK（Python 3.12+ sqlite3 legacy 模式下 DDL
+      不在隐式事务内，`with conn` 无法回滚建表）。
+    - 迁移执行后复查 in_transaction：若迁移内部破坏了事务边界（如误用
+      executescript），立即报错并阻止版本推进，避免"半截 schema 被记为成功"。
+    """
     conn = get_conn(db_path)
     _ensure_version_table(conn)
     applied = current_version(conn)
     for idx in range(applied, len(MIGRATIONS)):
         fn = MIGRATIONS[idx]
-        # 显式事务：Python 3.12+ sqlite3 默认 autocommit=LEGACY，DDL 不在隐式
-        # 事务内，`with conn` 无法回滚 CREATE TABLE——必须 BEGIN/COMMIT/ROLLBACK。
         conn.execute("BEGIN")
+        if not conn.in_transaction:
+            raise RuntimeError("migration_transaction_not_started")
         try:
             fn(conn)
+            if not conn.in_transaction:
+                raise RuntimeError(
+                    f"migration_broke_transaction_boundary:{fn.__name__}"
+                    "（迁移内禁止 executescript/COMMIT）"
+                )
             conn.execute(
                 "INSERT INTO schema_version(version,name,applied_at) VALUES(?,?,?)",
                 (idx + 1, fn.__name__, now_iso()),
             )
             conn.execute("COMMIT")
         except BaseException:
-            conn.execute("ROLLBACK")
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             raise
     return current_version(conn)
 

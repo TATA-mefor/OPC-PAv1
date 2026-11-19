@@ -120,6 +120,67 @@ def test_migration_failure_rolls_back(isolated_env, monkeypatch):
     assert db.current_version(conn) == 1  # m001 已成功独立提交，坏迁移未记录
 
 
+def test_m001_midway_failure_full_rollback(isolated_env, monkeypatch):
+    """M1 审查修复：初始建表迁移中途失败 → 所有业务表/索引/版本记录全部回滚。"""
+    real_stmts = db._m001_statements()
+    assert len(real_stmts) >= 13  # 7 表 + 6 索引
+    cut = len(real_stmts) // 2    # 在 tasks/schedules 等已建、其余未建时炸
+
+    def failing_statements():
+        return real_stmts[:cut] + ["CREATE TABLE boom (id INTEGER"]  # 故意语法错误
+
+    monkeypatch.setattr(db, "_m001_statements", failing_statements)
+    with pytest.raises(sqlite3.OperationalError):
+        db.init_db()
+
+    conn = db.get_conn()
+    assert not conn.in_transaction
+    # 前半截已执行的建表也必须回滚干净
+    assert _tables(conn) == {"schema_version"}
+    idx = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'")}
+    assert idx == set()
+    assert db.current_version(conn) == 0
+
+
+def test_m001_rerun_after_failure_succeeds(isolated_env, monkeypatch):
+    """失败回滚后 init_db 可重新完整执行（审查要求的复跑验证）。"""
+    real_stmts = db._m001_statements()
+    calls = {"n": 0}
+
+    def flaky_statements():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real_stmts[:3] + ["SELECT * FROM no_such_table"]
+        return real_stmts
+
+    monkeypatch.setattr(db, "_m001_statements", flaky_statements)
+    with pytest.raises(sqlite3.OperationalError):
+        db.init_db()
+    assert db.current_version(db.get_conn()) == 0
+
+    v = db.init_db()  # 第二次完整成功
+    assert v == 2
+    conn = db.get_conn()
+    assert EXPECTED_TABLES <= _tables(conn)
+    for table in EXPECTED_TABLES - {"schema_version"}:
+        assert conn.execute(f"SELECT COUNT(*) c FROM {table}").fetchone()["c"] == 0
+
+
+def test_executescript_migration_rejected(isolated_env, monkeypatch):
+    """守卫：迁移内误用 executescript 破坏事务边界 → 报错且版本不推进。"""
+    def sneaky(conn):
+        conn.executescript("CREATE TABLE sneaky (id INTEGER);")
+
+    monkeypatch.setattr(db, "MIGRATIONS", [db.m001_init, sneaky])
+    with pytest.raises(RuntimeError, match="broke_transaction_boundary"):
+        db.init_db()
+    conn = db.get_conn()
+    assert db.current_version(conn) == 1  # m001 独立成功，坏迁移未记录版本
+    # executescript 已隐式提交的内容无法回滚——守卫的价值是阻止其被记为成功，
+    # 并在修复后由下一迁移/人工清理；此处验证版本推进被正确拦截。
+
+
 def test_backup_readable(isolated_env, tmp_path):
     db.init_db()
     conn = db.get_conn()
