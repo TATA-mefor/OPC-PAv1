@@ -209,12 +209,59 @@ def m002_task_idempotency(conn: sqlite3.Connection) -> None:
 MIGRATIONS = [m001_init, m002_task_idempotency]
 
 
-class MigrationConnection:
-    """迁移函数的受控连接接口（M1 复审修复：执行前拒绝，而非事后检查）。
+# 属性白名单：正常接口只允许这些名字，其余（含 _conn/_cur 内部槽、
+# executescript/commit/rollback/close、游标 .connection）在访问时即拒绝。
+# 注意（复审共识）：这不是抵御恶意代码的安全沙箱——object.__getattribute__
+# 等刻意内省仍可绕过；目标是让迁移函数的正常接口无法意外取得裸连接。
+_MIGRATION_ALLOWED = frozenset({"execute"})
+_CURSOR_ALLOWED = frozenset({"fetchone", "fetchall", "fetchmany", "rowcount", "lastrowid"})
 
-    只暴露 execute()；executescript/commit/rollback/close 等一切其他属性
-    在**访问时**即抛错——脚本根本没有机会执行，外层事务不会被隐式提交，
-    ROLLBACK 可完整撤销，数据库保持可安全重试状态。
+
+class MigrationCursor:
+    """受控游标代理：不原样返回 sqlite3.Cursor，封死 .connection 通路。"""
+
+    __slots__ = ("_cur",)
+
+    def __init__(self, cur: sqlite3.Cursor):
+        object.__setattr__(self, "_cur", cur)
+
+    def __getattribute__(self, name: str):
+        if name not in _CURSOR_ALLOWED:
+            raise RuntimeError(
+                f"migration_forbidden_cursor_api:{name}"
+                "（游标仅允许 fetchone/fetchall/fetchmany/rowcount/lastrowid）"
+            )
+        return object.__getattribute__(self, name)
+
+    def __setattr__(self, name: str, value):
+        raise RuntimeError(f"migration_forbidden_attr_write:{name}")
+
+    def fetchone(self):
+        return object.__getattribute__(self, "_cur").fetchone()
+
+    def fetchall(self):
+        return object.__getattribute__(self, "_cur").fetchall()
+
+    def fetchmany(self, size=None):
+        cur = object.__getattribute__(self, "_cur")
+        return cur.fetchmany() if size is None else cur.fetchmany(size)
+
+    @property
+    def rowcount(self) -> int:
+        return object.__getattribute__(self, "_cur").rowcount
+
+    @property
+    def lastrowid(self):
+        return object.__getattribute__(self, "_cur").lastrowid
+
+
+class MigrationConnection:
+    """迁移函数的受控连接接口（M1 两轮复审修复：执行前拒绝 + 白名单封装）。
+
+    - __getattribute__ 白名单：_conn 等内部属性与 executescript/commit 等
+      危险接口在**访问时**即抛错，脚本没有机会执行，外层事务不被隐式提交，
+      ROLLBACK 可完整撤销，数据库保持可安全重试状态。
+    - execute() 返回 MigrationCursor 代理，杜绝经游标 .connection 取裸连接。
     """
 
     __slots__ = ("_conn",)
@@ -222,26 +269,30 @@ class MigrationConnection:
     def __init__(self, conn: sqlite3.Connection):
         object.__setattr__(self, "_conn", conn)
 
-    def execute(self, sql: str, parameters=()) -> sqlite3.Cursor:
-        return self._conn.execute(sql, parameters)
-
-    def __getattr__(self, name: str):
-        raise RuntimeError(
-            f"migration_forbidden_api:{name}"
-            "（迁移内仅允许 execute；executescript/commit/rollback 等被禁止）"
-        )
+    def __getattribute__(self, name: str):
+        if name not in _MIGRATION_ALLOWED:
+            raise RuntimeError(
+                f"migration_forbidden_api:{name}"
+                "（迁移内仅允许 execute；executescript/commit/rollback 等被禁止）"
+            )
+        return object.__getattribute__(self, name)
 
     def __setattr__(self, name: str, value):
         raise RuntimeError(f"migration_forbidden_attr_write:{name}")
+
+    def execute(self, sql: str, parameters=()) -> MigrationCursor:
+        cur = object.__getattribute__(self, "_conn").execute(sql, parameters)
+        return MigrationCursor(cur)
 
 
 def init_db(db_path: Path | str | None = None) -> int:
     """建库并按序应用未执行的迁移。零播种。返回当前 schema 版本。
 
     原子性保障（M1 两轮审查修复）：
-    - 第一道防线：迁移函数拿到的是 MigrationConnection 受控接口，
-      executescript 等破坏事务边界的调用在**执行前**被拒绝，事务可完整回滚，
-      失败后数据库无残留、可安全重试。
+    - 第一道防线：迁移函数拿到的是 MigrationConnection 受控接口（属性白名单），
+      executescript 等危险调用在**执行前**被拒绝；_conn 内部属性与 execute()
+      返回游标的 .connection 同样不可访问（MigrationCursor 代理），事务可完整
+      回滚，失败后数据库无残留、可安全重试。
     - 显式 BEGIN/COMMIT/ROLLBACK（Python 3.12+ sqlite3 legacy 模式下 DDL
       不在隐式事务内，`with conn` 无法回滚建表）。
     - 第二道防线：迁移执行后复查 in_transaction，任何绕过受控接口破坏

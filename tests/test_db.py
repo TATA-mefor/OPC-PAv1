@@ -241,6 +241,68 @@ def test_retry_after_forbidden_api_succeeds(isolated_env, monkeypatch):
     assert "sneaky" not in _tables(conn)
 
 
+def test_bypass_via_private_conn_rejected(isolated_env, monkeypatch):
+    """复审阻断项回归①：conn._conn 取裸连接 → 属性访问即被拒，无残留可重试。"""
+    def bypass(conn):
+        conn._conn.executescript("CREATE TABLE sneaky (id INTEGER);")
+
+    monkeypatch.setattr(db, "MIGRATIONS", [db.m001_init, bypass])
+    with pytest.raises(RuntimeError, match="migration_forbidden_api:_conn"):
+        db.init_db()
+    conn = db.get_conn()
+    assert not conn.in_transaction
+    assert "sneaky" not in _tables(conn)
+    assert db.current_version(conn) == 1
+    # 修复后可安全重试
+    monkeypatch.setattr(db, "MIGRATIONS", [db.m001_init, db.m002_task_idempotency])
+    assert db.init_db() == 2
+    assert "sneaky" not in _tables(conn)
+
+
+def test_bypass_via_cursor_connection_rejected(isolated_env, monkeypatch):
+    """复审阻断项回归②：execute(...).connection 取裸连接 → 访问即被拒。"""
+    def bypass(conn):
+        conn.execute("SELECT 1").connection.executescript(
+            "CREATE TABLE sneaky (id INTEGER);")
+
+    monkeypatch.setattr(db, "MIGRATIONS", [db.m001_init, bypass])
+    with pytest.raises(RuntimeError, match="migration_forbidden_cursor_api:connection"):
+        db.init_db()
+    conn = db.get_conn()
+    assert not conn.in_transaction
+    assert "sneaky" not in _tables(conn)
+    assert db.current_version(conn) == 1
+    monkeypatch.setattr(db, "MIGRATIONS", [db.m001_init, db.m002_task_idempotency])
+    assert db.init_db() == 2
+    assert "sneaky" not in _tables(conn)
+
+
+def test_migration_cursor_proxy_usable(isolated_env, monkeypatch):
+    """受控游标正常接口可用（防过度封锁）：fetchone/fetchall/rowcount/lastrowid。"""
+    seen = {}
+
+    def probe(conn):
+        conn.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY, v TEXT)")
+        cur = conn.execute("INSERT INTO probe(v) VALUES('a')")
+        seen["lastrowid"] = cur.lastrowid
+        seen["rowcount"] = cur.rowcount
+        seen["one"] = conn.execute("SELECT v FROM probe").fetchone()[0]
+        seen["all"] = conn.execute("SELECT v FROM probe").fetchall()
+        # 游标上的危险接口同样被拒（executescript 不在游标白名单）
+        try:
+            conn.execute("SELECT 1").executescript
+            raise AssertionError("游标 executescript 应被拒绝")
+        except RuntimeError:
+            pass
+
+    monkeypatch.setattr(db, "MIGRATIONS", [probe])
+    assert db.init_db() == 1
+    assert seen["lastrowid"] == 1
+    assert seen["rowcount"] == 1
+    assert seen["one"] == "a"
+    assert len(seen["all"]) == 1
+
+
 def test_backup_readable(isolated_env, tmp_path):
     db.init_db()
     conn = db.get_conn()
