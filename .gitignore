@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+env/
+
+# 密钥与本地配置（绝不入库）
+.env
+.env.*
+!.env.example
+
+# 运行时数据（含 WAL 副件）
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+
+# Obsidian 仓库（含私密知识原文，不入库；老板可自行用 Git/同步盘另管）
+vault/
+.obsidian/
+
+# 备份与日志（备份含 private 数据）
+backups/
+logs/
+*.log
+
+# 测试与缓存
+.pytest_cache/
+.cache/
+tmp/
+temp/
+
+# OS / IDE / Office
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+~$*
