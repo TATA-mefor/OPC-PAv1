@@ -221,22 +221,37 @@ def request_disclosure(item_table: str, item_id: int, from_role: str,
     return cur.lastrowid
 
 
+def _is_num(value) -> bool:
+    """expires_at 合法数值判定：int/float 且排除 bool（isinstance(True,int) 为真）。"""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+# JSON1 类型守卫：SQLite 跨类型比较会让 TEXT > 数字 恒真（复审实证的缺口），
+# 必须显式限定 json_type 为 integer/real；字符串/布尔/null/数组/对象一律拒绝。
+_JSON_NUM_GUARD = "json_type(payload,'$.expires_at') IN ('integer','real')"
+
+
 def _sweep_expired(conn, approval_id: int) -> None:
     """惰性原子过期转换（必须在写事务内调用，先于决议/消费）。
 
-    覆盖 pending 与 approved 两态：expires_at <= now 一律转 expired。
+    仅处理 kind='private_disclosure'；覆盖 pending 与 approved 两态；
+    expires_at 必须为合法 JSON 数值且 <= now 才转 expired（类型非法不转换，
+    同时决议/消费的类型守卫会拒绝授权——fail closed）。
     """
     if _has_json1(conn):
         conn.execute(
             "UPDATE approvals SET status='expired', resolved_at=? "
-            "WHERE id=? AND status IN ('pending','approved') "
+            "WHERE id=? AND kind='private_disclosure' "
+            "AND status IN ('pending','approved') "
+            f"AND {_JSON_NUM_GUARD} "
             "AND json_extract(payload,'$.expires_at') <= ?",
             (db.now_iso(), approval_id, _now()),
         )
     else:
         row = conn.execute(
             "SELECT payload FROM approvals "
-            "WHERE id=? AND status IN ('pending','approved')",
+            "WHERE id=? AND kind='private_disclosure' "
+            "AND status IN ('pending','approved')",
             (approval_id,),
         ).fetchone()
         if row is not None:
@@ -244,18 +259,20 @@ def _sweep_expired(conn, approval_id: int) -> None:
                 expires = json.loads(row["payload"]).get("expires_at")
             except (ValueError, TypeError):
                 expires = None
-            if isinstance(expires, (int, float)) and expires <= _now():
+            if _is_num(expires) and expires <= _now():
                 conn.execute(
                     "UPDATE approvals SET status='expired', resolved_at=? "
-                    "WHERE id=? AND status IN ('pending','approved')",
+                    "WHERE id=? AND kind='private_disclosure' "
+                    "AND status IN ('pending','approved')",
                     (db.now_iso(), approval_id),
                 )
 
 
 def _payload_expires(conn, approval_id: int):
-    """备选路径：写锁内读取 expires_at；损坏/缺失返回 None（fail closed）。"""
+    """备选路径：写锁内读取 expires_at；损坏/缺失/类型非法/非披露单返回 None。"""
     row = conn.execute(
-        "SELECT payload FROM approvals WHERE id=? AND status='pending'",
+        "SELECT payload FROM approvals "
+        "WHERE id=? AND kind='private_disclosure' AND status='pending'",
         (approval_id,),
     ).fetchone()
     if row is None:
@@ -264,7 +281,7 @@ def _payload_expires(conn, approval_id: int):
         expires = json.loads(row["payload"]).get("expires_at")
     except (ValueError, TypeError):
         return None
-    return expires if isinstance(expires, (int, float)) else None
+    return expires if _is_num(expires) else None
 
 
 def resolve_disclosure(approval_id: int, decision: str, *, actor: str) -> None:
@@ -282,7 +299,8 @@ def resolve_disclosure(approval_id: int, decision: str, *, actor: str) -> None:
         if _has_json1(conn):
             cur = conn.execute(
                 "UPDATE approvals SET status=?, resolved_at=? "
-                "WHERE id=? AND status='pending' "
+                "WHERE id=? AND kind='private_disclosure' AND status='pending' "
+                f"AND {_JSON_NUM_GUARD} "
                 "AND json_extract(payload,'$.expires_at') > ?",
                 (decision, db.now_iso(), approval_id, _now()),
             )
@@ -293,7 +311,7 @@ def resolve_disclosure(approval_id: int, decision: str, *, actor: str) -> None:
             if expires is not None and expires > _now():
                 cur = conn.execute(
                     "UPDATE approvals SET status=?, resolved_at=? "
-                    "WHERE id=? AND status='pending'",
+                    "WHERE id=? AND kind='private_disclosure' AND status='pending'",
                     (decision, db.now_iso(), approval_id),
                 )
                 rowcount = cur.rowcount
@@ -334,6 +352,7 @@ def consume_grant(approval_id: int, to_role: str) -> dict:
                 "UPDATE approvals SET status='expired', resolved_at=? "
                 "WHERE id=? AND kind='private_disclosure' AND status='approved' "
                 "AND json_extract(payload,'$.to_role')=? "
+                f"AND {_JSON_NUM_GUARD} "
                 "AND json_extract(payload,'$.expires_at') > ?",
                 (db.now_iso(), approval_id, to_role, _now()),
             )
@@ -351,7 +370,9 @@ def consume_grant(approval_id: int, to_role: str) -> dict:
             ).fetchone()
             if row is not None and row["status"] == "approved":
                 data = json.loads(row["payload"])      # 异常 → 整体回滚
-                if data.get("to_role") == to_role and data.get("expires_at", 0) > _now():
+                expires = data.get("expires_at")
+                if (data.get("to_role") == to_role
+                        and _is_num(expires) and expires > _now()):
                     cur = conn.execute(
                         "UPDATE approvals SET status='expired', resolved_at=? "
                         "WHERE id=? AND status='approved'",

@@ -539,6 +539,95 @@ def test_suggestion_context_filter_rejects_invalid_caller():
             vis.filter_context_items([], bad)
 
 
+# ---------------------------------------------------------------------------
+# M2 第三轮复审修复回归：expires_at JSON 类型守卫 + 审批类型隔离
+# ---------------------------------------------------------------------------
+
+_BAD_EXPIRES = ["garbage", "9999999999", True, False, None, [1], {"a": 1}]
+
+
+def _set_expires(db_conn, aid, value):
+    # json_set 按绑定值类型决定 JSON 类型：必须传原始 Python 值
+    #（int→integer、float→real、str→text、bool→true/false、None→null）；
+    # 传 json.dumps 文本会把数值存成字符串，反而制造类型非法。
+    # list/dict 无对应 SQL 绑定类型，经 json() 包装写入。
+    with db_conn:
+        if isinstance(value, (list, dict, bool)):
+            # bool 直接绑定会被 SQLite 转成 0/1 整数，必须经 json() 保留布尔类型
+            db_conn.execute(
+                "UPDATE approvals SET payload=json_set(payload,'$.expires_at',json(?)) "
+                "WHERE id=?", (json.dumps(value), aid))
+        else:
+            db_conn.execute(
+                "UPDATE approvals SET payload=json_set(payload,'$.expires_at',?) "
+                "WHERE id=?", (value, aid))
+
+
+@pytest.mark.parametrize("bad", _BAD_EXPIRES)
+@pytest.mark.parametrize("use_json1", [True, False], ids=["json1", "fallback"])
+def test_fix4_bad_expires_type_fail_closed(db_conn, seeded, monkeypatch, bad, use_json1):
+    """阻断1：非法 expires_at 类型（字符串/布尔/null/数组/对象）两路径一律拒绝。"""
+    monkeypatch.setattr(vis, "_has_json1", lambda conn: use_json1)
+    aid = _request(db_conn, seeded)
+    _set_expires(db_conn, aid, bad)
+    # 决议被拒：状态保持 pending（类型非法不被清扫转换，也不被批准）
+    vis.resolve_disclosure(aid, "approved", actor="boss")
+    assert _status(db_conn, aid) == "pending"
+    # 消费被拒：同构占位，状态不变
+    assert vis.consume_grant(aid, "sales") == vis.PLACEHOLDER
+    assert _status(db_conn, aid) == "pending"
+
+
+def test_fix4_numeric_string_expires_not_greater_than_now(db_conn, seeded):
+    """复审实证场景：字符串 'garbage' 在裸比较下 > now 恒真，守卫后必须拒绝。"""
+    aid = _request(db_conn, seeded)
+    _set_expires(db_conn, aid, "garbage")
+    # 直接验证守卫 SQL 语义
+    row = db_conn.execute(
+        "SELECT json_extract(payload,'$.expires_at') > 100 AS bare, "
+        "json_type(payload,'$.expires_at') IN ('integer','real') AS guarded "
+        "FROM approvals WHERE id=?", (aid,)).fetchone()
+    assert row["bare"] == 1 and row["guarded"] == 0   # 缺口存在，守卫拦截
+    vis.resolve_disclosure(aid, "approved", actor="boss")
+    assert _status(db_conn, aid) == "pending"
+
+
+def test_fix4_valid_numeric_types_still_work(db_conn, seeded):
+    """integer 与 real 两种合法数值类型不受守卫误伤。"""
+    for value in (int(vis._now() + 3600), vis._now() + 3600.5):
+        aid = _request(db_conn, seeded)
+        _set_expires(db_conn, aid, value)
+        vis.resolve_disclosure(aid, "approved", actor="boss")
+        assert _status(db_conn, aid) == "approved"
+        got = vis.consume_grant(aid, "sales")
+        assert got["title"] == PRIVATE_SAMPLE
+
+
+def _seed_bulk_delete(db_conn):
+    with db_conn:
+        cur = db_conn.execute(
+            "INSERT INTO approvals(kind,payload,status,created_at) "
+            "VALUES('bulk_delete',?,'pending',?)",
+            (json.dumps({"ids": [1, 2], "to_role": "sales",
+                         "expires_at": vis._now() + 99999}), db.now_iso()))
+    return cur.lastrowid
+
+
+@pytest.mark.parametrize("use_json1", [True, False], ids=["json1", "fallback"])
+def test_fix5_bulk_delete_not_resolvable_or_consumable(db_conn, seeded, monkeypatch, use_json1):
+    """阻断2：bulk_delete 审批单不能被披露接口批准或消费（两路径一致）。"""
+    monkeypatch.setattr(vis, "_has_json1", lambda conn: use_json1)
+    bid = _seed_bulk_delete(db_conn)
+    vis.resolve_disclosure(bid, "approved", actor="boss")   # 幂等无操作
+    assert _status(db_conn, bid) == "pending"               # 未被批准
+    assert vis.consume_grant(bid, "sales") == vis.PLACEHOLDER
+    assert _status(db_conn, bid) == "pending"               # 未被消费/清扫
+    # 对照：同库的披露单不受影响，正常批准消费
+    aid = _request(db_conn, seeded)
+    vis.resolve_disclosure(aid, "approved", actor="boss")
+    assert vis.consume_grant(aid, "sales")["title"] == PRIVATE_SAMPLE
+
+
 def test_suggestion_log_reserved_fields(isolated_env):
     """建议2：timestamp/level 为内部保留字段，调用参数不得伪造。"""
     # timestamp 在白名单内但属内部保留字段：经 fields 传入不得覆盖自动值
