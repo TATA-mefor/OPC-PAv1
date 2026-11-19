@@ -72,7 +72,8 @@ def log(level: str, action: str, **fields) -> None:
         "action": _clean(action),
     }
     for key, value in fields.items():
-        if key in _ALLOWED_FIELDS:
+        # timestamp/level 为内部保留字段：调用参数不得覆盖（防元数据伪造）
+        if key in _ALLOWED_FIELDS and key not in ("timestamp", "level"):
             record[key] = _clean(value)
     _get_logger().log(
         getattr(logging, "WARNING" if level == "WARN" else level),

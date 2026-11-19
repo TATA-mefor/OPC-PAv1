@@ -390,3 +390,163 @@ def test_query_filter_value_parameterized(db_conn, seeded):
     rows = vis.query_visible("tasks", "boss", status="' OR 1=1 --")
     assert rows == []                          # 注入串作为普通参数值，无副作用
     assert db_conn.execute("SELECT COUNT(*) c FROM tasks").fetchone()["c"] >= 4
+
+
+# ---------------------------------------------------------------------------
+# M2 复审修复回归（阻断项 1/2/3 + 两项建议）
+# ---------------------------------------------------------------------------
+
+def _status(db_conn, aid):
+    return db_conn.execute("SELECT status FROM approvals WHERE id=?", (aid,)).fetchone()[0]
+
+
+def test_fix1_consume_sweeps_expired_pending(db_conn, seeded, monkeypatch):
+    """阻断1：过期 pending 在 consume 后转为 expired（不再滞留 pending）。"""
+    t0 = 3_000_000.0
+    monkeypatch.setattr(vis, "_now", lambda: t0)
+    aid = _request(db_conn, seeded)
+    monkeypatch.setattr(vis, "_now", lambda: t0 + vis.APPROVAL_TTL_S + 1)
+    assert vis.consume_grant(aid, "sales") == vis.PLACEHOLDER
+    assert _status(db_conn, aid) == "expired"
+
+
+def test_fix1_consume_sweeps_expired_approved(db_conn, seeded, monkeypatch):
+    """阻断1：过期 approved 在 consume 后转为 expired。"""
+    t0 = 3_100_000.0
+    monkeypatch.setattr(vis, "_now", lambda: t0)
+    aid = _request(db_conn, seeded)
+    vis.resolve_disclosure(aid, "approved", actor="boss")
+    monkeypatch.setattr(vis, "_now", lambda: t0 + vis.APPROVAL_TTL_S + 1)
+    assert vis.consume_grant(aid, "sales") == vis.PLACEHOLDER
+    assert _status(db_conn, aid) == "expired"
+
+
+def test_fix2_target_missing_rolls_back_grant(db_conn, seeded):
+    """阻断2：目标不存在 → 整体回滚，审批恢复 approved 可重试，无半消费。"""
+    aid = _request(db_conn, seeded)
+    vis.resolve_disclosure(aid, "approved", actor="boss")
+    with db_conn:
+        db_conn.execute("DELETE FROM tasks WHERE id=?", (seeded["cfo_private"],))
+    assert vis.consume_grant(aid, "sales") == vis.PLACEHOLDER
+    assert _status(db_conn, aid) == "approved"      # 未烧掉，可重试
+    # 目标恢复后重试成功（证明回滚完整、授权仍有效）
+    new_id = _seed_task(db_conn, "cfo", "private", PRIVATE_SAMPLE)
+    with db_conn:
+        db_conn.execute(
+            "UPDATE approvals SET payload=json_set(payload,'$.item_id',?) WHERE id=?",
+            (new_id, aid))
+    got = vis.consume_grant(aid, "sales")
+    assert got["title"] == PRIVATE_SAMPLE
+    assert _status(db_conn, aid) == "expired"
+
+
+def test_fix2_corrupt_payload_rolls_back(db_conn, seeded):
+    """阻断2：payload 损坏 → 回滚，审批状态不变（approved），fail closed。"""
+    aid = _request(db_conn, seeded)
+    vis.resolve_disclosure(aid, "approved", actor="boss")
+    with db_conn:
+        db_conn.execute("UPDATE approvals SET payload='{broken' WHERE id=?", (aid,))
+    assert vis.consume_grant(aid, "sales") == vis.PLACEHOLDER
+    assert _status(db_conn, aid) == "approved"      # 回滚，未半消费
+    assert not db.get_conn().in_transaction
+
+
+def test_fix2_read_failure_rolls_back(db_conn, seeded, monkeypatch):
+    """阻断2：目标读取异常 → 整体回滚（连接代理注入读取故障）。"""
+    aid = _request(db_conn, seeded)
+    vis.resolve_disclosure(aid, "approved", actor="boss")
+    real_conn = db.get_conn()
+
+    class FlakyConn:
+        """代理真实连接：仅目标读取抛错，其余透传（sqlite3 属性只读，不能直接 patch）。"""
+
+        def execute(self, sql, *a, **kw):
+            if sql.startswith("SELECT * FROM tasks WHERE id="):
+                raise sqlite3.OperationalError("simulated read failure")
+            return real_conn.execute(sql, *a, **kw)
+
+        def __getattr__(self, name):
+            return getattr(real_conn, name)
+
+    monkeypatch.setattr(db, "get_conn", lambda *a, **kw: FlakyConn())
+    assert vis.consume_grant(aid, "sales") == vis.PLACEHOLDER
+    monkeypatch.undo()
+    assert _status(db_conn, aid) == "approved"
+    assert not real_conn.in_transaction
+
+
+def test_fix3_nonjson1_paths_semantics_match(db_conn, seeded, monkeypatch):
+    """阻断3：JSON1 不可用时，resolve/consume 过期与消费语义与主路径一致。"""
+    monkeypatch.setattr(vis, "_has_json1", lambda conn: False)
+    t0 = 3_200_000.0
+    monkeypatch.setattr(vis, "_now", lambda: t0)
+    # 过期 pending：resolve 拒绝且转 expired
+    a1 = _request(db_conn, seeded)
+    monkeypatch.setattr(vis, "_now", lambda: t0 + vis.APPROVAL_TTL_S + 1)
+    vis.resolve_disclosure(a1, "approved", actor="boss")
+    assert _status(db_conn, a1) == "expired"
+    # 未过期：正常批准 + 单次消费
+    monkeypatch.setattr(vis, "_now", lambda: t0)
+    a2 = _request(db_conn, seeded)
+    vis.resolve_disclosure(a2, "approved", actor="boss")
+    assert _status(db_conn, a2) == "approved"
+    got = vis.consume_grant(a2, "sales")
+    assert got["title"] == PRIVATE_SAMPLE
+    assert vis.consume_grant(a2, "sales") == vis.PLACEHOLDER
+    # 过期 approved：consume 清扫转 expired
+    monkeypatch.setattr(vis, "_now", lambda: t0)
+    a3 = _request(db_conn, seeded)
+    vis.resolve_disclosure(a3, "approved", actor="boss")
+    monkeypatch.setattr(vis, "_now", lambda: t0 + vis.APPROVAL_TTL_S + 1)
+    assert vis.consume_grant(a3, "sales") == vis.PLACEHOLDER
+    assert _status(db_conn, a3) == "expired"
+    # 目标缺失：备选路径同样回滚到 approved
+    monkeypatch.setattr(vis, "_now", lambda: t0)
+    a4 = _request(db_conn, seeded)
+    vis.resolve_disclosure(a4, "approved", actor="boss")
+    with db_conn:
+        db_conn.execute("DELETE FROM tasks WHERE id=?", (seeded["cfo_private"],))
+    assert vis.consume_grant(a4, "sales") == vis.PLACEHOLDER
+    assert _status(db_conn, a4) == "approved"
+
+
+def test_fix3_nonjson1_concurrent_exactly_one(db_conn, seeded, monkeypatch):
+    """备选路径并发双消费同样恰好一次成功。"""
+    monkeypatch.setattr(vis, "_has_json1", lambda conn: False)
+    aid = _request(db_conn, seeded)
+    vis.resolve_disclosure(aid, "approved", actor="boss")
+    results, barrier = [], threading.Barrier(2)
+
+    def racer():
+        db.get_conn()
+        barrier.wait()
+        results.append(vis.consume_grant(aid, "sales"))
+        db.close_thread_conns()
+
+    ts = [threading.Thread(target=racer) for _ in range(2)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(timeout=15)
+    ok = [r for r in results if r != vis.PLACEHOLDER]
+    assert len(ok) == 1 and ok[0]["title"] == PRIVATE_SAMPLE
+
+
+def test_suggestion_context_filter_rejects_invalid_caller():
+    """建议1：filter_context_items 入口自身校验 caller，非法角色 fail closed。"""
+    for bad in ("ghost", "", None):
+        with pytest.raises(ValueError):
+            vis.filter_context_items([], bad)
+
+
+def test_suggestion_log_reserved_fields(isolated_env):
+    """建议2：timestamp/level 为内部保留字段，调用参数不得伪造。"""
+    # timestamp 在白名单内但属内部保留字段：经 fields 传入不得覆盖自动值
+    # （action/level 是签名参数，经 fields 传会 TypeError，故只伪造 timestamp）
+    audit_log.log("INFO", "probe", **{"timestamp": "1999-01-01T00:00:00+00:00",
+                                      "target_id": "42"})
+    rec = json.loads((config.LOG_DIR / "audit.log").read_text(encoding="utf-8").strip())
+    assert rec["level"] == "INFO"                    # 未被覆盖
+    assert not rec["timestamp"].startswith("1999")   # 未被覆盖
+    assert rec["action"] == "probe"                  # action 也不被 fields 覆盖
+    assert rec["target_id"] == "42"                  # 正常白名单字段不受影响
