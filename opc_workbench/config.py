@@ -121,6 +121,14 @@ DEFAULT_PRIVATE_ROLES = frozenset(
     k for k, v in ROLES.items() if v["default_visibility"] == "private"
 )
 
+# 敏感词升级表（PRD §4.2 规则2，M2.1 v3 §四.7）：命中即 private，宁可错杀，
+# 老板可显式改回 public。启发式词表，可调；不追求完备，角色默认兜底。
+SENSITIVE_HINTS = (
+    "病", "诊断", "药", "体检", "手术", "心理",
+    "工资", "存款", "账号", "密码", "银行卡", "身份证",
+    "分手", "离婚", "情感", "私事",
+)
+
 
 def role_label(role: str) -> str:
     info = ROLES.get(role)
