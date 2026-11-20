@@ -578,6 +578,53 @@ def test_fix4_bad_expires_type_fail_closed(db_conn, seeded, monkeypatch, bad, us
     assert _status(db_conn, aid) == "pending"
 
 
+@pytest.mark.parametrize("bad", _BAD_EXPIRES)
+@pytest.mark.parametrize("use_json1", [True, False], ids=["json1", "fallback"])
+def test_fix6_approved_then_bad_expires_consume_rejected(db_conn, seeded, monkeypatch,
+                                                         bad, use_json1):
+    """第三轮阻断A：先正常批准，再篡改 expires_at 为非法类型 → 真正进入消费判断。
+
+    断言：consume 返回 PLACEHOLDER；审批仍为 approved（未被消费）；
+    _sweep_expired 不把非法类型误判为已过期（状态不得变 expired）。
+    """
+    monkeypatch.setattr(vis, "_has_json1", lambda conn: use_json1)
+    aid = _request(db_conn, seeded)
+    vis.resolve_disclosure(aid, "approved", actor="boss")
+    assert _status(db_conn, aid) == "approved"      # 前置：确已批准
+
+    _set_expires(db_conn, aid, bad)                 # 批准后篡改时间类型
+    assert vis.consume_grant(aid, "sales") == vis.PLACEHOLDER
+    assert _status(db_conn, aid) == "approved"      # 未消费、未被误判过期
+
+    # 清扫路径单独验证：非法类型不得转 expired
+    conn = db.get_conn()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        vis._sweep_expired(conn, aid)
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    assert _status(db_conn, aid) == "approved"
+
+    # 恢复合法时间后仍可正常消费（证明守卫只拦非法类型，未损坏授权）
+    _set_expires(db_conn, aid, vis._now() + 3600)
+    got = vis.consume_grant(aid, "sales")
+    assert got["title"] == PRIVATE_SAMPLE
+    assert _status(db_conn, aid) == "expired"
+
+
+def test_fix6_fallback_final_update_has_kind_guard(db_conn, seeded, monkeypatch):
+    """第三轮阻断B：备选消费最终 UPDATE 自身限定 kind，bulk_delete 不被消费。"""
+    monkeypatch.setattr(vis, "_has_json1", lambda conn: False)
+    bid = _seed_bulk_delete(db_conn)
+    with db_conn:   # 直接把 bulk_delete 置为 approved，模拟极端状态
+        db_conn.execute("UPDATE approvals SET status='approved' WHERE id=?", (bid,))
+    assert vis.consume_grant(bid, "sales") == vis.PLACEHOLDER
+    assert _status(db_conn, bid) == "approved"      # 未被消费
+
+
 def test_fix4_numeric_string_expires_not_greater_than_now(db_conn, seeded):
     """复审实证场景：字符串 'garbage' 在裸比较下 > now 恒真，守卫后必须拒绝。"""
     aid = _request(db_conn, seeded)

@@ -375,7 +375,7 @@ def consume_grant(approval_id: int, to_role: str) -> dict:
                         and _is_num(expires) and expires > _now()):
                     cur = conn.execute(
                         "UPDATE approvals SET status='expired', resolved_at=? "
-                        "WHERE id=? AND status='approved'",
+                        "WHERE id=? AND kind='private_disclosure' AND status='approved'",
                         (db.now_iso(), approval_id),
                     )
                     won = cur.rowcount == 1
