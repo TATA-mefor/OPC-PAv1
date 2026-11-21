@@ -5,6 +5,7 @@
   → _build_identity(auth_backend) → IdentityAPI
   → _open_production_writer()（取得失败 fail fast，不静默降级）
   → _build_cas_service(authorize=identity_api.make_authorize(), writer=...)
+  → visibility.DisclosureService(writer)（M2 披露写能力显式注入）
   → build_tools(cas_service=...)（业务工具只接收注入实例）
   → launch（M6 补 Gradio 接线）
 
@@ -18,7 +19,7 @@ M6 接 Gradio 会话认证与确认弹窗后替换后端实现。
 """
 from __future__ import annotations
 
-from . import cas, db, identity
+from . import cas, db, identity, visibility
 
 
 class ProductionAuthBackend:
@@ -41,13 +42,14 @@ class ProductionAuthBackend:
 class Application:
     """组合根产物：持有生产实例引用（对象所有权边界）。"""
 
-    __slots__ = ("identity_api", "cas_service", "writer", "tools")
+    __slots__ = ("identity_api", "cas_service", "writer", "tools", "disclosure")
 
-    def __init__(self, *, identity_api, cas_service, writer, tools):
+    def __init__(self, *, identity_api, cas_service, writer, tools, disclosure):
         object.__setattr__(self, "identity_api", identity_api)
         object.__setattr__(self, "cas_service", cas_service)
         object.__setattr__(self, "writer", writer)
         object.__setattr__(self, "tools", tools)
+        object.__setattr__(self, "disclosure", disclosure)
 
     def __setattr__(self, *a):
         raise PermissionError("application_immutable")
@@ -59,12 +61,14 @@ def build_application() -> Application:
     auth_backend = ProductionAuthBackend()         # app 内部创建
     identity_api = identity._build_identity(auth_backend)
     production_writer = db._open_production_writer()
-    cas_service = cas._build_cas_service(
-        authorize=identity_api.make_authorize(), writer=production_writer)
+    authorize = identity_api.make_authorize()
+    cas_service = cas._build_cas_service(authorize=authorize, writer=production_writer)
+    # M2 披露写能力显式注入（db 侧已无普通模块可调用的获取入口）
+    disclosure = visibility.DisclosureService(production_writer)
     from .tools import build_tools
     tools = build_tools(cas_service=cas_service, identity_api=identity_api)
     return Application(identity_api=identity_api, cas_service=cas_service,
-                       writer=production_writer, tools=tools)
+                       writer=production_writer, tools=tools, disclosure=disclosure)
 
 
 def main() -> Application:

@@ -41,8 +41,8 @@ def get_conn(db_path: Path | str | None = None) -> sqlite3.Connection:
     与 Identity 的生产写旁路，与自建服务伪造授权属同一安全边界，不可作为
     兼容方案保留。现降级为 query_only 只读（与 get_read_conn 同缓存槽）：
     任何 INSERT/UPDATE/DELETE/DDL/BEGIN IMMEDIATE 在执行时被 SQLite 拒绝。
-    写操作唯一路径 = 组合根注入的 WriteCapability（M2 披露写经内部受控
-    写能力 _internal_writer，见下）。
+    写操作唯一路径 = 组合根注入的 WriteCapability（M3.2 起 M2 披露写经
+    显式注入的 DisclosureService，db 不再提供任何内部 writer 获取函数）。
     """
     return get_read_conn(db_path)
 
@@ -122,16 +122,20 @@ class WriteCapability:
     def in_transaction(self) -> bool:
         return object.__getattribute__(self, "_conn").in_transaction
 
-    def _bind_authorize(self, authorize) -> None:
-        """装配期一次性绑定 authorize（仅 CASService 构造内部调用）。
+    @property
+    def bound_authorize(self):
+        """组合根绑定的可信 authority（未绑定为 None）。"""
+        return object.__getattribute__(self, "_bound_authorize")
 
-        配对校验依据：生产 writer 只能与同一组合根装配的 authorize 配对；
-        已绑定后任何再次绑定（含同一函数）一律拒绝——伪造 authorize
-        拿生产 writer 构造服务的路径在构造期即断。
+    def _bind_authorize(self, authority) -> None:
+        """组合根取得 writer 后**立即**一次性绑定可信 authority。
+
+        M3.2 复审：绑定前移到组合根，CASService 构造期只校验不绑定，
+        消除"谁先构造谁赢"的先到先得窗口。已绑定后任何再次绑定一律拒绝。
         """
         if object.__getattribute__(self, "_bound_authorize") is not None:
             raise PermissionError("write_capability_already_paired")
-        object.__setattr__(self, "_bound_authorize", authorize)
+        object.__setattr__(self, "_bound_authorize", authority)
 
     def transaction(self):
         """with writer.transaction() as cur: ... —— 单事务写原语。
@@ -245,40 +249,16 @@ def _open_test_writer(db_path: Path | str) -> WriteCapability:
 
 
 # ---------------------------------------------------------------------------
-# 内部受控写能力（M2 披露写路径专用，用户裁决第2点）
+# M2 披露写能力（M3.2 复审：全局获取入口已删除）
 #
-# 定性：这不是公开工厂——模块级函数任何导入方可调，其约束与 get_conn 旧
-# 入口相同（进程内无硬边界）。保留它的唯一理由是 M2 披露函数签名零改动
-# （无注入参数）且业务语义/状态机不变；写 SQL 仍只经 WriteCapability 事务
-# 原语，与 M3 写路径同款纪律。真正封死的旁路是 get_conn 只读化：普通模块
-# 无法再经兼容符号取得可写连接执行任意 SQL。
+# 原 _internal_writer() / _close_internal_writer() / _internal_writer_local
+# 已整体移除：它们是普通模块可直接调用的生产写能力获取入口，且其 cap_id
+# 不等于 "production"，会跳过 CAS 配对校验（已实证可伪造 boss 越权写入）。
+#
+# 现行边界：生产写能力只由组合根经 _open_production_writer() 取得（一次性
+# + fail fast），取得后立即绑定可信 authority；M2 披露写经组合根显式注入
+# visibility.DisclosureService(writer)，本模块不再提供任何披露写获取函数。
 # ---------------------------------------------------------------------------
-
-_internal_writer_local = threading.local()
-
-
-def _internal_writer() -> WriteCapability:
-    """M2 披露写路径的受控写能力（线程本地，指向 config.DB_PATH）。
-
-    仅供 visibility.py 披露三函数内部使用；M3 业务写一律经组合根注入实例。
-    测试经 conftest 重定向 config.DB_PATH 到 tmp 库，天然隔离。
-    """
-    w = getattr(_internal_writer_local, "writer", None)
-    key = str(Path(config.DB_PATH).resolve())
-    if w is None or object.__getattribute__(w, "_db_path") != key:
-        if w is not None:
-            w.close()
-        w = _mint_writer(config.DB_PATH, cap_id="internal:m2_disclosure")
-        _internal_writer_local.writer = w
-    return w
-
-
-def _close_internal_writer() -> None:
-    """测试清理：关闭当前线程内部写能力。"""
-    w = getattr(_internal_writer_local, "writer", None)
-    if w is not None:
-        w.close()
-        _internal_writer_local.writer = None
 
 
 # ---------------------------------------------------------------------------

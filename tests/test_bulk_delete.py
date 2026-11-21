@@ -233,19 +233,19 @@ def test_concurrent_consume_exactly_once(db_conn, identity_api, boss_ctx, bulk_c
     assert len(ok) == 1 and ok[0]["deleted_n"] == 6
 
 
-def test_kind_isolation_both_directions(db_conn, identity_api, boss_ctx, bulk_ctx):
+def test_kind_isolation_both_directions(db_conn, identity_api, boss_ctx, bulk_ctx, disclosure):
     """bulk_delete 函数不触碰披露单；披露函数不触碰 bulk_delete 单。"""
     ids, _ = _seed(db_conn)
     aid = bd.request_bulk_delete("tasks", ids, _frame_caller="sales", _llm_args={}, _ctx=bulk_ctx)
     # 披露决议入口对 bulk_delete 单无效（kind 隔离）
-    visibility.resolve_disclosure(aid, "approved", actor="boss")
+    disclosure.resolve_disclosure(aid, "approved", actor="boss")
     assert _approval(db_conn, aid)["status"] == "pending"
     # bulk_delete 决议对披露单无效
     with db_conn:
         cur = db_conn.execute(
             "INSERT INTO tasks(title,owner_role,visibility,created_at,updated_at) "
             "VALUES('p','cfo','private',?,?)", (db.now_iso(), db.now_iso()))
-    d_aid = visibility.request_disclosure("tasks", cur.lastrowid, "cfo", "sales", "x")
+    d_aid = disclosure.request_disclosure("tasks", cur.lastrowid, "cfo", "sales", "x")
     bd.resolve_bulk_delete(d_aid, "approved", _frame_caller="boss",
                            _llm_args={}, _trusted_ctx=boss_ctx, _ctx=bulk_ctx)
     assert _approval(db_conn, d_aid)["status"] == "pending"

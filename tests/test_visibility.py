@@ -126,34 +126,34 @@ def test_v4_handoff_public_only_including_target_own_private():
 # V5 披露审批：原子消费 / 过期临界 / 同构占位 / 仅 boss 决议
 # ---------------------------------------------------------------------------
 
-def _request(db_conn, seeded, to_role="sales"):
-    return vis.request_disclosure("tasks", seeded["cfo_private"], "cfo", to_role, "报价核算")
+def _request(disclosure, seeded, to_role="sales"):
+    return disclosure.request_disclosure("tasks", seeded["cfo_private"], "cfo", to_role, "报价核算")
 
 
-def test_v5_pending_consume_placeholder(db_conn, seeded):
-    aid = _request(db_conn, seeded)
-    assert vis.consume_grant(aid, "sales") == vis.PLACEHOLDER
+def test_v5_pending_consume_placeholder(db_conn, seeded, disclosure):
+    aid = _request(disclosure, seeded)
+    assert disclosure.consume_grant(aid, "sales") == vis.PLACEHOLDER
 
 
-def test_v5_approve_consume_once(db_conn, seeded):
-    aid = _request(db_conn, seeded)
-    vis.resolve_disclosure(aid, "approved", actor="boss")
-    got = vis.consume_grant(aid, "sales")
+def test_v5_approve_consume_once(db_conn, seeded, disclosure):
+    aid = _request(disclosure, seeded)
+    disclosure.resolve_disclosure(aid, "approved", actor="boss")
+    got = disclosure.consume_grant(aid, "sales")
     assert got["title"] == PRIVATE_SAMPLE
-    assert vis.consume_grant(aid, "sales") == vis.PLACEHOLDER   # 二次消费失败
+    assert disclosure.consume_grant(aid, "sales") == vis.PLACEHOLDER   # 二次消费失败
     status = db_conn.execute("SELECT status FROM approvals WHERE id=?", (aid,)).fetchone()[0]
     assert status == "expired"
 
 
-def test_v5_concurrent_double_consume_exactly_one(db_conn, seeded):
-    aid = _request(db_conn, seeded)
-    vis.resolve_disclosure(aid, "approved", actor="boss")
+def test_v5_concurrent_double_consume_exactly_one(db_conn, seeded, disclosure):
+    aid = _request(disclosure, seeded)
+    disclosure.resolve_disclosure(aid, "approved", actor="boss")
     results, barrier = [], threading.Barrier(2)
 
     def racer():
         conn = db.get_read_conn()  # 每线程独立连接
         barrier.wait()
-        results.append(vis.consume_grant(aid, "sales"))
+        results.append(disclosure.consume_grant(aid, "sales"))
         db.close_thread_conns()
 
     ts = [threading.Thread(target=racer) for _ in range(2)]
@@ -165,94 +165,94 @@ def test_v5_concurrent_double_consume_exactly_one(db_conn, seeded):
     assert len(ok) == 1 and ok[0]["title"] == PRIVATE_SAMPLE
 
 
-def test_v5_placeholder_isomorphic_all_failure_modes(db_conn, seeded):
+def test_v5_placeholder_isomorphic_all_failure_modes(db_conn, seeded, disclosure):
     """未授权/过期/拒绝/角色不符/目标不存在/审批单不存在 → 完全同构。"""
     modes = []
-    modes.append(vis.consume_grant(_request(db_conn, seeded), "sales"))        # pending
-    a = _request(db_conn, seeded); vis.resolve_disclosure(a, "rejected", actor="boss")
-    modes.append(vis.consume_grant(a, "sales"))                                 # rejected
-    modes.append(vis.consume_grant(_request(db_conn, seeded), "marketing"))     # 角色不符(pending)
-    a = _request(db_conn, seeded); vis.resolve_disclosure(a, "approved", actor="boss")
-    modes.append(vis.consume_grant(a, "marketing"))                             # 角色不符(approved)
-    a = _request(db_conn, seeded, to_role="sales")
-    vis.resolve_disclosure(a, "approved", actor="boss")
+    modes.append(disclosure.consume_grant(_request(disclosure, seeded), "sales"))        # pending
+    a = _request(disclosure, seeded); disclosure.resolve_disclosure(a, "rejected", actor="boss")
+    modes.append(disclosure.consume_grant(a, "sales"))                                 # rejected
+    modes.append(disclosure.consume_grant(_request(disclosure, seeded), "marketing"))     # 角色不符(pending)
+    a = _request(disclosure, seeded); disclosure.resolve_disclosure(a, "approved", actor="boss")
+    modes.append(disclosure.consume_grant(a, "marketing"))                             # 角色不符(approved)
+    a = _request(disclosure, seeded, to_role="sales")
+    disclosure.resolve_disclosure(a, "approved", actor="boss")
     with db_conn:
         db_conn.execute("DELETE FROM tasks WHERE id=?", (seeded["cfo_private"],))
-    modes.append(vis.consume_grant(a, "sales"))                                 # 目标不存在
-    modes.append(vis.consume_grant(99999, "sales"))                             # 审批单不存在
+    modes.append(disclosure.consume_grant(a, "sales"))                                 # 目标不存在
+    modes.append(disclosure.consume_grant(99999, "sales"))                             # 审批单不存在
     for m in modes:
         assert m == vis.PLACEHOLDER
     assert all(json.dumps(m, sort_keys=True) == json.dumps(vis.PLACEHOLDER, sort_keys=True)
                for m in modes)
 
 
-def test_v5_only_boss_resolves(db_conn, seeded):
-    aid = _request(db_conn, seeded)
+def test_v5_only_boss_resolves(db_conn, seeded, disclosure):
+    aid = _request(disclosure, seeded)
     for actor in ("cfo", "sales", "coordinator", "personal"):
         with pytest.raises(PermissionError):
-            vis.resolve_disclosure(aid, "approved", actor=actor)
+            disclosure.resolve_disclosure(aid, "approved", actor=actor)
     assert db_conn.execute("SELECT status FROM approvals WHERE id=?", (aid,)).fetchone()[0] == "pending"
 
 
-def test_v5_decision_whitelist(db_conn, seeded):
-    aid = _request(db_conn, seeded)
+def test_v5_decision_whitelist(db_conn, seeded, disclosure):
+    aid = _request(disclosure, seeded)
     for bad in ("hacked", "APPROVED", "", "expired"):
         with pytest.raises(ValueError):
-            vis.resolve_disclosure(aid, bad, actor="boss")
+            disclosure.resolve_disclosure(aid, bad, actor="boss")
     assert db_conn.execute("SELECT status FROM approvals WHERE id=?", (aid,)).fetchone()[0] == "pending"
 
 
-def test_v5_repeat_resolve_idempotent(db_conn, seeded):
-    aid = _request(db_conn, seeded)
-    vis.resolve_disclosure(aid, "approved", actor="boss")
-    vis.resolve_disclosure(aid, "rejected", actor="boss")   # 不覆盖既有决议
+def test_v5_repeat_resolve_idempotent(db_conn, seeded, disclosure):
+    aid = _request(disclosure, seeded)
+    disclosure.resolve_disclosure(aid, "approved", actor="boss")
+    disclosure.resolve_disclosure(aid, "rejected", actor="boss")   # 不覆盖既有决议
     assert db_conn.execute("SELECT status FROM approvals WHERE id=?", (aid,)).fetchone()[0] == "approved"
 
 
-def test_v5_expiry_critical_resolve(db_conn, seeded, monkeypatch):
+def test_v5_expiry_critical_resolve(db_conn, seeded, monkeypatch, disclosure):
     """临界：expires_at-1s 可决议；+1s 拒绝且 pending 已转 expired；恰等判过期。
 
     三个审批单均在同一基准时刻 t0 申请（expires_at 相同），再分别拨钟验证。
     """
     t0 = 1_000_000.0
     monkeypatch.setattr(vis, "_now", lambda: t0)
-    aid1 = _request(db_conn, seeded)
-    aid2 = _request(db_conn, seeded)
-    aid3 = _request(db_conn, seeded)
+    aid1 = _request(disclosure, seeded)
+    aid2 = _request(disclosure, seeded)
+    aid3 = _request(disclosure, seeded)
     expires = t0 + vis.APPROVAL_TTL_S
 
     # -1s：仍可决议
     monkeypatch.setattr(vis, "_now", lambda: expires - 1)
-    vis.resolve_disclosure(aid1, "approved", actor="boss")
+    disclosure.resolve_disclosure(aid1, "approved", actor="boss")
     assert db_conn.execute("SELECT status FROM approvals WHERE id=?", (aid1,)).fetchone()[0] == "approved"
 
     # +1s：决议被拒（幂等无操作），且 pending 已被 _sweep_expired 转为 expired
     monkeypatch.setattr(vis, "_now", lambda: expires + 1)
-    vis.resolve_disclosure(aid2, "approved", actor="boss")
+    disclosure.resolve_disclosure(aid2, "approved", actor="boss")
     assert db_conn.execute("SELECT status FROM approvals WHERE id=?", (aid2,)).fetchone()[0] == "expired"
 
     # 恰等 expires_at：<= 语义判过期
     monkeypatch.setattr(vis, "_now", lambda: expires)
-    vis.resolve_disclosure(aid3, "approved", actor="boss")
+    disclosure.resolve_disclosure(aid3, "approved", actor="boss")
     assert db_conn.execute("SELECT status FROM approvals WHERE id=?", (aid3,)).fetchone()[0] == "expired"
 
 
-def test_v5_expiry_critical_consume(db_conn, seeded, monkeypatch):
+def test_v5_expiry_critical_consume(db_conn, seeded, monkeypatch, disclosure):
     t0 = 2_000_000.0
     monkeypatch.setattr(vis, "_now", lambda: t0)
-    aid = _request(db_conn, seeded)
-    vis.resolve_disclosure(aid, "approved", actor="boss")
+    aid = _request(disclosure, seeded)
+    disclosure.resolve_disclosure(aid, "approved", actor="boss")
     expires = t0 + vis.APPROVAL_TTL_S
     monkeypatch.setattr(vis, "_now", lambda: expires + 1)   # 授权超期
-    assert vis.consume_grant(aid, "sales") == vis.PLACEHOLDER
+    assert disclosure.consume_grant(aid, "sales") == vis.PLACEHOLDER
 
 
-def test_v5_corrupt_payload_fail_closed(db_conn, seeded):
-    aid = _request(db_conn, seeded)
-    vis.resolve_disclosure(aid, "approved", actor="boss")
+def test_v5_corrupt_payload_fail_closed(db_conn, seeded, disclosure):
+    aid = _request(disclosure, seeded)
+    disclosure.resolve_disclosure(aid, "approved", actor="boss")
     with db_conn:
         db_conn.execute("UPDATE approvals SET payload='{broken json' WHERE id=?", (aid,))
-    assert vis.consume_grant(aid, "sales") == vis.PLACEHOLDER   # 不泄露、不崩溃
+    assert disclosure.consume_grant(aid, "sales") == vis.PLACEHOLDER   # 不泄露、不崩溃
 
 
 # ---------------------------------------------------------------------------
@@ -349,12 +349,12 @@ def test_v8_session_legal_in_memory_never_in_sqlite(db_conn):
 # V9 日志全文无 private/Key + 注入清洗
 # ---------------------------------------------------------------------------
 
-def test_v9_log_scan_no_private_no_key(db_conn, seeded):
-    aid = _request(db_conn, seeded)
-    vis.resolve_disclosure(aid, "approved", actor="boss")
-    vis.consume_grant(aid, "sales")
+def test_v9_log_scan_no_private_no_key(db_conn, seeded, disclosure):
+    aid = _request(disclosure, seeded)
+    disclosure.resolve_disclosure(aid, "approved", actor="boss")
+    disclosure.consume_grant(aid, "sales")
     vis.resolve_caller("sales", {"caller_role": "boss"})
-    vis.request_disclosure("tasks", seeded["cfo_private"], "cfo", "hr", PRIVATE_SAMPLE)
+    disclosure.request_disclosure("tasks", seeded["cfo_private"], "cfo", "hr", PRIVATE_SAMPLE)
     log_text = (config.LOG_DIR / "audit.log").read_text(encoding="utf-8")
     assert PRIVATE_SAMPLE not in log_text     # reason 含私密样本也不落盘
     assert KEY_SAMPLE not in log_text
@@ -400,34 +400,34 @@ def _status(db_conn, aid):
     return db_conn.execute("SELECT status FROM approvals WHERE id=?", (aid,)).fetchone()[0]
 
 
-def test_fix1_consume_sweeps_expired_pending(db_conn, seeded, monkeypatch):
+def test_fix1_consume_sweeps_expired_pending(db_conn, seeded, monkeypatch, disclosure):
     """阻断1：过期 pending 在 consume 后转为 expired（不再滞留 pending）。"""
     t0 = 3_000_000.0
     monkeypatch.setattr(vis, "_now", lambda: t0)
-    aid = _request(db_conn, seeded)
+    aid = _request(disclosure, seeded)
     monkeypatch.setattr(vis, "_now", lambda: t0 + vis.APPROVAL_TTL_S + 1)
-    assert vis.consume_grant(aid, "sales") == vis.PLACEHOLDER
+    assert disclosure.consume_grant(aid, "sales") == vis.PLACEHOLDER
     assert _status(db_conn, aid) == "expired"
 
 
-def test_fix1_consume_sweeps_expired_approved(db_conn, seeded, monkeypatch):
+def test_fix1_consume_sweeps_expired_approved(db_conn, seeded, monkeypatch, disclosure):
     """阻断1：过期 approved 在 consume 后转为 expired。"""
     t0 = 3_100_000.0
     monkeypatch.setattr(vis, "_now", lambda: t0)
-    aid = _request(db_conn, seeded)
-    vis.resolve_disclosure(aid, "approved", actor="boss")
+    aid = _request(disclosure, seeded)
+    disclosure.resolve_disclosure(aid, "approved", actor="boss")
     monkeypatch.setattr(vis, "_now", lambda: t0 + vis.APPROVAL_TTL_S + 1)
-    assert vis.consume_grant(aid, "sales") == vis.PLACEHOLDER
+    assert disclosure.consume_grant(aid, "sales") == vis.PLACEHOLDER
     assert _status(db_conn, aid) == "expired"
 
 
-def test_fix2_target_missing_rolls_back_grant(db_conn, seeded):
+def test_fix2_target_missing_rolls_back_grant(db_conn, seeded, disclosure):
     """阻断2：目标不存在 → 整体回滚，审批恢复 approved 可重试，无半消费。"""
-    aid = _request(db_conn, seeded)
-    vis.resolve_disclosure(aid, "approved", actor="boss")
+    aid = _request(disclosure, seeded)
+    disclosure.resolve_disclosure(aid, "approved", actor="boss")
     with db_conn:
         db_conn.execute("DELETE FROM tasks WHERE id=?", (seeded["cfo_private"],))
-    assert vis.consume_grant(aid, "sales") == vis.PLACEHOLDER
+    assert disclosure.consume_grant(aid, "sales") == vis.PLACEHOLDER
     assert _status(db_conn, aid) == "approved"      # 未烧掉，可重试
     # 目标恢复后重试成功（证明回滚完整、授权仍有效）
     new_id = _seed_task(db_conn, "cfo", "private", PRIVATE_SAMPLE)
@@ -435,45 +435,43 @@ def test_fix2_target_missing_rolls_back_grant(db_conn, seeded):
         db_conn.execute(
             "UPDATE approvals SET payload=json_set(payload,'$.item_id',?) WHERE id=?",
             (new_id, aid))
-    got = vis.consume_grant(aid, "sales")
+    got = disclosure.consume_grant(aid, "sales")
     assert got["title"] == PRIVATE_SAMPLE
     assert _status(db_conn, aid) == "expired"
 
 
-def test_fix2_corrupt_payload_rolls_back(db_conn, seeded):
+def test_fix2_corrupt_payload_rolls_back(db_conn, seeded, disclosure):
     """阻断2：payload 损坏 → 回滚，审批状态不变（approved），fail closed。"""
-    aid = _request(db_conn, seeded)
-    vis.resolve_disclosure(aid, "approved", actor="boss")
+    aid = _request(disclosure, seeded)
+    disclosure.resolve_disclosure(aid, "approved", actor="boss")
     with db_conn:
         db_conn.execute("UPDATE approvals SET payload='{broken' WHERE id=?", (aid,))
-    assert vis.consume_grant(aid, "sales") == vis.PLACEHOLDER
+    assert disclosure.consume_grant(aid, "sales") == vis.PLACEHOLDER
     assert _status(db_conn, aid) == "approved"      # 回滚，未半消费
     assert not db.get_read_conn().in_transaction
 
 
-def test_fix2_read_failure_rolls_back(db_conn, seeded, monkeypatch):
+def test_fix2_read_failure_rolls_back(db_conn, seeded, monkeypatch, disclosure):
     """阻断2：目标读取异常 → 整体回滚（连接代理注入读取故障）。"""
-    aid = _request(db_conn, seeded)
-    vis.resolve_disclosure(aid, "approved", actor="boss")
-    real_conn = db.get_read_conn()
+    aid = _request(disclosure, seeded)
+    disclosure.resolve_disclosure(aid, "approved", actor="boss")
+    # 必须用可写连接：get_read_conn 已 query_only=ON，BEGIN IMMEDIATE 会先失败，
+    # 那样异常在取写锁阶段就被吞掉，根本走不到"目标读取失败"路径（平凡通过）。
+    real_conn = sqlite3.connect(config.DB_PATH)
+    real_conn.row_factory = sqlite3.Row
+    fired = []
 
     class FlakyConn:
         """代理真实连接：仅目标读取抛错，其余透传（sqlite3 属性只读，不能直接 patch）。"""
 
         def execute(self, sql, *a, **kw):
             if sql.startswith("SELECT * FROM tasks WHERE id="):
+                fired.append(sql)
                 raise sqlite3.OperationalError("simulated read failure")
             return real_conn.execute(sql, *a, **kw)
 
         def __getattr__(self, name):
             return getattr(real_conn, name)
-
-    class FlakyWriter:
-        """代理内部写能力：transaction() 返回的游标仅目标读取抛错。"""
-        def transaction(self):
-            return _FlakyTxn(real_conn)
-        def __getattr__(self, name):
-            return getattr(db._internal_writer(), name)
 
     class _FlakyTxn:
         def __init__(self, conn):
@@ -489,59 +487,75 @@ def test_fix2_read_failure_rolls_back(db_conn, seeded, monkeypatch):
                     self._conn.execute("ROLLBACK")
             return False
 
-    monkeypatch.setattr(db, "_internal_writer", lambda: FlakyWriter())
-    assert vis.consume_grant(aid, "sales") == vis.PLACEHOLDER
-    monkeypatch.undo()
+    class FlakyWriter(db.WriteCapability):
+        """故障写能力：仍是 WriteCapability 子类型，经**构造期注入**进新服务。
+
+        M3.2：不再 monkeypatch db._internal_writer（该入口已删除）。
+        """
+        __slots__ = ()
+
+        def transaction(self):
+            return _FlakyTxn(real_conn)
+
+    flaky = db.WriteCapability.__new__(FlakyWriter)
+    object.__setattr__(flaky, "_cap_id", "test:flaky")
+    object.__setattr__(flaky, "_db_path", config.DB_PATH)
+    object.__setattr__(flaky, "_conn", real_conn)
+    flaky_service = vis.DisclosureService(flaky)
+
+    assert flaky_service.consume_grant(aid, "sales") == vis.PLACEHOLDER
+    assert fired, "目标读取故障未触发，用例没有覆盖到预期路径"
     assert _status(db_conn, aid) == "approved"
     assert not real_conn.in_transaction
+    real_conn.close()
 
 
-def test_fix3_nonjson1_paths_semantics_match(db_conn, seeded, monkeypatch):
+def test_fix3_nonjson1_paths_semantics_match(db_conn, seeded, monkeypatch, disclosure):
     """阻断3：JSON1 不可用时，resolve/consume 过期与消费语义与主路径一致。"""
     monkeypatch.setattr(vis, "_has_json1", lambda conn: False)
     t0 = 3_200_000.0
     monkeypatch.setattr(vis, "_now", lambda: t0)
     # 过期 pending：resolve 拒绝且转 expired
-    a1 = _request(db_conn, seeded)
+    a1 = _request(disclosure, seeded)
     monkeypatch.setattr(vis, "_now", lambda: t0 + vis.APPROVAL_TTL_S + 1)
-    vis.resolve_disclosure(a1, "approved", actor="boss")
+    disclosure.resolve_disclosure(a1, "approved", actor="boss")
     assert _status(db_conn, a1) == "expired"
     # 未过期：正常批准 + 单次消费
     monkeypatch.setattr(vis, "_now", lambda: t0)
-    a2 = _request(db_conn, seeded)
-    vis.resolve_disclosure(a2, "approved", actor="boss")
+    a2 = _request(disclosure, seeded)
+    disclosure.resolve_disclosure(a2, "approved", actor="boss")
     assert _status(db_conn, a2) == "approved"
-    got = vis.consume_grant(a2, "sales")
+    got = disclosure.consume_grant(a2, "sales")
     assert got["title"] == PRIVATE_SAMPLE
-    assert vis.consume_grant(a2, "sales") == vis.PLACEHOLDER
+    assert disclosure.consume_grant(a2, "sales") == vis.PLACEHOLDER
     # 过期 approved：consume 清扫转 expired
     monkeypatch.setattr(vis, "_now", lambda: t0)
-    a3 = _request(db_conn, seeded)
-    vis.resolve_disclosure(a3, "approved", actor="boss")
+    a3 = _request(disclosure, seeded)
+    disclosure.resolve_disclosure(a3, "approved", actor="boss")
     monkeypatch.setattr(vis, "_now", lambda: t0 + vis.APPROVAL_TTL_S + 1)
-    assert vis.consume_grant(a3, "sales") == vis.PLACEHOLDER
+    assert disclosure.consume_grant(a3, "sales") == vis.PLACEHOLDER
     assert _status(db_conn, a3) == "expired"
     # 目标缺失：备选路径同样回滚到 approved
     monkeypatch.setattr(vis, "_now", lambda: t0)
-    a4 = _request(db_conn, seeded)
-    vis.resolve_disclosure(a4, "approved", actor="boss")
+    a4 = _request(disclosure, seeded)
+    disclosure.resolve_disclosure(a4, "approved", actor="boss")
     with db_conn:
         db_conn.execute("DELETE FROM tasks WHERE id=?", (seeded["cfo_private"],))
-    assert vis.consume_grant(a4, "sales") == vis.PLACEHOLDER
+    assert disclosure.consume_grant(a4, "sales") == vis.PLACEHOLDER
     assert _status(db_conn, a4) == "approved"
 
 
-def test_fix3_nonjson1_concurrent_exactly_one(db_conn, seeded, monkeypatch):
+def test_fix3_nonjson1_concurrent_exactly_one(db_conn, seeded, monkeypatch, disclosure):
     """备选路径并发双消费同样恰好一次成功。"""
     monkeypatch.setattr(vis, "_has_json1", lambda conn: False)
-    aid = _request(db_conn, seeded)
-    vis.resolve_disclosure(aid, "approved", actor="boss")
+    aid = _request(disclosure, seeded)
+    disclosure.resolve_disclosure(aid, "approved", actor="boss")
     results, barrier = [], threading.Barrier(2)
 
     def racer():
         db.get_read_conn()
         barrier.wait()
-        results.append(vis.consume_grant(aid, "sales"))
+        results.append(disclosure.consume_grant(aid, "sales"))
         db.close_thread_conns()
 
     ts = [threading.Thread(target=racer) for _ in range(2)]
@@ -586,35 +600,35 @@ def _set_expires(db_conn, aid, value):
 
 @pytest.mark.parametrize("bad", _BAD_EXPIRES)
 @pytest.mark.parametrize("use_json1", [True, False], ids=["json1", "fallback"])
-def test_fix4_bad_expires_type_fail_closed(db_conn, seeded, monkeypatch, bad, use_json1):
+def test_fix4_bad_expires_type_fail_closed(db_conn, seeded, monkeypatch, bad, use_json1, disclosure):
     """阻断1：非法 expires_at 类型（字符串/布尔/null/数组/对象）两路径一律拒绝。"""
     monkeypatch.setattr(vis, "_has_json1", lambda conn: use_json1)
-    aid = _request(db_conn, seeded)
+    aid = _request(disclosure, seeded)
     _set_expires(db_conn, aid, bad)
     # 决议被拒：状态保持 pending（类型非法不被清扫转换，也不被批准）
-    vis.resolve_disclosure(aid, "approved", actor="boss")
+    disclosure.resolve_disclosure(aid, "approved", actor="boss")
     assert _status(db_conn, aid) == "pending"
     # 消费被拒：同构占位，状态不变
-    assert vis.consume_grant(aid, "sales") == vis.PLACEHOLDER
+    assert disclosure.consume_grant(aid, "sales") == vis.PLACEHOLDER
     assert _status(db_conn, aid) == "pending"
 
 
 @pytest.mark.parametrize("bad", _BAD_EXPIRES)
 @pytest.mark.parametrize("use_json1", [True, False], ids=["json1", "fallback"])
 def test_fix6_approved_then_bad_expires_consume_rejected(db_conn, seeded, monkeypatch,
-                                                         bad, use_json1):
+                                                         bad, use_json1, disclosure):
     """第三轮阻断A：先正常批准，再篡改 expires_at 为非法类型 → 真正进入消费判断。
 
     断言：consume 返回 PLACEHOLDER；审批仍为 approved（未被消费）；
     _sweep_expired 不把非法类型误判为已过期（状态不得变 expired）。
     """
     monkeypatch.setattr(vis, "_has_json1", lambda conn: use_json1)
-    aid = _request(db_conn, seeded)
-    vis.resolve_disclosure(aid, "approved", actor="boss")
+    aid = _request(disclosure, seeded)
+    disclosure.resolve_disclosure(aid, "approved", actor="boss")
     assert _status(db_conn, aid) == "approved"      # 前置：确已批准
 
     _set_expires(db_conn, aid, bad)                 # 批准后篡改时间类型
-    assert vis.consume_grant(aid, "sales") == vis.PLACEHOLDER
+    assert disclosure.consume_grant(aid, "sales") == vis.PLACEHOLDER
     assert _status(db_conn, aid) == "approved"      # 未消费、未被误判过期
 
     # 清扫路径单独验证：非法类型不得转 expired（经夹具可写连接）
@@ -631,24 +645,24 @@ def test_fix6_approved_then_bad_expires_consume_rejected(db_conn, seeded, monkey
 
     # 恢复合法时间后仍可正常消费（证明守卫只拦非法类型，未损坏授权）
     _set_expires(db_conn, aid, vis._now() + 3600)
-    got = vis.consume_grant(aid, "sales")
+    got = disclosure.consume_grant(aid, "sales")
     assert got["title"] == PRIVATE_SAMPLE
     assert _status(db_conn, aid) == "expired"
 
 
-def test_fix6_fallback_final_update_has_kind_guard(db_conn, seeded, monkeypatch):
+def test_fix6_fallback_final_update_has_kind_guard(db_conn, seeded, monkeypatch, disclosure):
     """第三轮阻断B：备选消费最终 UPDATE 自身限定 kind，bulk_delete 不被消费。"""
     monkeypatch.setattr(vis, "_has_json1", lambda conn: False)
     bid = _seed_bulk_delete(db_conn)
     with db_conn:   # 直接把 bulk_delete 置为 approved，模拟极端状态
         db_conn.execute("UPDATE approvals SET status='approved' WHERE id=?", (bid,))
-    assert vis.consume_grant(bid, "sales") == vis.PLACEHOLDER
+    assert disclosure.consume_grant(bid, "sales") == vis.PLACEHOLDER
     assert _status(db_conn, bid) == "approved"      # 未被消费
 
 
-def test_fix4_numeric_string_expires_not_greater_than_now(db_conn, seeded):
+def test_fix4_numeric_string_expires_not_greater_than_now(db_conn, seeded, disclosure):
     """复审实证场景：字符串 'garbage' 在裸比较下 > now 恒真，守卫后必须拒绝。"""
-    aid = _request(db_conn, seeded)
+    aid = _request(disclosure, seeded)
     _set_expires(db_conn, aid, "garbage")
     # 直接验证守卫 SQL 语义
     row = db_conn.execute(
@@ -656,18 +670,18 @@ def test_fix4_numeric_string_expires_not_greater_than_now(db_conn, seeded):
         "json_type(payload,'$.expires_at') IN ('integer','real') AS guarded "
         "FROM approvals WHERE id=?", (aid,)).fetchone()
     assert row["bare"] == 1 and row["guarded"] == 0   # 缺口存在，守卫拦截
-    vis.resolve_disclosure(aid, "approved", actor="boss")
+    disclosure.resolve_disclosure(aid, "approved", actor="boss")
     assert _status(db_conn, aid) == "pending"
 
 
-def test_fix4_valid_numeric_types_still_work(db_conn, seeded):
+def test_fix4_valid_numeric_types_still_work(db_conn, seeded, disclosure):
     """integer 与 real 两种合法数值类型不受守卫误伤。"""
     for value in (int(vis._now() + 3600), vis._now() + 3600.5):
-        aid = _request(db_conn, seeded)
+        aid = _request(disclosure, seeded)
         _set_expires(db_conn, aid, value)
-        vis.resolve_disclosure(aid, "approved", actor="boss")
+        disclosure.resolve_disclosure(aid, "approved", actor="boss")
         assert _status(db_conn, aid) == "approved"
-        got = vis.consume_grant(aid, "sales")
+        got = disclosure.consume_grant(aid, "sales")
         assert got["title"] == PRIVATE_SAMPLE
 
 
@@ -682,18 +696,18 @@ def _seed_bulk_delete(db_conn):
 
 
 @pytest.mark.parametrize("use_json1", [True, False], ids=["json1", "fallback"])
-def test_fix5_bulk_delete_not_resolvable_or_consumable(db_conn, seeded, monkeypatch, use_json1):
+def test_fix5_bulk_delete_not_resolvable_or_consumable(db_conn, seeded, monkeypatch, use_json1, disclosure):
     """阻断2：bulk_delete 审批单不能被披露接口批准或消费（两路径一致）。"""
     monkeypatch.setattr(vis, "_has_json1", lambda conn: use_json1)
     bid = _seed_bulk_delete(db_conn)
-    vis.resolve_disclosure(bid, "approved", actor="boss")   # 幂等无操作
+    disclosure.resolve_disclosure(bid, "approved", actor="boss")   # 幂等无操作
     assert _status(db_conn, bid) == "pending"               # 未被批准
-    assert vis.consume_grant(bid, "sales") == vis.PLACEHOLDER
+    assert disclosure.consume_grant(bid, "sales") == vis.PLACEHOLDER
     assert _status(db_conn, bid) == "pending"               # 未被消费/清扫
     # 对照：同库的披露单不受影响，正常批准消费
-    aid = _request(db_conn, seeded)
-    vis.resolve_disclosure(aid, "approved", actor="boss")
-    assert vis.consume_grant(aid, "sales")["title"] == PRIVATE_SAMPLE
+    aid = _request(disclosure, seeded)
+    disclosure.resolve_disclosure(aid, "approved", actor="boss")
+    assert disclosure.consume_grant(aid, "sales")["title"] == PRIVATE_SAMPLE
 
 
 def test_suggestion_log_reserved_fields(isolated_env):
