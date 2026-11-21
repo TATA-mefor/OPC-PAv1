@@ -26,25 +26,27 @@ def test_gradio_blocks_builds():
 
 
 def test_sqlite_wal_multithread_writes(db_conn):
-    """WAL 模式下多线程并发写不丢行、不锁死。"""
+    """WAL 模式下多线程并发写不丢行、不锁死。
+
+    写经 WriteCapability 事务原语（get_conn 已只读化，用户裁决 2026-11-21）；
+    writer 跨线程共享（check_same_thread=False + 实例锁串行），与生产同款。
+    """
     assert db_conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
 
     errors: list[Exception] = []
+    writer = db._open_test_writer(config.DB_PATH)
 
     def worker(n: int):
         try:
-            conn = db.get_conn()  # 每线程独立连接
             for i in range(20):
-                with conn:
-                    conn.execute(
+                with writer.transaction() as cur:
+                    cur.execute(
                         "INSERT INTO tasks(title,owner_role,created_at,updated_at) "
                         "VALUES(?,?,?,?)",
                         (f"t{n}-{i}", "sales", db.now_iso(), db.now_iso()),
                     )
         except Exception as exc:  # noqa: BLE001
             errors.append(exc)
-        finally:
-            db.close_thread_conns()
 
     threads = [threading.Thread(target=worker, args=(n,)) for n in range(4)]
     for t in threads:
@@ -55,6 +57,7 @@ def test_sqlite_wal_multithread_writes(db_conn):
     assert not any(t.is_alive() for t in threads)
     total = db_conn.execute("SELECT COUNT(*) c FROM tasks").fetchone()["c"]
     assert total == 80
+    writer.close()
 
 
 def test_mock_llm_roundtrip(isolated_env):

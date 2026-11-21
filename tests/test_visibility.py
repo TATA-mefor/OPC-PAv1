@@ -151,7 +151,7 @@ def test_v5_concurrent_double_consume_exactly_one(db_conn, seeded):
     results, barrier = [], threading.Barrier(2)
 
     def racer():
-        conn = db.get_conn()  # 每线程独立连接
+        conn = db.get_read_conn()  # 每线程独立连接
         barrier.wait()
         results.append(vis.consume_grant(aid, "sales"))
         db.close_thread_conns()
@@ -448,14 +448,14 @@ def test_fix2_corrupt_payload_rolls_back(db_conn, seeded):
         db_conn.execute("UPDATE approvals SET payload='{broken' WHERE id=?", (aid,))
     assert vis.consume_grant(aid, "sales") == vis.PLACEHOLDER
     assert _status(db_conn, aid) == "approved"      # 回滚，未半消费
-    assert not db.get_conn().in_transaction
+    assert not db.get_read_conn().in_transaction
 
 
 def test_fix2_read_failure_rolls_back(db_conn, seeded, monkeypatch):
     """阻断2：目标读取异常 → 整体回滚（连接代理注入读取故障）。"""
     aid = _request(db_conn, seeded)
     vis.resolve_disclosure(aid, "approved", actor="boss")
-    real_conn = db.get_conn()
+    real_conn = db.get_read_conn()
 
     class FlakyConn:
         """代理真实连接：仅目标读取抛错，其余透传（sqlite3 属性只读，不能直接 patch）。"""
@@ -468,7 +468,28 @@ def test_fix2_read_failure_rolls_back(db_conn, seeded, monkeypatch):
         def __getattr__(self, name):
             return getattr(real_conn, name)
 
-    monkeypatch.setattr(db, "get_conn", lambda *a, **kw: FlakyConn())
+    class FlakyWriter:
+        """代理内部写能力：transaction() 返回的游标仅目标读取抛错。"""
+        def transaction(self):
+            return _FlakyTxn(real_conn)
+        def __getattr__(self, name):
+            return getattr(db._internal_writer(), name)
+
+    class _FlakyTxn:
+        def __init__(self, conn):
+            self._conn = conn
+        def __enter__(self):
+            self._conn.execute("BEGIN IMMEDIATE")
+            return FlakyConn()
+        def __exit__(self, exc_type, exc, tb):
+            if exc_type is None:
+                self._conn.execute("COMMIT")
+            else:
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+            return False
+
+    monkeypatch.setattr(db, "_internal_writer", lambda: FlakyWriter())
     assert vis.consume_grant(aid, "sales") == vis.PLACEHOLDER
     monkeypatch.undo()
     assert _status(db_conn, aid) == "approved"
@@ -518,7 +539,7 @@ def test_fix3_nonjson1_concurrent_exactly_one(db_conn, seeded, monkeypatch):
     results, barrier = [], threading.Barrier(2)
 
     def racer():
-        db.get_conn()
+        db.get_read_conn()
         barrier.wait()
         results.append(vis.consume_grant(aid, "sales"))
         db.close_thread_conns()
@@ -596,8 +617,8 @@ def test_fix6_approved_then_bad_expires_consume_rejected(db_conn, seeded, monkey
     assert vis.consume_grant(aid, "sales") == vis.PLACEHOLDER
     assert _status(db_conn, aid) == "approved"      # 未消费、未被误判过期
 
-    # 清扫路径单独验证：非法类型不得转 expired
-    conn = db.get_conn()
+    # 清扫路径单独验证：非法类型不得转 expired（经夹具可写连接）
+    conn = db_conn
     conn.execute("BEGIN IMMEDIATE")
     try:
         vis._sweep_expired(conn, aid)

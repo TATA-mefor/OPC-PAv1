@@ -14,7 +14,7 @@ import sqlite3
 
 import pytest
 
-from opc_workbench import db
+from opc_workbench import config, db
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +64,11 @@ def v2_conn(isolated_env, monkeypatch):
         assert db.init_db() == 2
     finally:
         monkeypatch.setattr(db, "MIGRATIONS", full)
-    return db.get_conn()
+    import sqlite3
+    conn = sqlite3.connect(str(config.DB_PATH), timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +181,9 @@ def test_m003_failure_rolls_back_completely(v2_conn, monkeypatch):
 def test_m003_fresh_db_boss_writable(isolated_env):
     """全新库直接走到 v4：boss 归属可写、version 默认 1、updated_at 必填。"""
     assert db.init_db() == 4
-    conn = db.get_conn()
+    import sqlite3
+    conn = sqlite3.connect(str(config.DB_PATH), timeout=5.0)
+    conn.row_factory = sqlite3.Row
     with conn:
         cur = conn.execute(
             "INSERT INTO artifacts(kind,title,content_md,owner_role,period_key,"

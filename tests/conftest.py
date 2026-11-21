@@ -108,14 +108,24 @@ def isolated_env(request, tmp_path, monkeypatch):
     yield {"data_dir": data_dir, "vault_dir": vault_dir, "fake_llm": fake}
 
     db.close_thread_conns()
+    db._close_internal_writer()
     llm_client.set_llm(None)
 
 
 @pytest.fixture()
 def db_conn(isolated_env):
-    """已迁移的测试库连接。"""
+    """已迁移的测试库**可写**连接（测试播种专用）。
+
+    get_conn 已只读化（用户裁决 2026-11-21），测试播种不再经兼容符号；
+    本夹具直接打开 tmp 测试库连接（测试工具代码，非生产模块路径）。
+    """
+    import sqlite3
     db.init_db()
-    return db.get_conn()
+    conn = sqlite3.connect(str(config.DB_PATH), timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
+    yield conn
+    conn.close()
 
 
 # ---------------------------------------------------------------------------

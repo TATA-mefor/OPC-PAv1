@@ -209,16 +209,19 @@ def request_disclosure(item_table: str, item_id: int, from_role: str,
         "reason": str(reason)[:200], "grant_once": True,
         "expires_at": _now() + APPROVAL_TTL_S,
     }
-    conn = db.get_conn()
-    with conn:
-        cur = conn.execute(
+    # 写经内部受控写能力（get_conn 已只读化，用户裁决 2026-11-21）；
+    # 业务语义/状态机零改动。
+    writer = db._internal_writer()
+    with writer.transaction() as cur:
+        cur.execute(
             "INSERT INTO approvals(kind,payload,status,created_at) "
             "VALUES('private_disclosure',?,'pending',?)",
             (json.dumps(payload, ensure_ascii=False), db.now_iso()),
         )
+        approval_id = cur.lastrowid
     audit_log.log("INFO", "disclosure_requested", actor_role=from_role,
-                  target_table=item_table, target_id=item_id, approval_id=cur.lastrowid)
-    return cur.lastrowid
+                  target_table=item_table, target_id=item_id, approval_id=approval_id)
+    return approval_id
 
 
 def _is_num(value) -> bool:
@@ -291,10 +294,11 @@ def resolve_disclosure(approval_id: int, decision: str, *, actor: str) -> None:
         raise PermissionError("boss_only")
     if decision not in _DECISIONS:            # 白名单先校验，任意串不进状态字段
         raise ValueError(f"forbidden_decision:{decision}")
-    conn = db.get_conn()
+    # 写经内部受控写能力（get_conn 已只读化）；BEGIN IMMEDIATE/COMMIT/
+    # ROLLBACK 由事务原语保证，状态机与守卫 SQL 零改动。
+    writer = db._internal_writer()
     rowcount = 0
-    conn.execute("BEGIN IMMEDIATE")           # 两路径统一写事务边界
-    try:
+    with writer.transaction() as conn:
         _sweep_expired(conn, approval_id)
         if _has_json1(conn):
             cur = conn.execute(
@@ -315,11 +319,6 @@ def resolve_disclosure(approval_id: int, decision: str, *, actor: str) -> None:
                     (decision, db.now_iso(), approval_id),
                 )
                 rowcount = cur.rowcount
-        conn.execute("COMMIT")
-    except BaseException:
-        if conn.in_transaction:
-            conn.execute("ROLLBACK")
-        raise
     # rowcount=0：已决议/已过期/不存在 → 幂等无操作，对外同构不区分原因
     audit_log.log("INFO", "disclosure_resolved", actor_role=actor,
                   approval_id=approval_id, result_code=decision if rowcount else "noop")
@@ -336,67 +335,62 @@ def consume_grant(approval_id: int, to_role: str) -> dict:
     """
     if to_role not in config.ROLES:
         return dict(PLACEHOLDER)
-    conn = db.get_conn()
+    # 写经内部受控写能力（get_conn 已只读化）；事务原语保证 BEGIN IMMEDIATE
+    # 先取写锁、异常整体 ROLLBACK（审批恢复 approved 可重试），语义零改动。
+    writer = db._internal_writer()
     try:
-        conn.execute("BEGIN IMMEDIATE")
-    except Exception:
-        audit_log.log("ERROR", "grant_consume_failed",
-                      actor_role=to_role, approval_id=approval_id, result_code="lock_error")
-        return dict(PLACEHOLDER)
-    try:
-        _sweep_expired(conn, approval_id)
-        won = False
-        payload = None
-        if _has_json1(conn):
-            cur = conn.execute(
-                "UPDATE approvals SET status='expired', resolved_at=? "
-                "WHERE id=? AND kind='private_disclosure' AND status='approved' "
-                "AND json_extract(payload,'$.to_role')=? "
-                f"AND {_JSON_NUM_GUARD} "
-                "AND json_extract(payload,'$.expires_at') > ?",
-                (db.now_iso(), approval_id, to_role, _now()),
-            )
-            won = cur.rowcount == 1
-            if won:
+        with writer.transaction() as conn:
+            _sweep_expired(conn, approval_id)
+            won = False
+            payload = None
+            if _has_json1(conn):
+                cur = conn.execute(
+                    "UPDATE approvals SET status='expired', resolved_at=? "
+                    "WHERE id=? AND kind='private_disclosure' AND status='approved' "
+                    "AND json_extract(payload,'$.to_role')=? "
+                    f"AND {_JSON_NUM_GUARD} "
+                    "AND json_extract(payload,'$.expires_at') > ?",
+                    (db.now_iso(), approval_id, to_role, _now()),
+                )
+                won = cur.rowcount == 1
+                if won:
+                    row = conn.execute(
+                        "SELECT payload FROM approvals WHERE id=?", (approval_id,)
+                    ).fetchone()
+                    payload = json.loads(row["payload"])   # 异常 → 整体回滚
+            else:
                 row = conn.execute(
-                    "SELECT payload FROM approvals WHERE id=?", (approval_id,)
+                    "SELECT payload,status FROM approvals "
+                    "WHERE id=? AND kind='private_disclosure'",
+                    (approval_id,),
                 ).fetchone()
-                payload = json.loads(row["payload"])   # 异常 → 整体回滚
-        else:
-            row = conn.execute(
-                "SELECT payload,status FROM approvals "
-                "WHERE id=? AND kind='private_disclosure'",
-                (approval_id,),
+                if row is not None and row["status"] == "approved":
+                    data = json.loads(row["payload"])      # 异常 → 整体回滚
+                    expires = data.get("expires_at")
+                    if (data.get("to_role") == to_role
+                            and _is_num(expires) and expires > _now()):
+                        cur = conn.execute(
+                            "UPDATE approvals SET status='expired', resolved_at=? "
+                            "WHERE id=? AND kind='private_disclosure' AND status='approved'",
+                            (db.now_iso(), approval_id),
+                        )
+                        won = cur.rowcount == 1
+                        payload = data if won else None
+            if not won:
+                # 正常退出事务 → COMMIT 仅持久化清扫转换；未获授权不消费
+                return dict(PLACEHOLDER)
+            # 目标读取在同一事务内：失败则授权变更一并回滚
+            table = payload["item_table"]
+            if table not in _GRANTABLE_TABLES:
+                raise ValueError("forbidden_table")
+            item = conn.execute(
+                f"SELECT * FROM {table} WHERE id=?", (int(payload["item_id"]),)
             ).fetchone()
-            if row is not None and row["status"] == "approved":
-                data = json.loads(row["payload"])      # 异常 → 整体回滚
-                expires = data.get("expires_at")
-                if (data.get("to_role") == to_role
-                        and _is_num(expires) and expires > _now()):
-                    cur = conn.execute(
-                        "UPDATE approvals SET status='expired', resolved_at=? "
-                        "WHERE id=? AND kind='private_disclosure' AND status='approved'",
-                        (db.now_iso(), approval_id),
-                    )
-                    won = cur.rowcount == 1
-                    payload = data if won else None
-        if not won:
-            conn.execute("COMMIT")   # 仅持久化清扫转换；未获授权不消费
-            return dict(PLACEHOLDER)
-        # 目标读取在同一事务内：失败则授权变更一并回滚
-        table = payload["item_table"]
-        if table not in _GRANTABLE_TABLES:
-            raise ValueError("forbidden_table")
-        item = conn.execute(
-            f"SELECT * FROM {table} WHERE id=?", (int(payload["item_id"]),)
-        ).fetchone()
-        if item is None:
-            raise ValueError("target_missing")
-        result = dict(item)
-        conn.execute("COMMIT")
+            if item is None:
+                raise ValueError("target_missing")
+            result = dict(item)
     except Exception:
-        if conn.in_transaction:
-            conn.execute("ROLLBACK")   # 审批恢复 approved，可重试；无半消费态
+        # 事务原语已 ROLLBACK（审批恢复 approved，可重试；无半消费态）
         audit_log.log("ERROR", "grant_consume_failed",
                       actor_role=to_role, approval_id=approval_id, result_code="error")
         return dict(PLACEHOLDER)

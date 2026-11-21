@@ -20,6 +20,10 @@ from . import config
 
 _LOCAL = threading.local()
 
+# 生产库默认路径快照（模块加载时固定）：测试写工厂守卫基准。
+# 测试 fixture 重定向 config.DB_PATH 不影响本常量——守卫始终拒绝真实生产库。
+_PRODUCTION_DB_DEFAULT = Path(config.DB_PATH)
+
 
 def now_iso() -> str:
     """统一时间格式：aware UTC ISO8601（PRD §12.1，禁止 naive 入库）。"""
@@ -31,22 +35,16 @@ def _roles_sql() -> str:
 
 
 def get_conn(db_path: Path | str | None = None) -> sqlite3.Connection:
-    """线程本地连接。db_path 缺省取 config.DB_PATH（测试经 monkeypatch 重定向）。"""
-    path = Path(db_path) if db_path is not None else config.DB_PATH
-    conns: dict = getattr(_LOCAL, "conns", None)
-    if conns is None:
-        conns = _LOCAL.conns = {}
-    key = str(path)
-    conn = conns.get(key)
-    if conn is None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(key, timeout=config.DB_BUSY_TIMEOUT_MS / 1000)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute(f"PRAGMA busy_timeout={config.DB_BUSY_TIMEOUT_MS}")
-        conn.execute("PRAGMA foreign_keys=ON")
-        conns[key] = conn
-    return conn
+    """兼容符号：**物理只读**连接（用户裁决 2026-11-21：安全边界优先）。
+
+    历史语义为可写线程本地连接；v10.2 复审裁定该入口构成绕过 CASService
+    与 Identity 的生产写旁路，与自建服务伪造授权属同一安全边界，不可作为
+    兼容方案保留。现降级为 query_only 只读（与 get_read_conn 同缓存槽）：
+    任何 INSERT/UPDATE/DELETE/DDL/BEGIN IMMEDIATE 在执行时被 SQLite 拒绝。
+    写操作唯一路径 = 组合根注入的 WriteCapability（M2 披露写经内部受控
+    写能力 _internal_writer，见下）。
+    """
+    return get_read_conn(db_path)
 
 
 def get_read_conn(db_path: Path | str | None = None) -> sqlite3.Connection:
@@ -234,10 +232,53 @@ def _open_test_writer(db_path: Path | str) -> WriteCapability:
 
     对新库自动应用全部迁移（零播种），开箱即有完整 schema。
     可多次创建（并发用例需要）；不占用生产一次性名额。
+    **拒绝指向真实生产库默认路径**（防借测试工厂取生产写能力，用户裁决
+    第4点）。判定基准是未被测试重定向的默认路径 config.DATA_DIR/personal_agent.db
+    的原始值——测试经 fixture 把 config.DB_PATH 重定向到 tmp 后，
+    _open_test_writer(config.DB_PATH) 合法（写的就是隔离测试库）。
     调用方负责 close()（fixture 清理）。
     """
+    if Path(db_path).resolve() == _PRODUCTION_DB_DEFAULT.resolve():
+        raise PermissionError("test_writer_cannot_target_production_db")
     init_db(db_path)
     return _mint_writer(db_path, cap_id=f"test:{db_path}")
+
+
+# ---------------------------------------------------------------------------
+# 内部受控写能力（M2 披露写路径专用，用户裁决第2点）
+#
+# 定性：这不是公开工厂——模块级函数任何导入方可调，其约束与 get_conn 旧
+# 入口相同（进程内无硬边界）。保留它的唯一理由是 M2 披露函数签名零改动
+# （无注入参数）且业务语义/状态机不变；写 SQL 仍只经 WriteCapability 事务
+# 原语，与 M3 写路径同款纪律。真正封死的旁路是 get_conn 只读化：普通模块
+# 无法再经兼容符号取得可写连接执行任意 SQL。
+# ---------------------------------------------------------------------------
+
+_internal_writer_local = threading.local()
+
+
+def _internal_writer() -> WriteCapability:
+    """M2 披露写路径的受控写能力（线程本地，指向 config.DB_PATH）。
+
+    仅供 visibility.py 披露三函数内部使用；M3 业务写一律经组合根注入实例。
+    测试经 conftest 重定向 config.DB_PATH 到 tmp 库，天然隔离。
+    """
+    w = getattr(_internal_writer_local, "writer", None)
+    key = str(Path(config.DB_PATH).resolve())
+    if w is None or object.__getattribute__(w, "_db_path") != key:
+        if w is not None:
+            w.close()
+        w = _mint_writer(config.DB_PATH, cap_id="internal:m2_disclosure")
+        _internal_writer_local.writer = w
+    return w
+
+
+def _close_internal_writer() -> None:
+    """测试清理：关闭当前线程内部写能力。"""
+    w = getattr(_internal_writer_local, "writer", None)
+    if w is not None:
+        w.close()
+        _internal_writer_local.writer = None
 
 
 # ---------------------------------------------------------------------------
@@ -585,30 +626,41 @@ def init_db(db_path: Path | str | None = None) -> int:
     - 第二道防线：迁移执行后复查 in_transaction，任何绕过受控接口破坏
       事务边界的行为仍会被拦截并阻止版本推进。
     """
-    conn = get_conn(db_path)
-    _ensure_version_table(conn)
-    applied = current_version(conn)
-    for idx in range(applied, len(MIGRATIONS)):
-        fn = MIGRATIONS[idx]
-        conn.execute("BEGIN")
-        if not conn.in_transaction:
-            raise RuntimeError("migration_transaction_not_started")
-        try:
-            fn(MigrationConnection(conn))
+    # 专用引导连接（get_conn 已只读化，用户裁决 2026-11-21）：
+    # 仅在本函数内部打开/关闭，不进入线程缓存、不对外暴露。
+    path = Path(db_path) if db_path is not None else config.DB_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), timeout=config.DB_BUSY_TIMEOUT_MS / 1000)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(f"PRAGMA busy_timeout={config.DB_BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA foreign_keys=ON")
+    try:
+        _ensure_version_table(conn)
+        applied = current_version(conn)
+        for idx in range(applied, len(MIGRATIONS)):
+            fn = MIGRATIONS[idx]
+            conn.execute("BEGIN")
             if not conn.in_transaction:
-                raise RuntimeError(
-                    f"migration_broke_transaction_boundary:{fn.__name__}"
+                raise RuntimeError("migration_transaction_not_started")
+            try:
+                fn(MigrationConnection(conn))
+                if not conn.in_transaction:
+                    raise RuntimeError(
+                        f"migration_broke_transaction_boundary:{fn.__name__}"
+                    )
+                conn.execute(
+                    "INSERT INTO schema_version(version,name,applied_at) VALUES(?,?,?)",
+                    (idx + 1, fn.__name__, now_iso()),
                 )
-            conn.execute(
-                "INSERT INTO schema_version(version,name,applied_at) VALUES(?,?,?)",
-                (idx + 1, fn.__name__, now_iso()),
-            )
-            conn.execute("COMMIT")
-        except BaseException:
-            if conn.in_transaction:
-                conn.execute("ROLLBACK")
-            raise
-    return current_version(conn)
+                conn.execute("COMMIT")
+            except BaseException:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
+        return current_version(conn)
+    finally:
+        conn.close()
 
 
 def backup(dest_path: Path | str, db_path: Path | str | None = None) -> Path:

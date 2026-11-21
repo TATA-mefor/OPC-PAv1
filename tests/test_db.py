@@ -118,7 +118,7 @@ def test_migration_failure_rolls_back(isolated_env, monkeypatch):
     monkeypatch.setattr(db, "MIGRATIONS", [db.m001_init, bad_migration])
     with pytest.raises(RuntimeError):
         db.init_db()
-    conn = db.get_conn()
+    conn = db.get_read_conn()
     assert "half_done" not in _tables(conn)
     assert db.current_version(conn) == 1  # m001 已成功独立提交，坏迁移未记录
 
@@ -136,7 +136,7 @@ def test_m001_midway_failure_full_rollback(isolated_env, monkeypatch):
     with pytest.raises(sqlite3.OperationalError):
         db.init_db()
 
-    conn = db.get_conn()
+    conn = db.get_read_conn()
     assert not conn.in_transaction
     # 前半截已执行的建表也必须回滚干净
     assert _tables(conn) == {"schema_version"}
@@ -160,11 +160,11 @@ def test_m001_rerun_after_failure_succeeds(isolated_env, monkeypatch):
     monkeypatch.setattr(db, "_m001_statements", flaky_statements)
     with pytest.raises(sqlite3.OperationalError):
         db.init_db()
-    assert db.current_version(db.get_conn()) == 0
+    assert db.current_version(db.get_read_conn()) == 0
 
     v = db.init_db()  # 第二次完整成功
     assert v == 4
-    conn = db.get_conn()
+    conn = db.get_read_conn()
     assert EXPECTED_TABLES <= _tables(conn)
     for table in EXPECTED_TABLES - {"schema_version"}:
         assert conn.execute(f"SELECT COUNT(*) c FROM {table}").fetchone()["c"] == 0
@@ -187,7 +187,7 @@ def test_executescript_rejected_before_execution(isolated_env, monkeypatch):
     with pytest.raises(RuntimeError, match="migration_forbidden_api:executescript"):
         db.init_db()
 
-    conn = db.get_conn()
+    conn = db.get_read_conn()
     assert executed["script_ran"] is False
     assert not conn.in_transaction
     assert "sneaky" not in _tables(conn)          # 无残留
@@ -207,7 +207,7 @@ def test_migration_forbidden_apis(isolated_env, monkeypatch):
         monkeypatch.setattr(db, "MIGRATIONS", [bad])
         with pytest.raises(RuntimeError, match=f"migration_forbidden_api:{api}"):
             db.init_db()
-        conn = db.get_conn()
+        conn = db.get_read_conn()
         assert db.current_version(conn) == 0
         assert _tables(conn) == {"schema_version"}
 
@@ -217,7 +217,7 @@ def test_migration_forbidden_apis(isolated_env, monkeypatch):
     monkeypatch.setattr(db, "MIGRATIONS", [write_attr])
     with pytest.raises(RuntimeError, match="migration_forbidden_attr_write"):
         db.init_db()
-    assert db.current_version(db.get_conn()) == 0
+    assert db.current_version(db.get_read_conn()) == 0
 
 
 def test_retry_after_forbidden_api_succeeds(isolated_env, monkeypatch):
@@ -235,7 +235,7 @@ def test_retry_after_forbidden_api_succeeds(isolated_env, monkeypatch):
     monkeypatch.setattr(db, "MIGRATIONS", [flaky])
     with pytest.raises(RuntimeError, match="migration_forbidden_api"):
         db.init_db()
-    conn = db.get_conn()
+    conn = db.get_read_conn()
     assert "sneaky" not in _tables(conn) and "retry_ok" not in _tables(conn)
     assert db.current_version(conn) == 0
 
@@ -252,7 +252,7 @@ def test_bypass_via_private_conn_rejected(isolated_env, monkeypatch):
     monkeypatch.setattr(db, "MIGRATIONS", [db.m001_init, bypass])
     with pytest.raises(RuntimeError, match="migration_forbidden_api:_conn"):
         db.init_db()
-    conn = db.get_conn()
+    conn = db.get_read_conn()
     assert not conn.in_transaction
     assert "sneaky" not in _tables(conn)
     assert db.current_version(conn) == 1
@@ -271,7 +271,7 @@ def test_bypass_via_cursor_connection_rejected(isolated_env, monkeypatch):
     monkeypatch.setattr(db, "MIGRATIONS", [db.m001_init, bypass])
     with pytest.raises(RuntimeError, match="migration_forbidden_cursor_api:connection"):
         db.init_db()
-    conn = db.get_conn()
+    conn = db.get_read_conn()
     assert not conn.in_transaction
     assert "sneaky" not in _tables(conn)
     assert db.current_version(conn) == 1
@@ -306,9 +306,8 @@ def test_migration_cursor_proxy_usable(isolated_env, monkeypatch):
     assert len(seen["all"]) == 1
 
 
-def test_backup_readable(isolated_env, tmp_path):
-    db.init_db()
-    conn = db.get_conn()
+def test_backup_readable(isolated_env, tmp_path, db_conn):
+    conn = db_conn
     with conn:
         conn.execute(
             "INSERT INTO tasks(title,owner_role,created_at,updated_at) VALUES(?,?,?,?)",
