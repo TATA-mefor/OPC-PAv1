@@ -108,6 +108,7 @@ def test_upsert_same_key_one_row_version_increments(tool, db_conn):
         "SELECT * FROM artifacts WHERE kind='daily_report' AND period_key='2026-11-21' "
         "AND owner_role='sales'").fetchall()
     assert len(rows) == 1 and rows[0]["version"] == 2
+    assert rows[0]["visibility"] == "private"   # 契约①：重复生成仍 private
 
 
 def test_upsert_updated_at_refreshes(tool, db_conn, monkeypatch):
@@ -248,3 +249,104 @@ def test_fc_schema_excludes_identity_fields(tool):
             assert forbidden not in props, (name, forbidden)
     # owner_role 仅 boss 可用但仍是业务参数（员工传他角色被拒）——保留在 schema
     assert "owner_role" in schema["generate_daily"]["parameters"]["properties"]
+
+
+# ---------------------------------------------------------------------------
+# Report visibility 三条契约（用户 2026-11-22 正式采纳）
+#
+# ① 新建报告强制 private —— 含降级分支与零数据分支；
+# ② UPSERT 不改变既有行的 visibility —— 既有 public 行保留 public 是**预期行为**，
+#    本契约不等于"所有历史报告恒 private"（开发库实测为空表，无历史 public 行）；
+# ③ 合法 CAS 写路径不得修改 artifacts.visibility。
+# ---------------------------------------------------------------------------
+
+def _vis_of(conn, aid):
+    return conn.execute("SELECT visibility FROM artifacts WHERE id=?",
+                        (aid,)).fetchone()["visibility"]
+
+
+def test_contract1_new_report_private_all_branches(tool, db_conn, isolated_env):
+    """契约①：正常 / 降级 / 零数据 / explicit public / boss 全聚合，新建一律 private。"""
+    # 零数据分支（不触发 LLM）
+    r_empty = _call(tool, "generate_daily", date="2026-11-01")
+    assert _vis_of(db_conn, r_empty["artifact_id"]) == "private"
+
+    _seed_task(db_conn, "sales")
+    _seed_task(db_conn, "sales", created="2026-11-22T08:00:00+08:00")
+    _seed_task(db_conn, "sales", created="2026-11-23T08:00:00+08:00")
+    # 正常分支
+    r_ok = _call(tool, "generate_daily", date="2026-11-21")
+    assert r_ok["degraded"] is False
+    assert _vis_of(db_conn, r_ok["artifact_id"]) == "private"
+
+    # explicit public 强制回落
+    r_pub = _call(tool, "generate_daily", date="2026-11-22", visibility="public")
+    assert _vis_of(db_conn, r_pub["artifact_id"]) == "private"
+
+    # 降级分支
+    isolated_env["fake_llm"].responses = [llm_client.LLMFailure("boom")]
+    r_deg = _call(tool, "generate_daily", date="2026-11-23")
+    assert r_deg["degraded"] is True
+    assert _vis_of(db_conn, r_deg["artifact_id"]) == "private"
+    isolated_env["fake_llm"].responses = ["fake-ok"]
+
+    # boss 全聚合分支
+    r_boss = _call(tool, "generate_weekly", week="2026-W47",
+                   frame_caller="boss", trusted_ctx=_boss_ctx(tool))
+    assert _vis_of(db_conn, r_boss["artifact_id"]) == "private"
+
+
+def test_contract2_upsert_preserves_existing_visibility(tool, db_conn):
+    """契约②：既有行 visibility 不被 UPSERT 改写（public 保留 public 为预期行为）。"""
+    _seed_task(db_conn, "sales")
+    now = db.now_iso()
+    with db_conn:
+        cur = db_conn.execute(
+            "INSERT INTO artifacts(kind,title,content_md,owner_role,visibility,"
+            "period_key,created_at,version,updated_at) "
+            "VALUES('daily_report','旧报告','# 旧','sales','public','2026-11-21',?,1,?)",
+            (now, now))
+    aid = cur.lastrowid
+
+    res = _call(tool, "generate_daily", date="2026-11-21")
+    assert res["artifact_id"] == aid            # 命中同一行，未新插
+    row = db_conn.execute("SELECT * FROM artifacts WHERE id=?", (aid,)).fetchone()
+    assert row["visibility"] == "public"        # 既有 visibility 保留
+    assert row["version"] == 2                  # 其余字段照常更新
+    assert row["content_md"] != "# 旧"
+    assert db_conn.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0] == 1
+
+
+def test_contract2b_upsert_keeps_private_private(tool, db_conn):
+    """契约②对照：既有 private 行重复生成仍 private。"""
+    _seed_task(db_conn, "sales")
+    r1 = _call(tool, "generate_daily", date="2026-11-21")
+    for _ in range(3):
+        _call(tool, "generate_daily", date="2026-11-21")
+    assert _vis_of(db_conn, r1["artifact_id"]) == "private"
+
+
+def test_contract3_cas_cannot_modify_artifact_visibility(cas_service, identity_api, db_conn):
+    """契约③：合法 CAS 写路径不得修改 artifacts.visibility（白名单外）。"""
+    _seed_task(db_conn, "sales")
+    now = db.now_iso()
+    with db_conn:
+        cur = db_conn.execute(
+            "INSERT INTO artifacts(kind,title,content_md,owner_role,visibility,"
+            "period_key,created_at,version,updated_at) "
+            "VALUES('daily_report','报告','# c','sales','private','2026-11-21',?,1,?)",
+            (now, now))
+    aid = cur.lastrowid
+    ident = identity_api.resolve_identity("sales", {})
+
+    with pytest.raises(ValueError, match="forbidden_column:artifacts.visibility"):
+        cas_service.cas_update("artifacts", aid, 1, ident=ident, visibility="public")
+
+    row = db_conn.execute("SELECT * FROM artifacts WHERE id=?", (aid,)).fetchone()
+    assert row["visibility"] == "private"
+    assert row["version"] == 1                  # 被拒的写入不得推进版本
+
+    # 对照：白名单内字段可正常改，且仍不动 visibility
+    cas_service.cas_update("artifacts", aid, 1, ident=ident, title="改标题")
+    row2 = db_conn.execute("SELECT * FROM artifacts WHERE id=?", (aid,)).fetchone()
+    assert row2["title"] == "改标题" and row2["visibility"] == "private"
