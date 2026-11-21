@@ -40,3 +40,6 @@ Thumbs.db
 .idea/
 *.swp
 ~$*
+
+# M3.2 越权探针留存的审计实物（保留本地，不入库）
+/logs/audit.log
