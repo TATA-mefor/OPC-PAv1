@@ -60,17 +60,21 @@ def test_db_module_has_no_public_writer_factory():
 
 
 def test_production_writer_only_via_composition_root(isolated_env):
-    """M3.2①：生产 writer 只能经组合根取得；重复装配 fail fast。
+    """M3.2①：生产 writer 只在组合根函数体内铸造，任何公开面都取不到。
 
     原 _open_production_writer 的"首个调用者赢"语义已废除——一次性锁
-    只拦第二个调用者，不能证明第一个是组合根。
+    只拦第二个调用者，不能证明第一个是组合根。工厂只构造不缓存，
+    单例语义由 ApplicationLauncher 实例承担。
     """
     a = app.build_application()
-    assert isinstance(a.writer, db.WriteCapability)
-    assert a.writer.cap_id == "production"
-    with pytest.raises(RuntimeError, match="production_writer_already_taken"):
-        app.build_application()
-    a.writer.close()
+    b = app.build_application()
+    try:
+        assert not hasattr(a, "writer")      # 不暴露原始写能力
+        assert not hasattr(b, "writer")
+        assert b is not a                    # 工厂只构造，各自独立
+    finally:
+        a.close()
+        b.close()
 
 
 def test_production_writer_failure_fail_fast(isolated_env, monkeypatch):

@@ -67,9 +67,8 @@ def isolated_env(request, tmp_path, monkeypatch):
     monkeypatch.setattr(audit_log, "_logger", None, raising=False)
     monkeypatch.setattr(audit_log, "_logger_dir", None, raising=False)
 
-    # 生产写能力一次性名额重置（M3 v10.2）：每个测试独立，互不抢占
-    # 生产写能力一次性名额重置（M3.2①：名额移入组合根 app）：每个测试独立
-    monkeypatch.setattr(app, "_production_writer_taken", False, raising=False)
+    # M3.2①：app 侧已无模块级应用槽/名额，无需重置；
+    # 每个测试自行 build_application() 或持有 ApplicationLauncher 实例。
 
     # socket 层禁外网：仅真回环放行；@live 显式解除。
     is_live = "live" in request.keywords

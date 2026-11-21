@@ -337,7 +337,6 @@ def test_forged_service_cannot_write_production_db(isolated_env, identity_api, d
 
     # 组合根装配（生产 writer 只在其函数体内部铸造）
     application = app.build_application()
-    prod_writer = application.writer
     prod_service = application.cas_service
 
     # 攻击者：自建整套链
@@ -354,33 +353,31 @@ def test_forged_service_cannot_write_production_db(isolated_env, identity_api, d
     assert after["title"] == before["title"]
     assert after["version"] == before["version"]
 
-    # ② 攻击者尝试再装配一次以取得生产 writer → 拒绝（名额已占用）
-    with pytest.raises(RuntimeError, match="production_writer_already_taken"):
-        app.build_application()
+    # ② 攻击者再装配一次 → 只得到另一份有界服务，仍取不到原始 writer
+    again = app.build_application()
+    assert not hasattr(again, "writer")
+    with pytest.raises(PermissionError, match="cas_service_writer_not_exposed"):
+        again.cas_service._writer
+    again.close()
 
     # ③ 正向对照：组合根服务正常写成功
     legit = application.identity_api.resolve_identity("sales", {})
     row = prod_service.cas_update("tasks", rid, 1, ident=legit, title="合法更新")
     assert row["version"] == 2
-    prod_writer.close()
+    application.close()
 
 
-def test_writer_authorize_cross_pairing_rejected(isolated_env, auth_backend):
-    """⑥ 跨配对拒绝：生产 writer 只接受带同源归属标记的 authorize；
-    伪造 lambda（无标记）→ 构造拒绝；已绑定后平行链 authorize → 拒绝。"""
-    application = app.build_application()
-    prod_writer = application.writer
-    with pytest.raises(PermissionError):
-        cas.CASService(authorize=lambda ident: "boss", writer=prod_writer)
-    # 本阶段 CAS 仍在首次构造时绑定：组合根已绑定后，任何二次配对一律拒绝
-    # （②把绑定前移到组合根后，此处改为"同源可配对、平行链拒绝"）
-    with pytest.raises(PermissionError):
-        cas.CASService(authorize=application.identity_api.make_authorize(),
-                       writer=prod_writer)
-    other_api = identity._build_identity(auth_backend)
-    with pytest.raises(PermissionError):
-        cas.CASService(authorize=other_api.make_authorize(), writer=prod_writer)
-    prod_writer.close()
+def test_production_writer_unreachable_via_public_surface(isolated_env, auth_backend):
+    """M3.2①：生产 writer 经任何公开面都取不到，故无法自建服务配它。
+    原跨配对用例需先拿到 prod_writer——那本身就是漏洞。配对语义详见②。
+    """
+    a = app.build_application()
+    assert not hasattr(a, "writer")
+    with pytest.raises(PermissionError, match="cas_service_writer_not_exposed"):
+        a.cas_service._writer
+    with pytest.raises(PermissionError, match="disclosure_service_writer_not_exposed"):
+        a.disclosure._writer
+    a.close()
 
 
 def test_ordinary_module_cannot_preempt_production_writer(isolated_env, db_conn):
@@ -399,8 +396,8 @@ def test_ordinary_module_cannot_preempt_production_writer(isolated_env, db_conn)
         db._mint_test_writer(db._PRODUCTION_DB_DEFAULT, "production")
     # 抢先失败后组合根仍能正常启动（名额未被普通调用消耗）
     application = app.build_application()
-    assert application.writer.cap_id == "production"
-    application.writer.close()
+    assert not hasattr(application, "writer")
+    application.close()
 
 
 def test_m3_write_path_no_legacy_conn(isolated_env, identity_api, db_conn, monkeypatch):

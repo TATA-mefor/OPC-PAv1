@@ -105,6 +105,18 @@ class CASService:
     def __setattr__(self, *a):
         raise PermissionError("cas_service_immutable")
 
+    def __getattribute__(self, name):
+        # M3.2① 复审：不暴露原始 WriteCapability。否则任何拿到 CASService 的
+        # 调用方都能取出 writer 并用 transaction() 绕过 CAS 治理直写。
+        # 内部写路径经 object.__getattribute__ 取用，不受影响。
+        if name == "_writer":
+            raise PermissionError("cas_service_writer_not_exposed")
+        return object.__getattribute__(self, name)
+
+    def close(self) -> None:
+        """有界关停：关闭内部写连接，**不返回**任何写能力句柄。"""
+        object.__getattribute__(self, "_writer").close()
+
     # -- 写入原语 -----------------------------------------------------------
 
     def cas_update(self, table: str, target_id: int, expected_version: int,

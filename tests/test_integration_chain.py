@@ -10,14 +10,14 @@ import json
 
 import pytest
 
-from opc_workbench import app, db
+from opc_workbench import app, config, db
 
 
 @pytest.fixture()
 def application(isolated_env):
     a = app.build_application()
     yield a
-    a.writer.close()
+    a.close()
 
 
 def _agent_call(app, action, role="sales", **params):
@@ -76,7 +76,9 @@ def test_chain_schedule_create_notify(application, db_conn, monkeypatch):
                     title="链路提醒", remind_at="2026-11-21T09:00:00+08:00")
     assert r["status"] == "pending"
     import queue
-    eng = reminder.ReminderEngine(writer=application.writer, notify_queue=queue.Queue(50))
+    # M3.2①：Application 不再暴露原始 writer；提醒引擎用同库测试写能力
+    _w = db._open_test_writer(config.DB_PATH)
+    eng = reminder.ReminderEngine(writer=_w, notify_queue=queue.Queue(50))
     assert eng.process_due() == 1
     row = db_conn.execute("SELECT * FROM schedules WHERE id=?", (r["id"],)).fetchone()
     assert row["status"] == "notified" and row["recovery_enqueued_at"] is not None

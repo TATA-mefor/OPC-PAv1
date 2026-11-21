@@ -102,8 +102,8 @@ class ReportTool:
         return handler(_frame_caller=_frame_caller, _llm_args=_llm_args,
                        _trusted_ctx=_trusted_ctx, **params)
 
-    def _writer(self):
-        return object.__getattribute__(self._cas, "_writer")
+    # M3.2① 复审：原 _writer() 公开方法已删除（会泄露原始 WriteCapability），
+    # 改为使用点内联取用。
 
     # -- generate -----------------------------------------------------------
 
@@ -224,7 +224,7 @@ class ReportTool:
                     f"> AI 点评不可用（降级为纯统计模板）\n"), True
 
     def _upsert(self, kind, period_key, owner, content, refs, vis) -> int:
-        writer = self._writer()
+        writer = object.__getattribute__(object.__getattribute__(self, "_cas"), "_writer")
         now = _now_iso()
         title = f"{period_key} 报告"
         with writer.transaction() as cur:
