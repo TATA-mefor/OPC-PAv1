@@ -21,7 +21,7 @@ def _tables(conn):
 
 def test_init_creates_all_tables(db_conn):
     assert EXPECTED_TABLES <= _tables(db_conn)
-    assert db.current_version(db_conn) == len(db.MIGRATIONS) == 2
+    assert db.current_version(db_conn) == len(db.MIGRATIONS) == 4  # M3: +m003/m004
 
 
 def test_init_idempotent_rerun(db_conn):
@@ -32,9 +32,9 @@ def test_init_idempotent_rerun(db_conn):
             ("保留我", "sales", db.now_iso(), db.now_iso()),
         )
     v = db.init_db()
-    assert v == 2
+    assert v == 4
     assert db_conn.execute("SELECT COUNT(*) c FROM tasks").fetchone()["c"] == 1
-    assert db_conn.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 2
+    assert db_conn.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 4
 
 
 def test_zero_seeding(db_conn):
@@ -97,13 +97,16 @@ def test_idempotency_key_unique(db_conn):
 
 
 def test_artifact_period_unique(db_conn):
-    args = ("INSERT INTO artifacts(kind,title,content_md,owner_role,period_key,created_at) "
-            "VALUES(?,?,?,?,?,?)")
+    # M3 m003 后 artifacts 新增 updated_at NOT NULL（version 有默认值）
+    args = ("INSERT INTO artifacts(kind,title,content_md,owner_role,period_key,"
+            "created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
     with db_conn:
-        db_conn.execute(args, ("daily_report", "d", "x", "cfo", "2026-11-19", db.now_iso()))
+        db_conn.execute(args, ("daily_report", "d", "x", "cfo", "2026-11-19",
+                               db.now_iso(), db.now_iso()))
     with pytest.raises(sqlite3.IntegrityError):
         with db_conn:
-            db_conn.execute(args, ("daily_report", "d2", "y", "cfo", "2026-11-19", db.now_iso()))
+            db_conn.execute(args, ("daily_report", "d2", "y", "cfo", "2026-11-19",
+                                   db.now_iso(), db.now_iso()))
 
 
 def test_migration_failure_rolls_back(isolated_env, monkeypatch):
@@ -160,7 +163,7 @@ def test_m001_rerun_after_failure_succeeds(isolated_env, monkeypatch):
     assert db.current_version(db.get_conn()) == 0
 
     v = db.init_db()  # 第二次完整成功
-    assert v == 2
+    assert v == 4
     conn = db.get_conn()
     assert EXPECTED_TABLES <= _tables(conn)
     for table in EXPECTED_TABLES - {"schema_version"}:

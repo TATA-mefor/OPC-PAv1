@@ -67,6 +67,9 @@ def isolated_env(request, tmp_path, monkeypatch):
     monkeypatch.setattr(audit_log, "_logger", None, raising=False)
     monkeypatch.setattr(audit_log, "_logger_dir", None, raising=False)
 
+    # 生产写能力一次性名额重置（M3 v10.2）：每个测试独立，互不抢占
+    monkeypatch.setattr(db, "_production_writer_taken", False, raising=False)
+
     # socket 层禁外网：仅真回环放行；@live 显式解除。
     is_live = "live" in request.keywords
     if not is_live:
@@ -113,6 +116,92 @@ def db_conn(isolated_env):
     """已迁移的测试库连接。"""
     db.init_db()
     return db.get_conn()
+
+
+# ---------------------------------------------------------------------------
+# M3 身份链测试组合根（M3.1 清单 v10.1：fixture 与 app.main 同构装配）
+# ---------------------------------------------------------------------------
+
+class TestAuthBackend:
+    """受控认证后端替身（测试专用，不进生产模块）。
+
+    - authenticate：可编排返回 None（模拟认证失败）或签发 AuthEvent；
+    - validate_event：只认本后端登记签发的事件（伪造事件拒绝）；
+    - confirm_action：按会话注入受控确认处理器；未注入 → None（无确认）。
+    """
+
+    def __init__(self):
+        self._events: dict = {}
+        self._confirmations: dict = {}
+        self.authenticate_enabled = True
+
+    def authenticate(self, session_id: str):
+        from opc_workbench import identity
+        if not self.authenticate_enabled:
+            return None
+        ev = object.__new__(identity.AuthEvent)
+        import uuid
+        object.__setattr__(ev, "_event_id", uuid.uuid4().hex)
+        object.__setattr__(ev, "_session_id", session_id)
+        self._events[ev._event_id] = session_id
+        return ev
+
+    def validate_event(self, ev) -> bool:
+        from opc_workbench import identity
+        return (isinstance(ev, identity.AuthEvent)
+                and self._events.get(ev._event_id) == ev._session_id)
+
+    def confirm_action(self, session_id: str, action_spec: dict):
+        handler = self._confirmations.get(session_id)
+        if handler is None:
+            return None
+        return handler(action_spec)
+
+    def allow_confirm(self, session_id: str, handler=None):
+        """注入受控确认：默认 handler 校验 request 标记后返回确认结果。"""
+        if handler is None:
+            def handler(spec):
+                req = spec.get("request")
+                if getattr(req, "is_ui_confirmation", False) is not True:
+                    return None
+                if getattr(req, "session_id", None) != session_id:
+                    return None
+                return {"confirmed": True}
+        self._confirmations[session_id] = handler
+
+
+class UIConfirmationRequest:
+    """模拟真实 UI 确认回调请求对象（M6 由 Gradio 事件上下文构造）。"""
+
+    def __init__(self, session_id: str):
+        self.is_ui_confirmation = True
+        self.session_id = session_id
+
+
+@pytest.fixture()
+def ui_confirmation_request_cls():
+    """注入请求对象类（避免 from tests.conftest 与 site-packages 同名包冲突）。"""
+    return UIConfirmationRequest
+
+
+@pytest.fixture()
+def auth_backend():
+    return TestAuthBackend()
+
+
+@pytest.fixture()
+def identity_api(auth_backend):
+    from opc_workbench import identity
+    return identity._build_identity(auth_backend)
+
+
+@pytest.fixture()
+def boss_ctx(identity_api, auth_backend):
+    """完整 boss 身份链：认证事件 → 登记 → proof → 铸造 ctx₀。"""
+    ev = auth_backend.authenticate("sess-boss-1")
+    identity_api.register_session(ev)
+    proof = identity_api.issue_proof("sess-boss-1")
+    return identity_api.mint_boss_context(proof)
 
 
 def pytest_collection_modifyitems(config, items):
