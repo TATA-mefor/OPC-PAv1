@@ -13,7 +13,7 @@ import threading
 
 import pytest
 
-from opc_workbench import cas, config, db, identity, visibility
+from opc_workbench import app, cas, config, db, identity, visibility
 
 
 # ---------------------------------------------------------------------------
@@ -335,15 +335,13 @@ def test_forged_service_cannot_write_production_db(isolated_env, identity_api, d
     rid = _seed_row(db_conn, "tasks", "sales", "public")
     before = dict(_row(db_conn, "tasks", rid))
 
-    # 组合根先取得生产 writer（模拟 app.main 启动顺序）
-    prod_writer = db._open_production_writer()
-    prod_service = cas._build_cas_service(authorize=identity_api.make_authorize(),
-                                          writer=prod_writer)
+    # 组合根装配（生产 writer 只在其函数体内部铸造）
+    application = app.build_application()
+    prod_writer = application.writer
+    prod_service = application.cas_service
 
     # 攻击者：自建整套链
     evil_api = identity._build_identity(identity_api._authority._auth_backend)
-    evil_ident = evil_api.resolve_identity("boss", {}, None) if False else None
-    # boss 无 ctx 签不出 → 攻击者改用 Agent 身份 + 伪造 authorize
     evil_ident = evil_api.resolve_identity("sales", {})
     evil_service = cas.CASService(authorize=lambda ident: "boss",
                                   writer=db._open_test_writer(
@@ -356,40 +354,53 @@ def test_forged_service_cannot_write_production_db(isolated_env, identity_api, d
     assert after["title"] == before["title"]
     assert after["version"] == before["version"]
 
-    # ② 攻击者尝试重取生产 writer → 拒绝（一次性已占用）
+    # ② 攻击者尝试再装配一次以取得生产 writer → 拒绝（名额已占用）
     with pytest.raises(RuntimeError, match="production_writer_already_taken"):
-        db._open_production_writer()
+        app.build_application()
 
     # ③ 正向对照：组合根服务正常写成功
-    legit = identity_api.resolve_identity("sales", {})
+    legit = application.identity_api.resolve_identity("sales", {})
     row = prod_service.cas_update("tasks", rid, 1, ident=legit, title="合法更新")
     assert row["version"] == 2
     prod_writer.close()
 
 
-def test_writer_authorize_cross_pairing_rejected(isolated_env, identity_api, auth_backend):
+def test_writer_authorize_cross_pairing_rejected(isolated_env, auth_backend):
     """⑥ 跨配对拒绝：生产 writer 只接受带同源归属标记的 authorize；
     伪造 lambda（无标记）→ 构造拒绝；已绑定后平行链 authorize → 拒绝。"""
-    prod_writer = db._open_production_writer()
+    application = app.build_application()
+    prod_writer = application.writer
     with pytest.raises(PermissionError):
         cas.CASService(authorize=lambda ident: "boss", writer=prod_writer)
-    # 组合根正常装配（make_authorize 带归属标记）
-    legit = cas.CASService(authorize=identity_api.make_authorize(), writer=prod_writer)
-    assert legit is not None
-    # 平行链即便带标记，归属不同 → 已绑定 writer 拒绝二次配对
+    # 本阶段 CAS 仍在首次构造时绑定：组合根已绑定后，任何二次配对一律拒绝
+    # （②把绑定前移到组合根后，此处改为"同源可配对、平行链拒绝"）
+    with pytest.raises(PermissionError):
+        cas.CASService(authorize=application.identity_api.make_authorize(),
+                       writer=prod_writer)
     other_api = identity._build_identity(auth_backend)
     with pytest.raises(PermissionError):
         cas.CASService(authorize=other_api.make_authorize(), writer=prod_writer)
     prod_writer.close()
 
 
-def test_production_writer_preempted_composition_root_fail_fast(isolated_env, db_conn):
-    """先手抢占：业务模块抢先取得生产 writer → 组合根取得失败 → 启动失败
-    （fail fast，不静默降级）；抢到的 writer 进不了应用服务（⑥配对校验）。"""
-    stolen = db._open_production_writer()   # 攻击者抢先
-    with pytest.raises(RuntimeError, match="production_writer_already_taken"):
-        db._open_production_writer()        # 组合根 fail fast
-    stolen.close()
+def test_ordinary_module_cannot_preempt_production_writer(isolated_env, db_conn):
+    """M3.2① 阻断项修复：普通模块**无法**抢先取得生产写能力。
+
+    修复前：db._open_production_writer() 首个调用者即取得，一次性锁只拦
+    第二个调用者，攻击者可在组合根启动前抢先拿到 writer 并用 transaction()
+    绕过 CAS 直接写库（已实证）。修复后该入口不存在，组合根照常启动。
+    """
+    assert not hasattr(db, "_open_production_writer")
+    assert not hasattr(db, "_mint_writer")
+    # 借测试工厂指向真实生产库默认路径 → 拒绝
+    with pytest.raises(PermissionError):
+        db._open_test_writer(db._PRODUCTION_DB_DEFAULT)
+    with pytest.raises(PermissionError):
+        db._mint_test_writer(db._PRODUCTION_DB_DEFAULT, "production")
+    # 抢先失败后组合根仍能正常启动（名额未被普通调用消耗）
+    application = app.build_application()
+    assert application.writer.cap_id == "production"
+    application.writer.close()
 
 
 def test_m3_write_path_no_legacy_conn(isolated_env, identity_api, db_conn, monkeypatch):

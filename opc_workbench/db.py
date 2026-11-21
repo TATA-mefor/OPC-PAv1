@@ -83,7 +83,7 @@ def close_thread_conns() -> None:
 # 写能力隔离（M3.1 清单 v10.2 §三.3）
 #
 # 安全依据 = 对象所有权与依赖注入，不是命名/一次性标志：
-# - WriteCapability 不可直构；生产 writer 只由组合根经 _open_production_writer
+# - WriteCapability 不可直构；生产 writer 只由组合根在 build_application
 #   取得并封入应用 CASService（构造期固定，无 setter/rebind）；
 # - 一次性取得**不是安全依据**（同 bind 槽教训）——抢先到者得到的 writer
 #   进不了应用服务，且应用组合根因取得失败而启动失败（fail fast）；
@@ -193,16 +193,33 @@ class _WriteTransaction:
         return False
 
 
-def _mint_writer(path: Path | str, cap_id: str) -> WriteCapability:
-    """内部铸造：打开专用写连接并封入不可变句柄（失败原样抛错，fail fast）。"""
+def apply_write_pragmas(conn: sqlite3.Connection) -> None:
+    """为**调用方已自行打开**的写连接施加统一 PRAGMA。
+
+    纯配置函数：不打开连接、不铸造句柄、不发放任何能力。
+    组合根自行打开生产连接后调用它，避免 PRAGMA 策略在两处重复。
+    """
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(f"PRAGMA busy_timeout={config.DB_BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _mint_test_writer(path: Path | str, cap_id: str) -> WriteCapability:
+    """**测试专用**铸造：拒绝真实生产库默认路径。
+
+    M3.2① 复审修复：原 _mint_writer 无任何守卫、无一次性限制、cap_id 可
+    任意传入，是比 _open_production_writer 更短的生产写获取入口（已实证
+    可反复铸造指向生产库的 writer 并绕过 CAS 直接写入）。现统一加生产
+    路径守卫，且只供 _open_test_writer 使用。
+    """
     p = Path(path)
+    if p.resolve() == _PRODUCTION_DB_DEFAULT.resolve():
+        raise PermissionError("test_writer_cannot_target_production_db")
     p.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(p), timeout=config.DB_BUSY_TIMEOUT_MS / 1000,
                            check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute(f"PRAGMA busy_timeout={config.DB_BUSY_TIMEOUT_MS}")
-    conn.execute("PRAGMA foreign_keys=ON")
+    apply_write_pragmas(conn)
     w = object.__new__(WriteCapability)
     object.__setattr__(w, "_conn", conn)
     object.__setattr__(w, "_db_path", str(p))
@@ -212,30 +229,28 @@ def _mint_writer(path: Path | str, cap_id: str) -> WriteCapability:
     return w
 
 
-_production_writer_taken = False
-_production_writer_lock = threading.Lock()
-
-
-def _open_production_writer() -> WriteCapability:
-    """组合根专用：进程内首个调用者取得生产写能力，后续调用抛错。
-
-    一次性不是安全依据（见上方注释）；取得失败原样抛错 → 组合根启动失败，
-    不静默降级。路径取 config.DB_PATH（测试经 fixture 重定向到 tmp）。
-    """
-    global _production_writer_taken
-    with _production_writer_lock:
-        if _production_writer_taken:
-            raise RuntimeError("production_writer_already_taken")
-        w = _mint_writer(config.DB_PATH, cap_id="production")
-        _production_writer_taken = True
-        return w
+# ---------------------------------------------------------------------------
+# 生产写能力获取入口：**本模块不提供任何此类函数**（M3.2① 复审修复）
+#
+# 原 _open_production_writer() 已整体删除。它虽有一次性锁，但只拦得住第二个
+# 调用者，不能证明第一个调用者就是组合根——普通业务模块可在 app 启动前抢先
+# 调用它取得 production WriteCapability，再用公开的 transaction() 绕过 CAS
+# 直接写生产库（已实证）。一次性标志不是访问控制。
+#
+# 现行边界：生产 writer 由 app.build_application() **在函数体内部**自行打开
+# 连接并铸造，db 侧不存在任何返回生产写能力的模块级可调用对象。
+# 威胁模型（用户既定口径）：不要求进程内绝对不可绕过的沙箱——直接
+# sqlite3.connect(config.DB_PATH) 或 object.__new__(WriteCapability) 属于
+# 特权逃逸，不在防护范围；要求的是项目 API 中不存在普通模块可直接调用的
+# 生产写能力获取入口。
+# ---------------------------------------------------------------------------
 
 
 def _open_test_writer(db_path: Path | str) -> WriteCapability:
     """测试组合根专用：打开独立测试库写能力，与生产库物理隔离。
 
     对新库自动应用全部迁移（零播种），开箱即有完整 schema。
-    可多次创建（并发用例需要）；不占用生产一次性名额。
+    可多次创建（并发用例需要）。
     **拒绝指向真实生产库默认路径**（防借测试工厂取生产写能力，用户裁决
     第4点）。判定基准是未被测试重定向的默认路径 config.DATA_DIR/personal_agent.db
     的原始值——测试经 fixture 把 config.DB_PATH 重定向到 tmp 后，
@@ -245,7 +260,7 @@ def _open_test_writer(db_path: Path | str) -> WriteCapability:
     if Path(db_path).resolve() == _PRODUCTION_DB_DEFAULT.resolve():
         raise PermissionError("test_writer_cannot_target_production_db")
     init_db(db_path)
-    return _mint_writer(db_path, cap_id=f"test:{db_path}")
+    return _mint_test_writer(db_path, cap_id=f"test:{db_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -255,8 +270,8 @@ def _open_test_writer(db_path: Path | str) -> WriteCapability:
 # 已整体移除：它们是普通模块可直接调用的生产写能力获取入口，且其 cap_id
 # 不等于 "production"，会跳过 CAS 配对校验（已实证可伪造 boss 越权写入）。
 #
-# 现行边界：生产写能力只由组合根经 _open_production_writer() 取得（一次性
-# + fail fast），取得后立即绑定可信 authority；M2 披露写经组合根显式注入
+# 现行边界：生产写能力由组合根在 build_application() 内部铸造并立即绑定
+# 可信 authority；M2 披露写经组合根显式注入
 # visibility.DisclosureService(writer)，本模块不再提供任何披露写获取函数。
 # ---------------------------------------------------------------------------
 

@@ -3,7 +3,8 @@
 装配顺序（main 内部，业务模块导入前完成构造）：
   auth_backend（app 内部创建，不接收外部参数）
   → _build_identity(auth_backend) → IdentityAPI
-  → _open_production_writer()（取得失败 fail fast，不静默降级）
+  → 组合根**函数体内部**自行打开生产连接并铸造 WriteCapability
+    （db 侧无任何生产写获取函数；取得失败 fail fast，不静默降级）
   → _build_cas_service(authorize=identity_api.make_authorize(), writer=...)
   → visibility.DisclosureService(writer)（M2 披露写能力显式注入）
   → build_tools(cas_service=...)（业务工具只接收注入实例）
@@ -19,7 +20,16 @@ M6 接 Gradio 会话认证与确认弹窗后替换后端实现。
 """
 from __future__ import annotations
 
-from . import cas, db, identity, visibility
+import sqlite3
+import threading
+
+from . import cas, config, db, identity, visibility
+
+# 生产 writer 一次性名额：仅防重复装配（fail fast），**不是访问控制**。
+# 真正的边界是"铸造代码只存在于 build_application 函数体内部"，
+# 项目 API 中没有任何返回生产写能力的模块级可调用对象。
+_production_writer_taken = False
+_production_writer_lock = threading.Lock()
 
 
 class ProductionAuthBackend:
@@ -60,7 +70,25 @@ def build_application() -> Application:
     db.init_db()                                   # 迁移先行（零播种）
     auth_backend = ProductionAuthBackend()         # app 内部创建
     identity_api = identity._build_identity(auth_backend)
-    production_writer = db._open_production_writer()
+    # 生产写能力铸造：**只存在于本函数体内部**，不暴露为任何模块级可调用对象。
+    # 普通业务模块无法经项目 API 抢先取得生产 writer（一次性锁只防重复装配，
+    # 不承担访问控制）。失败原样抛错 → 启动失败，不静默降级。
+    global _production_writer_taken
+    with _production_writer_lock:
+        if _production_writer_taken:
+            raise RuntimeError("production_writer_already_taken")
+        _conn = sqlite3.connect(str(config.DB_PATH),
+                                timeout=config.DB_BUSY_TIMEOUT_MS / 1000,
+                                check_same_thread=False)
+        _conn.row_factory = sqlite3.Row
+        db.apply_write_pragmas(_conn)
+        production_writer = object.__new__(db.WriteCapability)
+        object.__setattr__(production_writer, "_conn", _conn)
+        object.__setattr__(production_writer, "_db_path", str(config.DB_PATH))
+        object.__setattr__(production_writer, "_cap_id", "production")
+        object.__setattr__(production_writer, "_lock", threading.Lock())
+        object.__setattr__(production_writer, "_bound_authorize", None)
+        _production_writer_taken = True
     authorize = identity_api.make_authorize()
     cas_service = cas._build_cas_service(authorize=authorize, writer=production_writer)
     # M2 披露写能力显式注入（db 侧已无普通模块可调用的获取入口）

@@ -72,13 +72,23 @@ def _boss_ok_audits(rid):
 
 
 def test_matrix7_no_module_level_production_writer_entry(isolated_env):
-    """⑦ 普通业务模块直接获取生产 writer → 无可用入口。"""
-    for name in ("_internal_writer", "_close_internal_writer", "_internal_writer_local"):
+    """⑦ 普通业务模块直接获取生产 writer → 无可用入口。
+
+    M3.2① 复审修复：原断言只验"第二次调用失败"，那恰恰证明第一次能被
+    普通调用方取得。现改为断言入口本身不存在，且组合根仍能正常启动。
+    """
+    for name in ("_internal_writer", "_close_internal_writer", "_internal_writer_local",
+                 "_open_production_writer", "_mint_writer"):
         assert not hasattr(db, name), f"db.{name} 仍存在，生产写获取旁路未封闭"
-    # 唯一生产入口是一次性的：组合根取得后普通模块再取即失败
-    db._open_production_writer()
-    with pytest.raises(RuntimeError, match="production_writer_already_taken"):
-        db._open_production_writer()
+    # 借测试铸造入口指向真实生产库默认路径 → 拒绝
+    with pytest.raises(PermissionError):
+        db._mint_test_writer(db._PRODUCTION_DB_DEFAULT, "production")
+    # 普通调用未能消耗名额：组合根照常取得生产 writer
+    a = app.build_application()
+    try:
+        assert a.writer.cap_id == "production"
+    finally:
+        a.writer.close()
 
 
 def test_matrix7b_composition_root_owns_disclosure(isolated_env):
@@ -176,3 +186,59 @@ def test_disclosure_service_minimal_surface(disclosure):
         assert not hasattr(disclosure, name), f"DisclosureService 暴露了 {name}"
     with pytest.raises(PermissionError, match="disclosure_service_immutable"):
         disclosure._writer = None
+
+
+# ---------------------------------------------------------------------------
+# 生产写能力抢先获取：两条已实证路径的负向复现（M3.2① 复审阻断项）
+#
+# 威胁模型（用户既定口径）：不要求进程内绝对不可绕过的沙箱。
+# object.__getattribute__(svc, "_writer") / object.__new__(WriteCapability) /
+# 直接 sqlite3.connect(config.DB_PATH) 属特权逃逸，不在防护范围；
+# 要求的是项目 API 中不存在普通模块可直接调用的生产写能力获取入口。
+# ---------------------------------------------------------------------------
+
+def test_attack_preempt_one_shot_factory_entry_gone(isolated_env, db_conn):
+    """路径A 复现：普通模块抢先调用一次性工厂取生产 writer。
+
+    修复前实测：首个调用者即取得 cap_id="production" 的 writer，
+    随后 writer.transaction() 绕过 CAS 直接写入成功；一次性锁只拦第二个
+    调用者，不能证明第一个是组合根。修复后该函数不存在。
+    """
+    with pytest.raises(AttributeError):
+        db._open_production_writer()
+    assert db_conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    # 普通调用未消耗名额，组合根照常启动
+    a = app.build_application()
+    try:
+        assert a.writer.cap_id == "production"
+    finally:
+        a.writer.close()
+
+
+def test_attack_unguarded_mint_entry_gone(isolated_env, db_conn):
+    """路径B 复现：_mint_writer 无守卫、无一次性限制、cap_id 可任意伪造。
+
+    修复前实测：可反复铸造指向生产库的 writer（比路径A 更短），
+    直接 transaction() 写入成功。修复后该函数不存在，替代的测试铸造
+    入口对真实生产库默认路径一律拒绝。
+    """
+    with pytest.raises(AttributeError):
+        db._mint_writer(config.DB_PATH, "test:evil")
+    for cap in ("production", "anything", "test:evil"):
+        with pytest.raises(PermissionError, match="test_writer_cannot_target_production_db"):
+            db._mint_test_writer(db._PRODUCTION_DB_DEFAULT, cap)
+    with pytest.raises(PermissionError):
+        db._open_test_writer(db._PRODUCTION_DB_DEFAULT)
+    assert db_conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_composition_root_mint_not_exposed_as_callable(isolated_env):
+    """铸造代码只在 build_application 函数体内部，app 模块无生产写工厂。"""
+    for name in ("_open_production_writer", "_mint_production_writer",
+                 "_mint_production_writer_inline", "open_writer", "get_writer"):
+        assert not hasattr(app, name), f"app.{name} 构成可调用的生产写获取入口"
+    a = app.build_application()
+    try:
+        assert isinstance(a.writer, db.WriteCapability)
+    finally:
+        a.writer.close()
