@@ -21,15 +21,16 @@ from opc_workbench import cas, config, db, identity, visibility
 # ---------------------------------------------------------------------------
 
 @pytest.fixture()
-def writer(isolated_env):
+def writer(isolated_env, identity_api):
     w = db._open_test_writer(config.DB_PATH)
+    w._bind_authority(identity_api.owner_token)   # 测试组合根：取得后立即绑定
     yield w
     w.close()
 
 
 @pytest.fixture()
 def cas_service(identity_api, writer):
-    return cas._build_cas_service(authorize=identity_api.authorize, writer=writer)
+    return cas._build_cas_service(authorize=identity_api.make_authorize(), writer=writer)
 
 
 def _seed_row(conn, table, owner, vis, title="目标"):
@@ -309,7 +310,7 @@ def test_cas_no_bind_no_module_service():
 def test_cas_service_requires_writer(identity_api):
     """⑧ 构造缺 writer → TypeError（写能力不可省略）。"""
     with pytest.raises(TypeError):
-        cas.CASService(authorize=identity_api.authorize)
+        cas.CASService(authorize=identity_api.make_authorize())
 
 
 def test_cas_service_immutable(cas_service, identity_api, writer):
@@ -335,23 +336,20 @@ def test_forged_service_cannot_write_production_db(isolated_env, identity_api, d
     rid = _seed_row(db_conn, "tasks", "sales", "public")
     before = dict(_row(db_conn, "tasks", rid))
 
-    # 组合根先取得生产 writer（模拟 app.main 启动顺序）
+    # 组合根先取得生产 writer 并立即绑定 authority（模拟 app.main 启动顺序）
     prod_writer = db._open_production_writer()
+    prod_writer._bind_authority(identity_api.owner_token)
     prod_service = cas._build_cas_service(authorize=identity_api.make_authorize(),
                                           writer=prod_writer)
 
-    # 攻击者：自建整套链
+    # 攻击者：自建整套身份链 + 伪造 authorize（恒 boss）
     evil_api = identity._build_identity(identity_api._authority._auth_backend)
-    evil_ident = evil_api.resolve_identity("boss", {}, None) if False else None
-    # boss 无 ctx 签不出 → 攻击者改用 Agent 身份 + 伪造 authorize
     evil_ident = evil_api.resolve_identity("sales", {})
-    evil_service = cas.CASService(authorize=lambda ident: "boss",
-                                  writer=db._open_test_writer(
-                                      isolated_env["data_dir"] / "evil.db"))
-    # 实际尝试写"生产库目标行"——evil_service 的 writer 指向独立库，
-    # 其中根本没有该行 → not_found；生产库行内容与 version 不变
-    with pytest.raises(cas.CASNotFound):
-        evil_service.cas_update("tasks", rid, 1, ident=evil_ident, title="篡改")
+    # M3.2：测试豁免已取消 —— 未配对 writer + 伪造 authorize 在**构造期**即被拒
+    with pytest.raises(PermissionError):
+        cas.CASService(authorize=lambda ident: "boss",
+                       writer=db._open_test_writer(
+                           isolated_env["data_dir"] / "evil.db"))
     after = dict(_row(db_conn, "tasks", rid))
     assert after["title"] == before["title"]
     assert after["version"] == before["version"]
@@ -367,16 +365,35 @@ def test_forged_service_cannot_write_production_db(isolated_env, identity_api, d
     prod_writer.close()
 
 
+def test_paired_isolated_writer_keeps_not_found_semantics(isolated_env, identity_api,
+                                                          auth_backend, db_conn):
+    """安全校验前移后，原 not-found 业务语义必须保留。
+
+    合法配对的隔离 writer（绑定自己的 authority）访问该库中不存在的目标，
+    仍返回原有 CASNotFound —— 而不是被安全校验提前拦成 PermissionError。
+    """
+    rid = _seed_row(db_conn, "tasks", "sales", "public")   # 只存在于隔离主库
+    other_api = identity._build_identity(auth_backend)
+    w = db._open_test_writer(isolated_env["data_dir"] / "empty.db")
+    w._bind_authority(other_api.owner_token)
+    service = cas.CASService(authorize=other_api.make_authorize(), writer=w)
+    ident = other_api.resolve_identity("sales", {})
+    with pytest.raises(cas.CASNotFound):
+        service.cas_update("tasks", rid, 1, ident=ident, title="篡改")
+    w.close()
+
+
 def test_writer_authorize_cross_pairing_rejected(isolated_env, identity_api, auth_backend):
     """⑥ 跨配对拒绝：生产 writer 只接受带同源归属标记的 authorize；
     伪造 lambda（无标记）→ 构造拒绝；已绑定后平行链 authorize → 拒绝。"""
     prod_writer = db._open_production_writer()
     with pytest.raises(PermissionError):
         cas.CASService(authorize=lambda ident: "boss", writer=prod_writer)
-    # 组合根正常装配（make_authorize 带归属标记）
+    # 组合根正常装配：先绑定 authority，再配 make_authorize 签发的 Authorize
+    prod_writer._bind_authority(identity_api.owner_token)
     legit = cas.CASService(authorize=identity_api.make_authorize(), writer=prod_writer)
     assert legit is not None
-    # 平行链即便带标记，归属不同 → 已绑定 writer 拒绝二次配对
+    # 平行链即便由 make_authorize 正规签发，authority 不同 → 拒绝配对
     other_api = identity._build_identity(auth_backend)
     with pytest.raises(PermissionError):
         cas.CASService(authorize=other_api.make_authorize(), writer=prod_writer)
@@ -397,7 +414,8 @@ def test_m3_write_path_no_legacy_conn(isolated_env, identity_api, db_conn, monke
     CAS 写入仍成功（证明写 SQL 只经注入 writer）。"""
     rid = _seed_row(db_conn, "tasks", "sales", "public")
     w = db._open_test_writer(config.DB_PATH)
-    service = cas._build_cas_service(authorize=identity_api.authorize, writer=w)
+    w._bind_authority(identity_api.owner_token)
+    service = cas._build_cas_service(authorize=identity_api.make_authorize(), writer=w)
     ident = identity_api.resolve_identity("sales", {})
 
     def sentinel(*a, **kw):

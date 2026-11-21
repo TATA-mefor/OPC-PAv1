@@ -140,6 +140,55 @@ class DeleteToken:
         return object.__getattribute__(self, "_digest")
 
 
+class Authorize:
+    """可信授权句柄（M3.2 复审：取代可伪造的 _pa_owner 属性标记）。
+
+    信任凭据是 authority._authorizes 签发登记表（实例私有），**不是对象形状**
+    ——与 Identity 同款机制。不可直构、不可变、无 __dict__；
+    __call__ 只委托本 api 的 authorize，**行为不可由调用方注入**：
+    即便有人绕过构造门禁造出实例，也无法让它返回登记之外的 role。
+    """
+
+    __slots__ = ("_api", "_authority")
+
+    def __init__(self, *a, **kw):
+        raise PermissionError("authorize_direct_construction_forbidden")
+
+    def __setattr__(self, *a):
+        raise PermissionError("authorize_immutable")
+
+    def __delattr__(self, *a):
+        raise PermissionError("authorize_immutable")
+
+    @property
+    def authority(self) -> object:
+        """签发本句柄的 authority 引用（供 writer 配对身份比对）。"""
+        return object.__getattribute__(self, "_authority")
+
+    def __call__(self, ident) -> str:
+        return object.__getattribute__(self, "_api").authorize(ident)
+
+
+def _verify_authorize(az) -> SessionAuthority:
+    """CASService 构造期唯一信任判定：查签发登记，返回可信 authority。
+
+    拒绝：非 Authorize 对象（裸 lambda / 绑定方法 / 贴了 _pa_owner 的函数）、
+    未登记实例（绕过构造门禁伪造）、api 与 authority 不同源。
+    """
+    if not isinstance(az, Authorize):
+        raise PermissionError("authorize_object_required")
+    a = object.__getattribute__(az, "_authority")
+    api = object.__getattribute__(az, "_api")
+    if not isinstance(a, SessionAuthority) or not isinstance(api, IdentityAPI):
+        raise PermissionError("authorize_authority_invalid")
+    if object.__getattribute__(api, "_authority") is not a:
+        raise PermissionError("authorize_api_mismatch")
+    with a._lock:
+        if a._authorizes.get(id(az)) is not az:
+            raise PermissionError("authorize_not_registered")
+    return a
+
+
 # ---------------------------------------------------------------------------
 # IdentityAPI：装配闭包的公开面（实例由 _build_identity 产出并持有 authority）
 # ---------------------------------------------------------------------------
@@ -168,17 +217,20 @@ class IdentityAPI:
         拿到引用不等于能伪造身份（登记与 secret 仍在实例内部）。"""
         return object.__getattribute__(self, "_authority")
 
-    def make_authorize(self):
-        """产出带归属标记的 authorize 闭包（组合根装配用）。
+    def make_authorize(self) -> Authorize:
+        """产出可信授权句柄（组合根装配用）。
 
-        闭包行为与 self.authorize 完全一致；附带 _pa_owner 指向本 api 的
-        authority，供 CASService 构造期校验 writer/authorize 同源配对。
-        伪造 lambda 无此标记 → 配生产 writer 构造即拒。
+        行为与 self.authorize 完全一致，且**不接受任何调用方参数**。
+        铸造后登记进 authority._authorizes；CASService 构造期经
+        _verify_authorize 查登记确认可信，再比对 writer 绑定的 authority。
         """
-        def authorize(ident):
-            return self.authorize(ident)
-        authorize._pa_owner = self.owner_token
-        return authorize
+        a = object.__getattribute__(self, "_authority")
+        az = object.__new__(Authorize)
+        object.__setattr__(az, "_api", self)
+        object.__setattr__(az, "_authority", a)
+        with a._lock:
+            a._authorizes[id(az)] = az
+        return az
 
     # -- 会话登记与凭证（职责分离，v8） ------------------------------------
 
@@ -425,6 +477,7 @@ def _build_identity(auth_backend) -> IdentityAPI:
     object.__setattr__(authority, "_sessions", {})
     object.__setattr__(authority, "_tokens", {})
     object.__setattr__(authority, "_identities", {})
+    object.__setattr__(authority, "_authorizes", {})
     object.__setattr__(authority, "_lock", threading.RLock())
     object.__setattr__(authority, "_auth_backend", auth_backend)
     return IdentityAPI(authority)

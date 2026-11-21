@@ -17,13 +17,9 @@ from opc_workbench.tools import report as report_tool
 
 
 @pytest.fixture()
-def tool(isolated_env, identity_api):
-    w = db._open_test_writer(config.DB_PATH)
-    service = cas._build_cas_service(authorize=identity_api.make_authorize(), writer=w)
-    t = report_tool.ReportTool(cas_service=service, identity_api=identity_api,
-                               llm=isolated_env["fake_llm"])
-    yield t
-    w.close()
+def tool(isolated_env, identity_api, cas_service):
+    return report_tool.ReportTool(cas_service=cas_service, identity_api=identity_api,
+                                  llm=isolated_env["fake_llm"])
 
 
 def _boss_ctx(tool):

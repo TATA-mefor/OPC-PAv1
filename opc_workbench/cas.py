@@ -7,8 +7,10 @@
 - CASService 实例化：构造期同时固定 authorize 与 writer（WriteCapability），
   无 setter/rebind、无 bind()、无模块级绑定槽、无模块级可变服务变量。
   写 SQL 只经注入 writer，绝不 import db 取共享连接（v10.2）。
-- 配对校验：生产 writer 与 authorize 必须同属一次组合根装配
-  （writer._bind_authorize 一次性绑定；伪造 authorize 配生产 writer 构造即拒）。
+- 配对校验（M3.2 复审强化）：**无测试豁免**，所有 writer 一律校验。
+  authorize 必须是 identity.Authorize 且在 authority 签发登记内（对象形状
+  与属性标记都不是凭据）；writer 的 authority 由组合根取得后立即绑定，
+  构造期只比对身份一致性，不再承担首次绑定。
 - 治理字段（id/version/owner_role/scope/created_at）禁改；version 仅原语递增；
   授权条件纳入最终 UPDATE/DELETE 的 WHERE（封堵"查询时 public、并发改
   private"窗口）；BEGIN IMMEDIATE 单事务；rowcount=0 事务内诊断分流
@@ -74,31 +76,28 @@ def write_where(caller: str) -> tuple[str, list]:
 class CASService:
     """构造期同时固定 authorize 与 writer；无 setter/rebind。
 
-    authorize：组合根注入的身份校验闭包（IdentityAPI.authorize），
-      每次写入查签发登记 → 取登记中的真实 role。
-    writer：WriteCapability 实例；生产 writer 构造期一次性配对绑定，
-      伪造 authorize / 跨组合根 authorize 配生产 writer → 构造拒绝。
+    authorize：组合根注入的 identity.Authorize 句柄（查签发登记确认可信），
+      每次写入查身份签发登记 → 取登记中的真实 role。
+    writer：WriteCapability 实例；其 authority 由组合根取得后一次性绑定，
+      与 authorize 的签发 authority 必须对象同一，否则构造拒绝。
     """
 
     __slots__ = ("_authorize", "_writer")
 
     def __init__(self, *, authorize, writer: db.WriteCapability):
-        if not callable(authorize):
-            raise TypeError("cas_authorize_required")
+        from . import identity
         if not isinstance(writer, db.WriteCapability):
             raise TypeError("cas_writer_required")
-        # 配对校验（v10.2 ⑥）：生产 writer 只接受同一组合根装配的 authorize。
-        # 依据 = 闭包归属标记（IdentityAPI.make_authorize 产出，_pa_owner 指向
-        # 签发 authority）+ writer 一次性绑定；伪造 lambda 无标记 → 构造即拒。
-        # 测试 writer（cap_id 以 test: 开头）供测试组合根自由装配。
-        if writer.cap_id == "production":
-            owner = getattr(authorize, "_pa_owner", None)
-            if owner is None:
-                raise PermissionError("writer_requires_composition_root_authorize")
-            bound = object.__getattribute__(writer, "_bound_authorize")
-            if bound is not None and bound is not owner:
-                raise PermissionError("writer_authorize_pairing_mismatch")
-            writer._bind_authorize(owner)
+        # M3.2 复审：**取消全部测试豁免**，所有 writer 一律完整配对校验。
+        # 信任判定只经 identity._verify_authorize（查 authority 签发登记）：
+        # 裸 lambda / 绑定方法 / 贴了 _pa_owner 的函数 / 未登记伪造实例一律拒。
+        authority = identity._verify_authorize(authorize)
+        # 绑定已由组合根前移完成；此处只校验，不承担首次绑定（消除先到先得）。
+        bound = writer.bound_authority
+        if bound is None:
+            raise PermissionError("writer_authority_not_bound")
+        if bound is not authority:
+            raise PermissionError("writer_authorize_pairing_mismatch")
         object.__setattr__(self, "_authorize", authorize)
         object.__setattr__(self, "_writer", writer)
 

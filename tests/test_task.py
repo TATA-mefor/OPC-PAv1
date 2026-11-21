@@ -14,12 +14,8 @@ from opc_workbench.tools import task as task_tool
 
 
 @pytest.fixture()
-def tool(isolated_env, identity_api):
-    w = db._open_test_writer(config.DB_PATH)
-    service = cas._build_cas_service(authorize=identity_api.make_authorize(), writer=w)
-    t = task_tool.TaskTool(cas_service=service, identity_api=identity_api)
-    yield t
-    w.close()
+def tool(identity_api, cas_service):
+    return task_tool.TaskTool(cas_service=cas_service, identity_api=identity_api)
 
 
 def _call(tool, action, frame_caller="sales", llm_args=None, trusted_ctx=None, **params):

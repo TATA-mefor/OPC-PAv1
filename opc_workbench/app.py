@@ -4,6 +4,7 @@
   auth_backend（app 内部创建，不接收外部参数）
   → _build_identity(auth_backend) → IdentityAPI
   → _open_production_writer()（取得失败 fail fast，不静默降级）
+  → writer._bind_authority(identity_api.owner_token)（M3.2：绑定前移，立即执行）
   → _build_cas_service(authorize=identity_api.make_authorize(), writer=...)
   → visibility.DisclosureService(writer)（M2 披露写能力显式注入）
   → build_tools(cas_service=...)（业务工具只接收注入实例）
@@ -61,6 +62,9 @@ def build_application() -> Application:
     auth_backend = ProductionAuthBackend()         # app 内部创建
     identity_api = identity._build_identity(auth_backend)
     production_writer = db._open_production_writer()
+    # M3.2 复审：取得 writer 后**立即**绑定可信 authority（绑定前移到组合根，
+    # CASService 构造期只校验不绑定，消除先到先得窗口）。
+    production_writer._bind_authority(identity_api.owner_token)
     authorize = identity_api.make_authorize()
     cas_service = cas._build_cas_service(authorize=authorize, writer=production_writer)
     # M2 披露写能力显式注入（db 侧已无普通模块可调用的获取入口）

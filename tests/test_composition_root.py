@@ -42,6 +42,7 @@ def test_2_self_built_service_cannot_replace_application(application, auth_backe
     before = application.cas_service
     other_api = identity._build_identity(auth_backend)
     w = db._open_test_writer(config.DATA_DIR / "parallel.db")
+    w._bind_authority(other_api.owner_token)
     cas.CASService(authorize=other_api.make_authorize(), writer=w)
     assert application.cas_service is before
     w.close()

@@ -17,12 +17,8 @@ from opc_workbench import cas, config, db, identity, visibility
 
 
 @pytest.fixture()
-def bulk_ctx(identity_api, isolated_env):
-    w = db._open_test_writer(config.DB_PATH)
-    service = cas._build_cas_service(authorize=identity_api.make_authorize(), writer=w)
-    ctx = bd.BulkDeleteContext(identity_api=identity_api, cas_service=service)
-    yield ctx
-    w.close()
+def bulk_ctx(identity_api, cas_service):
+    return bd.BulkDeleteContext(identity_api=identity_api, cas_service=cas_service)
 
 
 def _seed(conn, n=6, owner="sales", vis="public"):

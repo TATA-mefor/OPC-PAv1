@@ -102,7 +102,7 @@ class WriteCapability:
     BEGIN IMMEDIATE / COMMIT / ROLLBACK 显式控制（与迁移框架同款纪律）。
     """
 
-    __slots__ = ("_conn", "_db_path", "_cap_id", "_lock", "_bound_authorize")
+    __slots__ = ("_conn", "_db_path", "_cap_id", "_lock", "_bound_authority")
 
     def __init__(self, *a, **kw):
         raise PermissionError("write_capability_direct_construction_forbidden")
@@ -123,19 +123,19 @@ class WriteCapability:
         return object.__getattribute__(self, "_conn").in_transaction
 
     @property
-    def bound_authorize(self):
+    def bound_authority(self):
         """组合根绑定的可信 authority（未绑定为 None）。"""
-        return object.__getattribute__(self, "_bound_authorize")
+        return object.__getattribute__(self, "_bound_authority")
 
-    def _bind_authorize(self, authority) -> None:
+    def _bind_authority(self, authority) -> None:
         """组合根取得 writer 后**立即**一次性绑定可信 authority。
 
         M3.2 复审：绑定前移到组合根，CASService 构造期只校验不绑定，
         消除"谁先构造谁赢"的先到先得窗口。已绑定后任何再次绑定一律拒绝。
         """
-        if object.__getattribute__(self, "_bound_authorize") is not None:
+        if object.__getattribute__(self, "_bound_authority") is not None:
             raise PermissionError("write_capability_already_paired")
-        object.__setattr__(self, "_bound_authorize", authority)
+        object.__setattr__(self, "_bound_authority", authority)
 
     def transaction(self):
         """with writer.transaction() as cur: ... —— 单事务写原语。
@@ -208,7 +208,7 @@ def _mint_writer(path: Path | str, cap_id: str) -> WriteCapability:
     object.__setattr__(w, "_db_path", str(p))
     object.__setattr__(w, "_cap_id", cap_id)
     object.__setattr__(w, "_lock", threading.Lock())
-    object.__setattr__(w, "_bound_authorize", None)
+    object.__setattr__(w, "_bound_authority", None)
     return w
 
 

@@ -205,11 +205,29 @@ def identity_api(auth_backend):
 
 
 @pytest.fixture()
-def disclosure(isolated_env):
-    """M2 披露服务：写能力显式注入，隔离测试库（M3.2 修正版 A）。"""
+def bound_writer(identity_api):
+    """隔离测试库写能力，**已由测试组合根绑定 authority**（M3.2）。
+
+    与 app.build_application 同构：取得 writer 后立即绑定，
+    CASService 构造期只校验配对，不承担首次绑定。
+    """
     w = db._open_test_writer(config.DB_PATH)
-    yield visibility.DisclosureService(w)
+    w._bind_authority(identity_api.owner_token)
+    yield w
     w.close()
+
+
+@pytest.fixture()
+def cas_service(bound_writer, identity_api):
+    """测试组合根装配的 CAS 服务（真实 Identity 链 authorize）。"""
+    return cas._build_cas_service(authorize=identity_api.make_authorize(),
+                                  writer=bound_writer)
+
+
+@pytest.fixture()
+def disclosure(bound_writer):
+    """M2 披露服务：写能力显式注入，隔离测试库（M3.2 修正版 A）。"""
+    return visibility.DisclosureService(bound_writer)
 
 
 @pytest.fixture()

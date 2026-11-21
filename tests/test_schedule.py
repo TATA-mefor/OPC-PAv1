@@ -14,16 +14,12 @@ FUTURE = "2026-12-01T09:00:00+08:00"
 
 
 @pytest.fixture()
-def tool(isolated_env, identity_api, monkeypatch):
+def tool(identity_api, cas_service, monkeypatch):
     # 固定时钟：2026-11-21 09:00 本地（FUTURE 在其后）
     from datetime import datetime
     fixed = datetime.fromisoformat("2026-11-21T09:00:00+08:00").timestamp()
     monkeypatch.setattr(schedule_tool, "_now", lambda: fixed)
-    w = db._open_test_writer(config.DB_PATH)
-    service = cas._build_cas_service(authorize=identity_api.make_authorize(), writer=w)
-    t = schedule_tool.ScheduleTool(cas_service=service, identity_api=identity_api)
-    yield t
-    w.close()
+    return schedule_tool.ScheduleTool(cas_service=cas_service, identity_api=identity_api)
 
 
 def _call(tool, action, frame_caller="personal", llm_args=None, trusted_ctx=None, **params):

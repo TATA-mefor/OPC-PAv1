@@ -1,7 +1,14 @@
-"""M3.2 ① 写能力获取边界负向用例。
+"""M3.2 安全边界负向矩阵（用户 2026-11-22 裁决必测项）。
 
-db 侧内部 writer 获取入口已删除；DisclosureService 显式注入、fail closed、
-最小暴露面。所有断言为端到端行为断言（行内容 / version / 审计）。
+覆盖两条已实证的越权路径：
+- B1：非 production writer（原 internal:m2_disclosure）跳过配对校验 +
+      伪造 boss lambda → 改写 cfo 私有行。修复：取消全部豁免 + 删除内部 writer 入口。
+- B2：`forged._pa_owner = api.owner_token` 贴属性伪造归属标记 + **生产 writer**
+      → 构造成功并以 boss 身份改写 cfo 私有行。修复：信任凭据改为 authority
+      签发登记表（identity._verify_authorize），而非对象形状/属性。
+
+以及：写能力获取边界、DisclosureService fail closed、Report 三条契约。
+所有断言均为端到端行为断言（行内容 / version / 审计），不是对象同一性断言。
 """
 from __future__ import annotations
 
@@ -9,7 +16,7 @@ import json
 
 import pytest
 
-from opc_workbench import app, config, db, visibility
+from opc_workbench import app, cas, config, db, identity, visibility
 
 
 # ---------------------------------------------------------------------------
@@ -51,24 +58,101 @@ def _boss_ok_audits(rid):
             and r.get("target_id") == rid]
 
 
+def _forged_authorize_instance(real_az, *, api=None, authority=None):
+    """绕过构造门禁伪造 Authorize 实例（未登记）——验证登记表才是信任凭据。"""
+    fake = object.__new__(identity.Authorize)
+    object.__setattr__(fake, "_api", api if api is not None
+                       else object.__getattribute__(real_az, "_api"))
+    object.__setattr__(fake, "_authority", authority if authority is not None
+                       else object.__getattribute__(real_az, "_authority"))
+    return fake
 
 
 # ---------------------------------------------------------------------------
 # 一、CAS writer-authorize 配对矩阵（用户给定 8 行）
 # ---------------------------------------------------------------------------
 
+def test_matrix1_production_writer_real_identity_allowed(isolated_env, identity_api, db_conn):
+    """① 生产 writer + 组合根提供的真实 Identity → 允许合法授权操作。"""
+    rid = _seed_sales_public(db_conn)
+    w = db._open_production_writer()
+    w._bind_authority(identity_api.owner_token)
+    svc = cas.CASService(authorize=identity_api.make_authorize(), writer=w)
+    ident = identity_api.resolve_identity("sales", {})
+    row = svc.cas_update("tasks", rid, 1, ident=ident, title="合法更新")
+    assert row["version"] == 2
+    assert _task(db_conn, rid)["title"] == "合法更新"
+    w.close()
 
 
+def test_matrix2_bare_lambda_rejected(isolated_env, identity_api, db_conn):
+    """② 非测试 writer + lambda ident: "boss" → 拒绝构造。"""
+    rid = _seed_cfo_private(db_conn)
+    before = _task(db_conn, rid)
+    w = db._open_production_writer()
+    w._bind_authority(identity_api.owner_token)
+    with pytest.raises(PermissionError, match="authorize_object_required"):
+        cas.CASService(authorize=lambda ident: "boss", writer=w)
+    assert _task(db_conn, rid) == before
+    assert _boss_ok_audits(rid) == []
+    w.close()
 
 
+def test_matrix3_mismatched_authorize_rejected(isolated_env, identity_api,
+                                               auth_backend, db_conn):
+    """③ 非测试 writer + 不匹配的 authorize（平行链正规签发）→ 拒绝。"""
+    w = db._open_production_writer()
+    w._bind_authority(identity_api.owner_token)
+    other_api = identity._build_identity(auth_backend)
+    with pytest.raises(PermissionError, match="writer_authorize_pairing_mismatch"):
+        cas.CASService(authorize=other_api.make_authorize(), writer=w)
+    w.close()
 
 
+def test_matrix4_untrusted_source_authorize_rejected(isolated_env, identity_api, db_conn):
+    """④ 非测试 writer + 形状正确但来源不可信的 authorize → 拒绝。
+
+    伪造实例携带**真实** api 与 authority 引用（形状完全正确），
+    但不在 authority._authorizes 签发登记表中 → 拒绝。
+    这正是"__slots__ + isinstance 不足以构成不可伪造机制"的对策验证。
+    """
+    real_az = identity_api.make_authorize()
+    fake = _forged_authorize_instance(real_az)
+    assert isinstance(fake, identity.Authorize)          # 形状检查会通过
+    w = db._open_production_writer()
+    w._bind_authority(identity_api.owner_token)
+    with pytest.raises(PermissionError, match="authorize_not_registered"):
+        cas.CASService(authorize=fake, writer=w)
+    w.close()
 
 
+def test_matrix4b_api_authority_cross_source_rejected(isolated_env, identity_api,
+                                                      auth_backend):
+    """④b api 与 authority 不同源的伪造实例 → 拒绝（登记前先查同源）。"""
+    real_az = identity_api.make_authorize()
+    other_api = identity._build_identity(auth_backend)
+    fake = _forged_authorize_instance(
+        real_az, authority=object.__getattribute__(other_api, "_authority"))
+    w = db._open_production_writer()
+    w._bind_authority(identity_api.owner_token)
+    with pytest.raises(PermissionError, match="authorize_api_mismatch"):
+        cas.CASService(authorize=fake, writer=w)
+    w.close()
 
 
+def test_matrix5_test_writer_isolated_allowed(cas_service, identity_api, db_conn):
+    """⑤ 测试 writer + 测试授权依赖 + 隔离测试库 → 允许测试。"""
+    rid = _seed_sales_public(db_conn)
+    ident = identity_api.resolve_identity("sales", {})
+    row = cas_service.cas_update("tasks", rid, 1, ident=ident, title="测试写入")
+    assert row["version"] == 2
 
 
+def test_matrix6_test_writer_cannot_target_production_default(isolated_env):
+    """⑥ 测试 writer 指向生产默认库 → 拒绝。"""
+    db.init_db()
+    with pytest.raises(PermissionError):
+        db._open_test_writer(db._PRODUCTION_DB_DEFAULT)
 
 
 def test_matrix7_no_module_level_production_writer_entry(isolated_env):
@@ -108,8 +192,51 @@ def test_matrix8_disclosure_full_chain_regression(disclosure, db_conn):
 # 二、真实攻击复现（本轮最重要的负向验收证据）
 # ---------------------------------------------------------------------------
 
+def test_attack_b2_forged_pa_owner_cannot_write_cfo_private(isolated_env, identity_api,
+                                                            db_conn):
+    """B2 复现：生产 writer + 贴 _pa_owner 的伪造 boss lambda → 必须拒绝。
+
+    修复前实测：构造成功，cfo 私有行 version 1→2，审计记 boss/ok。
+    """
+    rid = _seed_cfo_private(db_conn)
+    before = _task(db_conn, rid)
+
+    w = db._open_production_writer()
+    w._bind_authority(identity_api.owner_token)
+
+    forged = lambda ident: "boss"                      # noqa: E731
+    forged._pa_owner = identity_api.owner_token        # 修复前凭此绕过配对校验
+
+    with pytest.raises(PermissionError, match="authorize_object_required"):
+        cas.CASService(authorize=forged, writer=w)
+
+    after = _task(db_conn, rid)
+    assert after["title"] == before["title"]
+    assert after["detail"] == before["detail"]
+    assert after["visibility"] == "private"
+    assert after["version"] == before["version"]
+    assert _boss_ok_audits(rid) == []
+    w.close()
 
 
+def test_attack_b2_forged_authorize_cannot_write_cfo_private(isolated_env, identity_api,
+                                                             db_conn):
+    """B2 升级变体：伪造 Authorize 实例（形状正确、未登记）+ 生产 writer。
+
+    即便攻击者改用新机制的对象形状，仍因未登记被拒；行内容与 version 不变。
+    """
+    rid = _seed_cfo_private(db_conn)
+    before = _task(db_conn, rid)
+    fake = _forged_authorize_instance(identity_api.make_authorize())
+
+    w = db._open_production_writer()
+    w._bind_authority(identity_api.owner_token)
+    with pytest.raises(PermissionError, match="authorize_not_registered"):
+        cas.CASService(authorize=fake, writer=w)
+
+    assert _task(db_conn, rid) == before
+    assert _boss_ok_audits(rid) == []
+    w.close()
 
 
 def test_attack_b1_internal_writer_entry_is_gone(isolated_env, identity_api, db_conn):
@@ -122,20 +249,72 @@ def test_attack_b1_internal_writer_entry_is_gone(isolated_env, identity_api, db_
     assert _boss_ok_audits(rid) == []
 
 
+def test_legit_service_cannot_cross_role_write_cfo_private(cas_service, identity_api,
+                                                           db_conn):
+    """正向对照的边界：即便服务合法配对，sales 身份也改不动 cfo 私有行。"""
+    rid = _seed_cfo_private(db_conn)
+    before = _task(db_conn, rid)
+    ident = identity_api.resolve_identity("sales", {})
+    with pytest.raises(cas.CASNotFound):
+        cas_service.cas_update("tasks", rid, 1, ident=ident, title="越权篡改")
+    assert _task(db_conn, rid) == before
+    assert _boss_ok_audits(rid) == []
 
 
 # ---------------------------------------------------------------------------
 # 三、Authorize 不可伪造（普通调用方路径）
 # ---------------------------------------------------------------------------
 
+def test_authorize_direct_construction_forbidden():
+    with pytest.raises(PermissionError, match="authorize_direct_construction_forbidden"):
+        identity.Authorize()
 
 
+def test_authorize_immutable(identity_api):
+    az = identity_api.make_authorize()
+    with pytest.raises(PermissionError, match="authorize_immutable"):
+        az._authority = object()
+    with pytest.raises(PermissionError, match="authorize_immutable"):
+        az._api = object()
+    with pytest.raises(PermissionError, match="authorize_immutable"):
+        az.__call__ = lambda ident: "boss"
+    with pytest.raises(PermissionError):
+        del az._authority
+    assert not hasattr(az, "__dict__")
 
 
+def test_authorize_behaviour_not_injectable(identity_api, db_conn):
+    """即便绕过门禁造出实例，__call__ 也只委托真实 api.authorize，
+    无法让它对未登记身份返回 boss。"""
+    fake = _forged_authorize_instance(identity_api.make_authorize())
+    with pytest.raises(PermissionError):
+        fake(object())          # 未登记身份 → 真实 authorize 拒绝
 
 
+def test_authorize_registry_is_trust_anchor(isolated_env, identity_api, auth_backend):
+    """特权改写 _authority 指向另一 authority 后，仍因未登记被拒。"""
+    az = identity_api.make_authorize()
+    other_api = identity._build_identity(auth_backend)
+    other_authority = object.__getattribute__(other_api, "_authority")
+    object.__setattr__(az, "_authority", other_authority)
+    object.__setattr__(az, "_api", other_api)
+    w = db._open_production_writer()
+    w._bind_authority(other_authority)
+    with pytest.raises(PermissionError, match="authorize_not_registered"):
+        cas.CASService(authorize=az, writer=w)
+    w.close()
 
 
+def test_bound_authority_not_rebindable(isolated_env, identity_api, auth_backend):
+    """writer 的 authority 绑定一次后不可改（消除先到先得抢占）。"""
+    w = db._open_production_writer()
+    w._bind_authority(identity_api.owner_token)
+    other_api = identity._build_identity(auth_backend)
+    with pytest.raises(PermissionError):
+        w._bind_authority(other_api.owner_token)
+    with pytest.raises(PermissionError):
+        w._bound_authority = other_api.owner_token
+    w.close()
 
 
 # ---------------------------------------------------------------------------
