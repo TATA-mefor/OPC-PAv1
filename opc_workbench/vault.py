@@ -12,11 +12,12 @@
 """
 from __future__ import annotations
 
+import ntpath
 import os
 import re
 import tempfile
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from . import audit_log, config, visibility
 
@@ -135,18 +136,30 @@ def serialize_frontmatter(meta: dict, body: str) -> str:
 
 
 def resolve_safe_path(root: Path | str, rel: str) -> Path:
-    """把 vault 相对路径解析为根内绝对路径；越界一律拒绝。"""
+    """把 vault 相对路径解析为根内绝对路径；越界一律拒绝。
+
+    **平台无关**：不依赖本机 Path  flavour。Windows 驱动器/UNC 前缀用
+    ntpath.splitdrive 识别（在 Linux 上 PurePosixPath 不会识别 C:\\），
+    反斜杠统一按分隔符处理，避免同一路径在两个平台判定不一致。
+    """
     if not isinstance(rel, str) or rel == "":
         raise ValueError("vault_path_unsafe")
     if "\x00" in rel:
         raise ValueError("vault_path_unsafe")
-    p = Path(rel)
-    if p.is_absolute() or p.drive or rel.startswith(("/", "\\")):
+    # 驱动器号 / UNC / NTFS 备用数据流（"a.md:stream"）一律拒绝
+    if ntpath.splitdrive(rel)[0]:
         raise ValueError("vault_path_unsafe")
-    if any(part == ".." for part in p.parts):
+    normalized = rel.replace("\\", "/")
+    # 冒号一律拒绝：驱动器前缀与 NTFS 备用数据流（ntpath 只认单字母驱动器）
+    if ":" in normalized:
+        raise ValueError("vault_path_unsafe")
+    if normalized.startswith("/"):
+        raise ValueError("vault_path_unsafe")
+    parts = PurePosixPath(normalized).parts
+    if any(part == ".." for part in parts):
         raise ValueError("vault_path_unsafe")
     root_abs = Path(root).resolve()
-    target = (root_abs / p).resolve()        # resolve 跟随符号链接 → 逃逸在此暴露
+    target = (root_abs / PurePosixPath(normalized)).resolve()   # 跟随符号链接 → 逃逸在此暴露
     if target != root_abs and not target.is_relative_to(root_abs):
         raise ValueError("vault_path_unsafe")
     return target

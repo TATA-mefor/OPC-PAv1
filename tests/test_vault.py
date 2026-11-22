@@ -319,3 +319,29 @@ def test_lone_cr_input_accepted():
     meta, body = vault.parse_frontmatter(text)
     assert meta == _meta()
     assert "\r" not in body
+
+
+# --- 跨平台路径判定（审查在 Linux 复跑发现的平台差异）-----------------------
+
+@pytest.mark.parametrize("rel", [
+    "C:\\evil.txt",              # Windows 驱动器绝对路径
+    "C:evil.txt",                # 驱动器相对路径
+    "c:/evil.txt",
+    "\\\\server\\share\\x.md",   # UNC
+    "cfo\\..\\..\\evil.md",      # 反斜杠穿越（Linux 上曾被视为普通文件名）
+    "cfo\\sub\\a.md:stream",     # NTFS 备用数据流
+    "\\rooted.md",
+])
+def test_windows_style_paths_rejected_on_any_platform(tmp_path, rel):
+    """不依赖本机 Path flavour：这些形态在 Windows 与 Linux 上都必须拒绝。"""
+    with pytest.raises(ValueError, match="vault_path_unsafe"):
+        vault.resolve_safe_path(tmp_path, rel)
+
+
+def test_plain_relative_path_still_accepted(tmp_path):
+    assert vault.resolve_safe_path(tmp_path, "cfo/sub/a.md").name == "a.md"
+
+
+def test_load_doc_rejects_windows_drive_path(tmp_path):
+    with pytest.raises(ValueError, match="vault_path_unsafe"):
+        vault.load_doc(tmp_path, "C:\\evil.txt", _doc())
