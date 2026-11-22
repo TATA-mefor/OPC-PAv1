@@ -18,7 +18,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
-from . import config, visibility
+from . import audit_log, config, visibility
 
 # --- 目录布局（PRD §5.8）----------------------------------------------------
 # 8 员工 + personal 各有角色目录；shared 为全员可读共享区；attachments 存二进制。
@@ -43,14 +43,21 @@ class FrontmatterError(ValueError):
 
 
 def _validate_meta(meta: dict) -> None:
+    if not isinstance(meta, dict):
+        raise FrontmatterError("frontmatter_invalid_type:meta")
     missing = [k for k in FM_KEYS if k not in meta]
     if missing:
         raise FrontmatterError(f"frontmatter_missing_key:{missing[0]}")
     extra = [k for k in meta if k not in FM_KEYS]
     if extra:
         raise FrontmatterError(f"frontmatter_unknown_key:{extra[0]}")
+    # 公开入口（serialize / validate_doc_meta）不依赖调用者传入正确类型：
+    # 五个字段一律先做类型校验，非字符串统一 FrontmatterError，绝不漏原生 TypeError
+    for k in FM_KEYS:
+        if not isinstance(meta[k], str):
+            raise FrontmatterError(f"frontmatter_invalid_type:{k}")
     if meta["owner_role"] not in config.ROLES:
-        raise FrontmatterError(f"frontmatter_invalid_value:owner_role")
+        raise FrontmatterError("frontmatter_invalid_value:owner_role")
     if meta["visibility"] not in ("public", "private"):
         raise FrontmatterError("frontmatter_invalid_value:visibility")
     if meta["scope"] not in ("global", "session"):
@@ -72,17 +79,22 @@ def validate_doc_meta(meta: dict) -> None:
 
 
 def parse_frontmatter(text: str) -> tuple[dict, str]:
-    """严格解析 md 头部 YAML 子集 → (meta, body)。任何非法形态抛 FrontmatterError。"""
+    """严格解析 md 头部 YAML 子集 → (meta, body)。任何非法形态抛 FrontmatterError。
+
+    换行口径：先把 CRLF / CR 归一为 LF 再解析（兼容 Windows 编辑器与
+    Obsidian 保存的 md），返回的 body 一律使用 LF。
+    分隔符口径：起止行必须**精确等于** '---'，带空白的 ' --- ' 一律拒绝。
+    """
     if not isinstance(text, str):
         raise FrontmatterError("frontmatter_malformed")
-    lines = text.split("\n")
-    if not lines or lines[0].strip() != _DELIM:
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if not lines or lines[0] != _DELIM:
         raise FrontmatterError("frontmatter_malformed")
     meta: dict[str, str] = {}
     end = None
     for i in range(1, len(lines)):
         raw = lines[i]
-        if raw.strip() == _DELIM:
+        if raw == _DELIM:
             end = i
             break
         if raw.strip() == "":
@@ -116,6 +128,8 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
 def serialize_frontmatter(meta: dict, body: str) -> str:
     """按固定键序序列化；先校验，非法不产出文本。"""
     _validate_meta(meta)
+    if not isinstance(body, str):
+        raise FrontmatterError("frontmatter_invalid_type:body")
     head = "\n".join(f"{k}: {meta[k]}" for k in FM_KEYS)
     return f"{_DELIM}\n{head}\n{_DELIM}\n{body}"
 
@@ -151,8 +165,36 @@ def owner_for_relpath(rel: str) -> str:
     raise ValueError("vault_owner_undetermined")
 
 
+def load_doc(root: Path | str, rel: str, text: str) -> dict:
+    """**唯一组合入口**：路径校验 → 解析 → 目录映射定归属 → 落库前语义校验。
+
+    B2 红线：owner_role 的唯一可信来源是目录映射。frontmatter 声明与目录
+    不符时**以目录为准**，记 WARN 并回显，绝不让文件内容决定归属。
+    调用方（第二批 ingest / watcher）必须经本入口，不得单独用 parse_frontmatter
+    的结果直接落库。
+
+    返回 {"meta", "body", "owner_corrected", "declared_owner"}。
+    """
+    resolve_safe_path(root, rel)                 # 非法路径先拒（含 .. 与逃逸）
+    meta, body = parse_frontmatter(text)
+    dir_owner = owner_for_relpath(rel)           # attachments/未知目录在此拒绝
+    declared = meta["owner_role"]
+    corrected = declared != dir_owner
+    if corrected:
+        audit_log.log("WARN", "frontmatter_owner_mismatch",
+                      target_path=rel, declared_owner=declared, directory_owner=dir_owner)
+        meta["owner_role"] = dir_owner
+    validate_doc_meta(meta)                      # 用归一化后的归属做持久化校验
+    return {"meta": meta, "body": body,
+            "owner_corrected": corrected, "declared_owner": declared}
+
+
 def atomic_write(path: Path | str, text: str) -> None:
-    """同目录 tmp + os.replace 原子落盘；失败清理 tmp，不留半成品。"""
+    """同目录 tmp + os.replace 原子落盘；失败清理 tmp，不留半成品。
+
+    耐久性口径：对文件内容 fsync 后原子替换，保证**读者不会看到半截文件**；
+    **未对父目录 fsync**，因此不宣称具备完整断电持久性保证。
+    """
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=".tmp-", suffix=".part")

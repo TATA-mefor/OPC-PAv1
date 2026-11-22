@@ -205,3 +205,117 @@ def test_diff_snapshots_is_pure_and_sorted():
     out = vault.diff_snapshots(old, new)
     assert out["added"] == ["a", "m"]                    # 有序，便于确定性断言
     assert old == before_old and new == before_new       # 不改入参
+
+# --- 阻断修复 1：owner_role 必须由目录映射约束（组合入口 load_doc）-----------
+
+def test_load_doc_directory_overrides_frontmatter_owner(tmp_path):
+    """cfo/a.md 里写 owner_role: sales → 最终归属必须是 cfo。"""
+    out = vault.load_doc(tmp_path, "cfo/a.md", _doc(owner_role="sales"))
+    assert out["meta"]["owner_role"] == "cfo"
+    assert out["owner_corrected"] is True
+    assert out["declared_owner"] == "sales"
+
+
+def test_load_doc_shared_maps_to_coordinator(tmp_path):
+    out = vault.load_doc(tmp_path, "shared/p.md", _doc(owner_role="sales", visibility="public"))
+    assert out["meta"]["owner_role"] == "coordinator"
+    assert out["owner_corrected"] is True
+
+
+def test_load_doc_matching_owner_not_corrected(tmp_path):
+    out = vault.load_doc(tmp_path, "cfo/a.md", _doc())
+    assert out["meta"]["owner_role"] == "cfo"
+    assert out["owner_corrected"] is False
+
+
+def test_load_doc_result_passes_persist_validation(tmp_path):
+    """后续持久化校验使用的是目录归一化后的归属。"""
+    out = vault.load_doc(tmp_path, "shared/p.md", _doc(owner_role="cfo", visibility="public"))
+    vault.validate_doc_meta(out["meta"])          # 不抛
+    assert out["meta"]["owner_role"] == "coordinator"
+
+
+def test_load_doc_rejects_traversal_before_mapping(tmp_path):
+    """shared/../cfo/a.md 不得被映射成 coordinator，必须整条拒绝。"""
+    with pytest.raises(ValueError, match="vault_path_unsafe"):
+        vault.load_doc(tmp_path, "shared/../cfo/a.md", _doc())
+
+
+@pytest.mark.parametrize("rel", ["../x.md", "/abs/x.md", "attachments/x.pdf", "unknown/x.md"])
+def test_load_doc_rejects_illegal_paths(tmp_path, rel):
+    with pytest.raises(ValueError):
+        vault.load_doc(tmp_path, rel, _doc())
+
+
+def test_load_doc_rejects_session_scope_after_normalization(tmp_path):
+    with pytest.raises(ValueError, match="session_not_persistable"):
+        vault.load_doc(tmp_path, "cfo/a.md", _doc(scope="session"))
+
+
+def test_load_doc_logs_warn_on_mismatch(tmp_path):
+    from opc_workbench import config
+    vault.load_doc(tmp_path, "cfo/a.md", _doc(owner_role="sales"))
+    log = config.LOG_DIR / "audit.log"
+    assert log.exists()
+    assert "frontmatter_owner_mismatch" in log.read_text(encoding="utf-8")
+
+
+# --- 阻断修复 2：非字符串字段统一 FrontmatterError，不漏原生 TypeError -------
+
+@pytest.mark.parametrize("key,bad", [
+    ("file_hash", None), ("file_hash", 123), ("file_hash", ["a"]), ("file_hash", b"x"),
+    ("owner_role", None), ("owner_role", 7),
+    ("visibility", None), ("visibility", ["private"]),
+    ("scope", 1), ("updated_at", None), ("updated_at", 20261122),
+])
+def test_non_string_field_rejected_in_validate(key, bad):
+    with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+        vault.validate_doc_meta(_meta(**{key: bad}))
+
+
+@pytest.mark.parametrize("key,bad", [
+    ("file_hash", None), ("file_hash", 123), ("owner_role", None), ("updated_at", 3.14),
+])
+def test_non_string_field_rejected_in_serialize(key, bad):
+    with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+        vault.serialize_frontmatter(_meta(**{key: bad}), "正文")
+
+
+def test_non_dict_meta_rejected():
+    with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+        vault.validate_doc_meta(["not", "a", "dict"])
+
+
+def test_non_string_body_rejected():
+    with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+        vault.serialize_frontmatter(_meta(), None)
+
+
+# --- 非阻断项修正：分隔符精确匹配 / CRLF 兼容 --------------------------------
+
+@pytest.mark.parametrize("bad", [" --- \n", "--- \n", " ---\n"])
+def test_delimiter_must_match_exactly(bad):
+    text = bad + "\n".join(f"{k}: {v}" for k, v in _meta().items()) + "\n---\n正文"
+    with pytest.raises(vault.FrontmatterError, match="malformed"):
+        vault.parse_frontmatter(text)
+
+
+def test_closing_delimiter_must_match_exactly():
+    text = _doc().replace("\n---\n正文内容", "\n --- \n正文内容")
+    with pytest.raises(vault.FrontmatterError, match="malformed"):
+        vault.parse_frontmatter(text)
+
+
+def test_crlf_input_accepted_and_body_normalized():
+    text = _doc().replace("\n", "\r\n")
+    meta, body = vault.parse_frontmatter(text)
+    assert meta == _meta()
+    assert body == "正文内容\n"          # 归一为 LF
+    assert "\r" not in body
+
+
+def test_lone_cr_input_accepted():
+    text = _doc().replace("\n", "\r")
+    meta, body = vault.parse_frontmatter(text)
+    assert meta == _meta()
+    assert "\r" not in body

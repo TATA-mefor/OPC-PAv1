@@ -78,3 +78,31 @@ def test_default_budget_matches_prd_approximation():
 def test_invalid_params_rejected(kw):
     with pytest.raises(ValueError):
         chunking.chunk_text("some text", **kw)
+
+# --- 已批准的分块规则：标题不重叠，其余边界与硬切按 64 重叠 ------------------
+
+def test_heading_chunk_has_no_overlap_from_previous():
+    """审查批准规则：标题完整地位于新块开头，不带入前块尾部内容。"""
+    text = "引子" * 60 + "\n# 第二章\n" + "正文" * 200
+    chunks = chunking.chunk_text(text, target=150, overlap=10)
+    idx = next(i for i, c in enumerate(chunks) if c.startswith("# 第二章"))
+    assert idx > 0
+    prev = chunks[idx - 1]
+    assert prev.endswith("\n")                       # 前块止于标题前的换行
+    assert not prev.endswith(chunks[idx][:5])        # 无重叠带入
+
+
+def test_hard_cut_uses_default_64_overlap():
+    text = "甲" * 3000                                # 无边界 → 硬切
+    chunks = chunking.chunk_text(text)                # 默认 target=512 / overlap=64
+    for prev, nxt in zip(chunks, chunks[1:]):
+        assert prev.endswith(nxt[:64])                # 恰好 64 字符重叠
+        assert len(nxt) > 64
+
+
+def test_paragraph_boundary_keeps_overlap():
+    text = ("段落内容若干。\n\n" * 300)
+    chunks = chunking.chunk_text(text, target=120, overlap=20)
+    assert len(chunks) > 2
+    shared = sum(1 for p, n in zip(chunks, chunks[1:]) if p.endswith(n[:5]))
+    assert shared > 0                                 # 普通边界仍保留重叠
