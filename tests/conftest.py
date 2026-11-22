@@ -7,6 +7,8 @@ autouse fixture 保证：
 """
 from __future__ import annotations
 
+import hashlib
+import math
 import socket
 import sys
 from pathlib import Path
@@ -23,8 +25,10 @@ from opc_workbench import config, db, llm_client  # noqa: E402
 class FakeLLM:
     """确定性替身：记录调用、可编排响应/异常，零网络。"""
 
-    def __init__(self, responses=None):
+    def __init__(self, responses=None, embed_responses=None, embed_dim=8):
         self.responses = list(responses or ["fake-ok"])
+        self.embed_responses = list(embed_responses or [])
+        self.embed_dim = embed_dim
         self.calls: list[dict] = []
         self.available = True
         self.breaker = llm_client.CircuitBreaker()
@@ -35,6 +39,28 @@ class FakeLLM:
         if isinstance(item, Exception):
             raise item
         return item
+
+    def embed(self, texts, *, deadline=None):
+        """M4 第一批测试替身：确定性、已归一化、零网络；可编排异常/异常向量。
+
+        生产 embed() 属第二批，本替身仅用于纯函数与分块/检索地基测试。
+        """
+        self.calls.append({"kind": "embed", "texts": list(texts)})
+        if self.embed_responses:
+            item = self.embed_responses.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+        return [self._vector(t) for t in texts]
+
+    def _vector(self, text: str) -> list[float]:
+        digest = hashlib.sha256(text.encode("utf-8")).digest()
+        raw = [(digest[i % len(digest)] / 255.0) - 0.5 for i in range(self.embed_dim)]
+        norm = math.sqrt(sum(v * v for v in raw))
+        if norm == 0.0:                       # 零向量兜底为单位向量，绝不返回全零
+            raw = [1.0] + [0.0] * (self.embed_dim - 1)
+            norm = 1.0
+        return [v / norm for v in raw]
 
 
 @pytest.fixture(autouse=True)
