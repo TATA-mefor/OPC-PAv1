@@ -1,17 +1,223 @@
-# M4 第二批红证原始输出
-# 做法：每个变体只撤销一处保护，跑对应目标用例；替换命中数均已在脚本中断言非零。
+# M4 第二批红证原始输出（含复审阻断 B1/B2 修复红证）
+# 做法：每个变体只撤销一处保护，跑对应目标用例；替换命中数在脚本中断言非零。
 # 基线树 = 本批实现工作树（未提交），不是 77c3a12（其尚无这些模块）。
 
-# red_b8_no_guard: B8 去掉条件更新与 rowcount 判定
+# red_b1_unconditional_failure: B1 失败更新不带版本与 missing 条件
+# cmd: C:\Python314\python.exe -m pytest tests/test_knowledge_race_guards.py -k failure -m not live -q --no-header -p no:cacheprovider
+
+F.F                                                                      [100%]
+================================== FAILURES ===================================
+_____________ test_stale_failure_cannot_mark_newer_version_failed _____________
+
+kwriter = <opc_workbench.db.WriteCapability object at 0x000001E1FF0B53A0>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-204/test_stale_failure_cannot_mark0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-204/test_stale_failure_cannot_mark0/vault')}
+write_md = <function write_md.<locals>._write at 0x000001E1FF035DD0>
+
+    def test_stale_failure_cannot_mark_newer_version_failed(
+            kwriter, isolated_env, write_md):
+        root = isolated_env["vault_dir"]
+        fake = isolated_env["fake_llm"]
+        write_md(root, "cfo/a.md", "V1-OLD")
+        gate = _FailAfterGate()
+        svc_a = KnowledgeService(kwriter, llm=gate, vault_root=root)
+        svc_b = KnowledgeService(kwriter, llm=fake, vault_root=root)
+    
+        out: dict = {}
+        errors: list = []
+    
+        def run_a():
+            try:
+                out["a"] = svc_a.ingest("cfo/a.md")
+            except BaseException as exc:      # noqa: BLE001
+                errors.append(exc)
+    
+        t = threading.Thread(target=run_a)
+        t.start()
+        try:
+            assert gate.entered.wait(10), "A 未进入嵌入阶段"
+            write_md(root, "cfo/a.md", "V2-NEW")
+            out["b"] = svc_b.ingest("cfo/a.md")
+            assert out["b"]["status"] == "ready"
+        finally:
+            gate.release.set()
+            t.join(10)
+        assert not errors, errors
+        assert not t.is_alive()
+    
+        doc = _doc("cfo/a.md")
+        # 先看实际状态：无保护时这里会变成 failed，新版本被挤出检索视图
+>       assert doc["status"] == "ready"
+E       AssertionError: assert 'failed' == 'ready'
+E         
+E         - ready
+E         + failed
+
+tests\test_knowledge_race_guards.py:79: AssertionError
+_____________ test_stale_failure_cannot_overwrite_missing_status ______________
+
+kwriter = <opc_workbench.db.WriteCapability object at 0x000001E1FF10E610>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-204/test_stale_failure_cannot_over0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-204/test_stale_failure_cannot_over0/vault')}
+write_md = <function write_md.<locals>._write at 0x000001E1FF061640>
+
+    def test_stale_failure_cannot_overwrite_missing_status(
+            kwriter, isolated_env, write_md):
+        """B1+B2 交叉：旧轮次失败也不得把 missing 改成 failed。"""
+        root = isolated_env["vault_dir"]
+        write_md(root, "sales/s.md", "GHOST-FAIL-BODY")
+        gate = _FailAfterGate()
+        svc_a = KnowledgeService(kwriter, llm=gate, vault_root=root)
+        svc_b = KnowledgeService(kwriter, llm=isolated_env["fake_llm"], vault_root=root)
+        out: dict = {}
+    
+        t = threading.Thread(target=lambda: out.update(a=svc_a.ingest("sales/s.md")))
+        t.start()
+        try:
+            assert gate.entered.wait(10)
+            (root / "sales" / "s.md").unlink()
+            svc_b.mark_missing("sales/s.md")
+        finally:
+            gate.release.set()
+            t.join(10)
+>       assert _doc("sales/s.md")["status"] == "missing"
+E       AssertionError: assert 'failed' == 'missing'
+E         
+E         - missing
+E         + failed
+
+tests\test_knowledge_race_guards.py:160: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_knowledge_race_guards.py::test_stale_failure_cannot_mark_newer_version_failed
+FAILED tests/test_knowledge_race_guards.py::test_stale_failure_cannot_overwrite_missing_status
+2 failed, 1 passed, 3 deselected in 1.57s
+
+# red_b2_commit_ignores_missing: B2 提交条件不排除 missing
+# cmd: C:\Python314\python.exe -m pytest tests/test_knowledge_race_guards.py -k resurrect -m not live -q --no-header -p no:cacheprovider
+
+F.                                                                       [100%]
+================================== FAILURES ===================================
+_______________ test_stale_success_cannot_resurrect_missing_doc _______________
+
+kwriter = <opc_workbench.db.WriteCapability object at 0x00000186BE1A5300>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-205/test_stale_success_cannot_resu0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-205/test_stale_success_cannot_resu0/vault')}
+write_md = <function write_md.<locals>._write at 0x00000186BC129DD0>
+gated_embedder_cls = <class 'conftest.gated_embedder_cls.<locals>.GatedEmbedder'>
+
+    def test_stale_success_cannot_resurrect_missing_doc(
+            kwriter, isolated_env, write_md, gated_embedder_cls):
+        root = isolated_env["vault_dir"]
+        fake = isolated_env["fake_llm"]
+        write_md(root, "sales/s.md", "GHOST-BODY")
+        gate = gated_embedder_cls(fake)
+        svc_a = KnowledgeService(kwriter, llm=gate, vault_root=root)
+        svc_b = KnowledgeService(kwriter, llm=fake, vault_root=root)
+    
+        out: dict = {}
+        errors: list = []
+    
+        def run_a():
+            try:
+                out["a"] = svc_a.ingest("sales/s.md")
+            except BaseException as exc:      # noqa: BLE001
+                errors.append(exc)
+    
+        t = threading.Thread(target=run_a)
+        t.start()
+        try:
+            assert gate.entered.wait(10), "A 未进入嵌入阶段"
+            (root / "sales" / "s.md").unlink()
+            svc_b.mark_missing("sales/s.md")
+            assert _doc("sales/s.md")["status"] == "missing"
+        finally:
+            gate.release.set()
+            t.join(10)
+        assert not errors, errors
+        assert not t.is_alive()
+    
+        doc = _doc("sales/s.md")
+        # 先看实际状态：无保护时旧任务会把它写回 ready
+>       assert doc["status"] == "missing"
+E       AssertionError: assert 'ready' == 'missing'
+E         
+E         - missing
+E         + ready
+
+tests\test_knowledge_race_guards.py:135: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_knowledge_race_guards.py::test_stale_success_cannot_resurrect_missing_doc
+1 failed, 1 passed, 4 deselected in 1.50s
+
+# red_b2_late_tx1: B2 同源缺口：晚到的 TX1 可复活 missing
+# cmd: C:\Python314\python.exe -m pytest tests/test_knowledge_race_guards.py -k late_tx1 -m not live -q --no-header -p no:cacheprovider
+
+F                                                                        [100%]
+================================== FAILURES ===================================
+_________________ test_late_tx1_cannot_resurrect_missing_doc __________________
+
+kwriter = <opc_workbench.db.WriteCapability object at 0x00000237F8B60720>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-206/test_late_tx1_cannot_resurrect0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-206/test_late_tx1_cannot_resurrect0/vault')}
+write_md = <function write_md.<locals>._write at 0x00000237F6AC9DD0>
+gated_embedder_cls = <class 'conftest.gated_embedder_cls.<locals>.GatedEmbedder'>
+
+    def test_late_tx1_cannot_resurrect_missing_doc(kwriter, isolated_env, write_md,
+                                                   gated_embedder_cls):
+        """同源缺口：TX1 本身也是状态转换，晚到的 TX1 同样不得复活 missing。
+    
+        构造：先让文档处于 missing 且文件不存在，再用一个"读到旧内容"的轮次
+        直接驱动 ingest——通过替身在读取后、TX1 前删除文件来精确制造该交错。
+        """
+        root = isolated_env["vault_dir"]
+        fake = isolated_env["fake_llm"]
+        write_md(root, "sales/s.md", "LATE-TX1-BODY")
+        svc = KnowledgeService(kwriter, llm=fake, vault_root=root)
+        svc.ingest("sales/s.md")
+    
+        entered = threading.Event()
+        release = threading.Event()
+        original_read = type(root).read_text
+    
+        def gated_read(self, *a, **kw):
+            text = original_read(self, *a, **kw)
+            if self.name == "s.md":
+                entered.set()
+                release.wait(10)          # 读完之后、TX1 之前停住
+            return text
+    
+        import pathlib
+        pathlib.Path.read_text = gated_read
+        out: dict = {}
+        t = threading.Thread(target=lambda: out.update(r=svc.ingest("sales/s.md")))
+        t.start()
+        try:
+            assert entered.wait(10)
+            (root / "sales" / "s.md").unlink()
+            svc.mark_missing("sales/s.md")
+        finally:
+            release.set()
+            t.join(10)
+            pathlib.Path.read_text = original_read
+    
+        doc = _doc("sales/s.md")
+>       assert doc["status"] == "missing"
+E       AssertionError: assert 'ready' == 'missing'
+E         
+E         - missing
+E         + ready
+
+tests\test_knowledge_race_guards.py:219: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_knowledge_race_guards.py::test_late_tx1_cannot_resurrect_missing_doc
+1 failed, 5 deselected in 1.44s
+
+# red_b8_no_guard: B8 去掉版本条件与 rowcount 判定
 # cmd: C:\Python314\python.exe -m pytest tests/test_knowledge_service.py -k stale -m not live -q --no-header -p no:cacheprovider
 
 FF                                                                       [100%]
 ================================== FAILURES ===================================
 _____________ test_stale_embedding_cannot_overwrite_newer_version _____________
 
-kwriter = <opc_workbench.db.WriteCapability object at 0x000001EBA4119EE0>
-isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-185/test_stale_embedding_cannot_ov0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-185/test_stale_embedding_cannot_ov0/vault')}
-write_md = <function write_md.<locals>._write at 0x000001EBA435DD20>
+kwriter = <opc_workbench.db.WriteCapability object at 0x00000194B560E0C0>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-197/test_stale_embedding_cannot_ov0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-197/test_stale_embedding_cannot_ov0/vault')}
+write_md = <function write_md.<locals>._write at 0x00000194B55F9C70>
 gated_embedder_cls = <class 'conftest.gated_embedder_cls.<locals>.GatedEmbedder'>
 
     def test_stale_embedding_cannot_overwrite_newer_version(
@@ -62,9 +268,9 @@ E         Use -v to get more diff
 tests\test_knowledge_service.py:347: AssertionError
 _________________ test_stale_discard_writes_no_partial_chunks _________________
 
-kwriter = <opc_workbench.db.WriteCapability object at 0x000001EBBC3DBD80>
-isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-185/test_stale_discard_writes_no_p0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-185/test_stale_discard_writes_no_p0/vault')}
-write_md = <function write_md.<locals>._write at 0x000001EBA40D1640>
+kwriter = <opc_workbench.db.WriteCapability object at 0x00000194CD67BF60>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-197/test_stale_discard_writes_no_p0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-197/test_stale_discard_writes_no_p0/vault')}
+write_md = <function write_md.<locals>._write at 0x00000194B5611590>
 gated_embedder_cls = <class 'conftest.gated_embedder_cls.<locals>.GatedEmbedder'>
 
     def test_stale_discard_writes_no_partial_chunks(
@@ -98,7 +304,36 @@ tests\test_knowledge_service.py:374: AssertionError
 =========================== short test summary info ===========================
 FAILED tests/test_knowledge_service.py::test_stale_embedding_cannot_overwrite_newer_version
 FAILED tests/test_knowledge_service.py::test_stale_discard_writes_no_partial_chunks
-2 failed, 37 deselected in 1.51s
+2 failed, 37 deselected in 1.60s
+
+# red_delete_no_role_check: 删除只查可信上下文、不查角色
+# cmd: C:\Python314\python.exe -m pytest tests/test_knowledge_tool.py -k role_not_just_hidden -m not live -q --no-header -p no:cacheprovider
+
+F                                                                        [100%]
+================================== FAILURES ===================================
+________________ test_delete_checks_role_not_just_hidden_entry ________________
+
+ktool = <opc_workbench.tools.knowledge_tool.KnowledgeTool object at 0x0000026C69821270>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-207/test_delete_checks_role_not_ju0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-207/test_delete_checks_role_not_ju0/vault')}
+write_md = <function write_md.<locals>._write at 0x0000026C67773B60>
+boss_ctx = <opc_workbench.identity.TrustedContext object at 0x0000026C697C2750>
+
+    def test_delete_checks_role_not_just_hidden_entry(ktool, isolated_env, write_md,
+                                                     boss_ctx):
+        """UI 隐藏入口不是授权边界：有可信上下文但角色非 boss 仍必须拒绝。"""
+        root = isolated_env["vault_dir"]
+        write_md(root, "cfo/a.md", "非 boss 不得删除")
+        ktool.import_doc(_frame_caller="cfo", _llm_args={}, vault_path="cfo/a.md")
+        out = ktool.delete_doc(_frame_caller="cfo", _llm_args={}, _trusted_ctx=boss_ctx,
+                               vault_path="cfo/a.md")
+>       assert out["error"]["code"] == "forbidden_role"
+               ^^^^^^^^^^^^
+E       KeyError: 'error'
+
+tests\test_knowledge_tool.py:101: KeyError
+=========================== short test summary info ===========================
+FAILED tests/test_knowledge_tool.py::test_delete_checks_role_not_just_hidden_entry
+1 failed, 13 deselected in 1.48s
 
 # red_log_fields_dropped: 审计字段落在白名单外被静默丢弃
 # cmd: C:\Python314\python.exe -m pytest tests/test_vault_batch2_regress.py -m not live -q --no-header -p no:cacheprovider
@@ -107,7 +342,7 @@ F.......                                                                 [100%]
 ================================== FAILURES ===================================
 _____________ test_owner_mismatch_log_carries_path_and_both_roles _____________
 
-tmp_path = WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-190/test_owner_mismatch_log_carrie0')
+tmp_path = WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-202/test_owner_mismatch_log_carrie0')
 
     def test_owner_mismatch_log_carries_path_and_both_roles(tmp_path):
         """审计字段必须落在白名单内，否则出处被静默丢弃、无法追溯。"""
@@ -123,7 +358,7 @@ E       KeyError: 'source'
 tests\test_vault_batch2_regress.py:30: KeyError
 =========================== short test summary info ===========================
 FAILED tests/test_vault_batch2_regress.py::test_owner_mismatch_log_carries_path_and_both_roles
-1 failed, 7 passed in 1.39s
+1 failed, 7 passed in 1.42s
 
 # red_metadata_not_synced: 正文未变时不同步 visibility 到 DB
 # cmd: C:\Python314\python.exe -m pytest tests/test_knowledge_service.py -k visibility_change -m not live -q --no-header -p no:cacheprovider
@@ -132,9 +367,9 @@ FF                                                                       [100%]
 ================================== FAILURES ===================================
 ______________ test_visibility_change_updates_db_without_reembed ______________
 
-kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x0000028107789BE0>
-isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-187/test_visibility_change_updates0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-187/test_visibility_change_updates0/vault')}
-write_md = <function write_md.<locals>._write at 0x0000028107765BC0>
+kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x000001CB0D9DDBE0>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-199/test_visibility_change_updates0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-199/test_visibility_change_updates0/vault')}
+write_md = <function write_md.<locals>._write at 0x000001CB0DD75BC0>
 
     def test_visibility_change_updates_db_without_reembed(kservice, isolated_env, write_md):
         root = isolated_env["vault_dir"]
@@ -157,9 +392,9 @@ E         + public
 tests\test_knowledge_service.py:145: AssertionError
 ___________________ test_visibility_change_both_directions ____________________
 
-kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x0000028107739D10>
-isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-187/test_visibility_change_both_di0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-187/test_visibility_change_both_di0/vault')}
-write_md = <function write_md.<locals>._write at 0x000002810749DF30>
+kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x000001CB0DD41E50>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-199/test_visibility_change_both_di0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-199/test_visibility_change_both_di0/vault')}
+write_md = <function write_md.<locals>._write at 0x000001CB0DD95F30>
 
     def test_visibility_change_both_directions(kservice, isolated_env, write_md):
         root = isolated_env["vault_dir"]
@@ -173,13 +408,13 @@ write_md = <function write_md.<locals>._write at 0x000002810749DF30>
 E       AssertionError: assert 0 == 1
 E        +  where 0 = len([])
 E        +    where [] = search('双向可见性测试正文', 'sales')
-E        +      where search = <opc_workbench.knowledge_service.KnowledgeService object at 0x0000028107739D10>.search
+E        +      where search = <opc_workbench.knowledge_service.KnowledgeService object at 0x000001CB0DD41E50>.search
 
 tests\test_knowledge_service.py:160: AssertionError
 =========================== short test summary info ===========================
 FAILED tests/test_knowledge_service.py::test_visibility_change_updates_db_without_reembed
 FAILED tests/test_knowledge_service.py::test_visibility_change_both_directions
-2 failed, 37 deselected in 1.51s
+2 failed, 37 deselected in 1.75s
 
 # red_no_content_dedup_revert: 重新加回内容级唯一索引（违反 C2）
 # cmd: C:\Python314\python.exe -m pytest tests/test_knowledge_migration.py -k dedup -m not live -q --no-header -p no:cacheprovider
@@ -188,7 +423,7 @@ F                                                                        [100%]
 ================================== FAILURES ===================================
 ___________________ test_m005_no_content_dedup_unique_index ___________________
 
-db_conn = <sqlite3.Connection object at 0x000001743C760C70>
+db_conn = <sqlite3.Connection object at 0x000002A6B7920F40>
 
     def test_m005_no_content_dedup_unique_index(db_conn):
         """C2：不得存在 (owner_role,file_hash) 唯一索引。"""
@@ -203,7 +438,7 @@ E             Use -v to get more diff)
 tests\test_knowledge_migration.py:45: AssertionError
 =========================== short test summary info ===========================
 FAILED tests/test_knowledge_migration.py::test_m005_no_content_dedup_unique_index
-1 failed, 13 deselected in 1.05s
+1 failed, 13 deselected in 1.10s
 
 # red_read_before_validate: 先读文件再校验路径
 # cmd: C:\Python314\python.exe -m pytest tests/test_knowledge_service.py -k before_any_read -m not live -q --no-header -p no:cacheprovider
@@ -212,9 +447,9 @@ FFFFF                                                                    [100%]
 ================================== FAILURES ===================================
 ____________ test_unsafe_path_rejected_before_any_read[../evil.md] ____________
 
-kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x000001AB9E9E9A90>
-isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-186/test_unsafe_path_rejected_befo0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-186/test_unsafe_path_rejected_befo0/vault')}
-monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001AB9E985F30>
+kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x000001C7F818DA90>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-198/test_unsafe_path_rejected_befo0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-198/test_unsafe_path_rejected_befo0/vault')}
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001C7F83F9E00>
 rel = '../evil.md'
 
     @pytest.mark.parametrize("rel", ["../evil.md", "cfo/../../evil.md", "C:\\evil.md",
@@ -233,15 +468,15 @@ rel = '../evil.md'
 
 tests\test_knowledge_service.py:119: 
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-opc_workbench\knowledge_service.py:73: in ingest
-    text, doc = self._read_validated(rel)
-                ^^^^^^^^^^^^^^^^^^^^^^^^^
-opc_workbench\knowledge_service.py:52: in _read_validated
+opc_workbench\knowledge_service.py:77: in ingest
+    text, doc, path = self._read_validated(rel)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^
+opc_workbench\knowledge_service.py:56: in _read_validated
     text = (self._root / rel).read_text(encoding="utf-8")
            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
 
-self = WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-186/test_unsafe_path_rejected_befo0/vault/../evil.md')
+self = WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-198/test_unsafe_path_rejected_befo0/vault/../evil.md')
 a = (), kw = {'encoding': 'utf-8'}
 
     def _read(self, *a, **kw):
@@ -252,9 +487,9 @@ E       AssertionError: read_before_path_validation
 tests\test_knowledge_service.py:115: AssertionError
 ________ test_unsafe_path_rejected_before_any_read[cfo/../../evil.md] _________
 
-kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x000001AB9E992350>
-isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-186/test_unsafe_path_rejected_befo1/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-186/test_unsafe_path_rejected_befo1/vault')}
-monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001AB9E9863F0>
+kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x000001C7F8406490>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-198/test_unsafe_path_rejected_befo1/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-198/test_unsafe_path_rejected_befo1/vault')}
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001C7F83FA2C0>
 rel = 'cfo/../../evil.md'
 
     @pytest.mark.parametrize("rel", ["../evil.md", "cfo/../../evil.md", "C:\\evil.md",
@@ -273,15 +508,15 @@ rel = 'cfo/../../evil.md'
 
 tests\test_knowledge_service.py:119: 
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-opc_workbench\knowledge_service.py:73: in ingest
-    text, doc = self._read_validated(rel)
-                ^^^^^^^^^^^^^^^^^^^^^^^^^
-opc_workbench\knowledge_service.py:52: in _read_validated
+opc_workbench\knowledge_service.py:77: in ingest
+    text, doc, path = self._read_validated(rel)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^
+opc_workbench\knowledge_service.py:56: in _read_validated
     text = (self._root / rel).read_text(encoding="utf-8")
            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
 
-self = WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-186/test_unsafe_path_rejected_befo1/vault/cfo/../../evil.md')
+self = WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-198/test_unsafe_path_rejected_befo1/vault/cfo/../../evil.md')
 a = (), kw = {'encoding': 'utf-8'}
 
     def _read(self, *a, **kw):
@@ -292,9 +527,9 @@ E       AssertionError: read_before_path_validation
 tests\test_knowledge_service.py:115: AssertionError
 ___________ test_unsafe_path_rejected_before_any_read[C:\\evil.md] ____________
 
-kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x000001AB9E992C10>
-isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-186/test_unsafe_path_rejected_befo2/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-186/test_unsafe_path_rejected_befo2/vault')}
-monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001ABB6B185F0>
+kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x000001C7F8406D50>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-198/test_unsafe_path_rejected_befo2/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-198/test_unsafe_path_rejected_befo2/vault')}
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001C7FE5C8710>
 rel = 'C:\\evil.md'
 
     @pytest.mark.parametrize("rel", ["../evil.md", "cfo/../../evil.md", "C:\\evil.md",
@@ -313,10 +548,10 @@ rel = 'C:\\evil.md'
 
 tests\test_knowledge_service.py:119: 
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-opc_workbench\knowledge_service.py:73: in ingest
-    text, doc = self._read_validated(rel)
-                ^^^^^^^^^^^^^^^^^^^^^^^^^
-opc_workbench\knowledge_service.py:52: in _read_validated
+opc_workbench\knowledge_service.py:77: in ingest
+    text, doc, path = self._read_validated(rel)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^
+opc_workbench\knowledge_service.py:56: in _read_validated
     text = (self._root / rel).read_text(encoding="utf-8")
            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
@@ -331,9 +566,9 @@ E       AssertionError: read_before_path_validation
 tests\test_knowledge_service.py:115: AssertionError
 ___________ test_unsafe_path_rejected_before_any_read[/etc/passwd] ____________
 
-kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x000001AB9E986650>
-isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-186/test_unsafe_path_rejected_befo3/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-186/test_unsafe_path_rejected_befo3/vault')}
-monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001AB9E959F20>
+kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x000001C7F83FA520>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-198/test_unsafe_path_rejected_befo3/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-198/test_unsafe_path_rejected_befo3/vault')}
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001C7F83E9F20>
 rel = '/etc/passwd'
 
     @pytest.mark.parametrize("rel", ["../evil.md", "cfo/../../evil.md", "C:\\evil.md",
@@ -352,10 +587,10 @@ rel = '/etc/passwd'
 
 tests\test_knowledge_service.py:119: 
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-opc_workbench\knowledge_service.py:73: in ingest
-    text, doc = self._read_validated(rel)
-                ^^^^^^^^^^^^^^^^^^^^^^^^^
-opc_workbench\knowledge_service.py:52: in _read_validated
+opc_workbench\knowledge_service.py:77: in ingest
+    text, doc, path = self._read_validated(rel)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^
+opc_workbench\knowledge_service.py:56: in _read_validated
     text = (self._root / rel).read_text(encoding="utf-8")
            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
@@ -370,9 +605,9 @@ E       AssertionError: read_before_path_validation
 tests\test_knowledge_service.py:115: AssertionError
 _________ test_unsafe_path_rejected_before_any_read[cfo/a.md:stream] __________
 
-kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x000001AB9E985220>
-isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-186/test_unsafe_path_rejected_befo4/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-186/test_unsafe_path_rejected_befo4/vault')}
-monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001AB9E95ACF0>
+kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x000001C7F83F90F0>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-198/test_unsafe_path_rejected_befo4/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-198/test_unsafe_path_rejected_befo4/vault')}
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001C7F83EACF0>
 rel = 'cfo/a.md:stream'
 
     @pytest.mark.parametrize("rel", ["../evil.md", "cfo/../../evil.md", "C:\\evil.md",
@@ -391,15 +626,15 @@ rel = 'cfo/a.md:stream'
 
 tests\test_knowledge_service.py:119: 
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-opc_workbench\knowledge_service.py:73: in ingest
-    text, doc = self._read_validated(rel)
-                ^^^^^^^^^^^^^^^^^^^^^^^^^
-opc_workbench\knowledge_service.py:52: in _read_validated
+opc_workbench\knowledge_service.py:77: in ingest
+    text, doc, path = self._read_validated(rel)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^
+opc_workbench\knowledge_service.py:56: in _read_validated
     text = (self._root / rel).read_text(encoding="utf-8")
            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
 
-self = WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-186/test_unsafe_path_rejected_befo4/vault/cfo/a.md:stream')
+self = WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-198/test_unsafe_path_rejected_befo4/vault/cfo/a.md:stream')
 a = (), kw = {'encoding': 'utf-8'}
 
     def _read(self, *a, **kw):
@@ -414,7 +649,7 @@ FAILED tests/test_knowledge_service.py::test_unsafe_path_rejected_before_any_rea
 FAILED tests/test_knowledge_service.py::test_unsafe_path_rejected_before_any_read[C:\\evil.md]
 FAILED tests/test_knowledge_service.py::test_unsafe_path_rejected_before_any_read[/etc/passwd]
 FAILED tests/test_knowledge_service.py::test_unsafe_path_rejected_before_any_read[cfo/a.md:stream]
-5 failed, 34 deselected in 1.63s
+5 failed, 34 deselected in 1.96s
 
 # red_shared_breaker: embed 与 chat 共用熔断器
 # cmd: C:\Python314\python.exe -m pytest tests/test_embed_client.py -k breaker -m not live -q --no-header -p no:cacheprovider
@@ -423,7 +658,7 @@ FF.                                                                      [100%]
 ================================== FAILURES ===================================
 _________________ test_embed_breaker_open_does_not_block_chat _________________
 
-monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000002C5E8AE1BA0>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000002B5394DDBA0>
 
     def test_embed_breaker_open_does_not_block_chat(monkeypatch):
         monkeypatch.setattr(llm_client.time, "sleep", lambda s: None)
@@ -441,7 +676,7 @@ E         + closed
 tests\test_embed_client.py:200: AssertionError
 _________________ test_chat_breaker_open_does_not_block_embed _________________
 
-monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000002C5E8AE2B10>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000002B5394DEB10>
 
     def test_chat_breaker_open_does_not_block_embed(monkeypatch):
         monkeypatch.setattr(llm_client.time, "sleep", lambda s: None)
@@ -462,7 +697,7 @@ opc_workbench\llm_client.py:151: in embed
                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
 
-self = <opc_workbench.llm_client.LLMClient object at 0x000002C5E8BF4CD0>
+self = <opc_workbench.llm_client.LLMClient object at 0x000002B5395FCCD0>
 batch = ['a']
 
     def _embed_batch(self, batch: list[str], *, deadline: float | None) -> list[list[float]]:
@@ -474,7 +709,7 @@ opc_workbench\llm_client.py:156: LLMFailure
 =========================== short test summary info ===========================
 FAILED tests/test_embed_client.py::test_embed_breaker_open_does_not_block_chat
 FAILED tests/test_embed_client.py::test_chat_breaker_open_does_not_block_embed
-2 failed, 1 passed, 16 deselected in 1.13s
+2 failed, 1 passed, 16 deselected in 1.10s
 
 # red_view_not_governed: 视图未接入 _QUERYABLE 白名单
 # cmd: C:\Python314\python.exe -m pytest tests/test_knowledge_service.py -k search -m not live -q --no-header -p no:cacheprovider
@@ -483,9 +718,9 @@ FFFFFF                                                                   [100%]
 ================================== FAILURES ===================================
 _________________ test_search_returns_content_and_provenance __________________
 
-kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x0000021082BADBE0>
-isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-188/test_search_returns_content_an0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-188/test_search_returns_content_an0/vault')}
-write_md = <function write_md.<locals>._write at 0x0000021082EB5C70>
+kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x00000207745EDBE0>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-200/test_search_returns_content_an0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-200/test_search_returns_content_an0/vault')}
+write_md = <function write_md.<locals>._write at 0x00000207748FDC70>
 
     def test_search_returns_content_and_provenance(kservice, isolated_env, write_md):
         root = isolated_env["vault_dir"]
@@ -497,7 +732,7 @@ write_md = <function write_md.<locals>._write at 0x0000021082EB5C70>
 
 tests\test_knowledge_service.py:174: 
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-opc_workbench\knowledge_service.py:183: in search
+opc_workbench\knowledge_service.py:217: in search
     rows = visibility.query_visible("knowledge_chunks_visible", caller_role,
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
 
@@ -512,9 +747,9 @@ E           ValueError: forbidden_table:knowledge_chunks_visible
 opc_workbench\visibility.py:75: ValueError
 __________ test_search_isolation_checks_content_path_logs_and_errors __________
 
-kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x0000021082E85F90>
-isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-188/test_search_isolation_checks_c0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-188/test_search_isolation_checks_c0/vault')}
-write_md = <function write_md.<locals>._write at 0x0000021082ECAE50>
+kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x00000207748CE210>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-200/test_search_isolation_checks_c0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-200/test_search_isolation_checks_c0/vault')}
+write_md = <function write_md.<locals>._write at 0x0000020774912FB0>
 
     def test_search_isolation_checks_content_path_logs_and_errors(
             kservice, isolated_env, write_md):
@@ -530,7 +765,7 @@ write_md = <function write_md.<locals>._write at 0x0000021082ECAE50>
 
 tests\test_knowledge_service.py:191: 
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-opc_workbench\knowledge_service.py:183: in search
+opc_workbench\knowledge_service.py:217: in search
     rows = visibility.query_visible("knowledge_chunks_visible", caller_role,
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
 
@@ -545,9 +780,9 @@ E           ValueError: forbidden_table:knowledge_chunks_visible
 opc_workbench\visibility.py:75: ValueError
 ____________________ test_missing_doc_excluded_from_search ____________________
 
-kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x0000021082E84E10>
-isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-188/test_missing_doc_excluded_from0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-188/test_missing_doc_excluded_from0/vault')}
-write_md = <function write_md.<locals>._write at 0x0000021082EB4F60>
+kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x00000207748CD090>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-200/test_missing_doc_excluded_from0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-200/test_missing_doc_excluded_from0/vault')}
+write_md = <function write_md.<locals>._write at 0x00000207748FCF60>
 
     def test_missing_doc_excluded_from_search(kservice, isolated_env, write_md):
         root = isolated_env["vault_dir"]
@@ -560,7 +795,7 @@ write_md = <function write_md.<locals>._write at 0x0000021082EB4F60>
 
 tests\test_knowledge_service.py:245: 
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-opc_workbench\knowledge_service.py:183: in search
+opc_workbench\knowledge_service.py:217: in search
     rows = visibility.query_visible("knowledge_chunks_visible", caller_role,
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
 
@@ -575,10 +810,10 @@ E           ValueError: forbidden_table:knowledge_chunks_visible
 opc_workbench\visibility.py:75: ValueError
 __________________ test_search_threshold_filters_low_scores ___________________
 
-kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x0000021082E4AC40>
-isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-188/test_search_threshold_filters_0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-188/test_search_threshold_filters_0/vault')}
-write_md = <function write_md.<locals>._write at 0x0000021082EB49E0>
-monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x0000021082E6E690>
+kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x00000207748BAB10>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-200/test_search_threshold_filters_0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-200/test_search_threshold_filters_0/vault')}
+write_md = <function write_md.<locals>._write at 0x00000207748FC9E0>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x00000207748B2580>
 
     def test_search_threshold_filters_low_scores(kservice, isolated_env, write_md, monkeypatch):
         root = isolated_env["vault_dir"]
@@ -590,7 +825,7 @@ monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x0000021082E6E690>
 
 tests\test_knowledge_service.py:253: 
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-opc_workbench\knowledge_service.py:183: in search
+opc_workbench\knowledge_service.py:217: in search
     rows = visibility.query_visible("knowledge_chunks_visible", caller_role,
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
 
@@ -605,7 +840,7 @@ E           ValueError: forbidden_table:knowledge_chunks_visible
 opc_workbench\visibility.py:75: ValueError
 ___________________ test_search_invalid_caller_fails_closed ___________________
 
-kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x0000021082E4B490>
+kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x00000207748BB360>
 
     def test_search_invalid_caller_fails_closed(kservice):
         with pytest.raises(ValueError, match="invalid_caller"):
@@ -613,7 +848,7 @@ kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x0000021
 
 tests\test_knowledge_service.py:260: 
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-opc_workbench\knowledge_service.py:183: in search
+opc_workbench\knowledge_service.py:217: in search
     rows = visibility.query_visible("knowledge_chunks_visible", caller_role,
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
 
@@ -629,7 +864,7 @@ opc_workbench\visibility.py:75: ValueError
 
 During handling of the above exception, another exception occurred:
 
-kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x0000021082E4B490>
+kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x00000207748BB360>
 
     def test_search_invalid_caller_fails_closed(kservice):
 >       with pytest.raises(ValueError, match="invalid_caller"):
@@ -641,9 +876,9 @@ E         Actual message: 'forbidden_table:knowledge_chunks_visible'
 tests\test_knowledge_service.py:259: AssertionError
 _____________________ test_search_top_k_invalid_rejected ______________________
 
-kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x000002109B095490>
-isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-188/test_search_top_k_invalid_reje0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-188/test_search_top_k_invalid_reje0/vault')}
-write_md = <function write_md.<locals>._write at 0x0000021082EB4460>
+kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x000002077EA416D0>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-200/test_search_top_k_invalid_reje0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-200/test_search_top_k_invalid_reje0/vault')}
+write_md = <function write_md.<locals>._write at 0x00000207748FC460>
 
     def test_search_top_k_invalid_rejected(kservice, isolated_env, write_md):
         root = isolated_env["vault_dir"]
@@ -654,7 +889,7 @@ write_md = <function write_md.<locals>._write at 0x0000021082EB4460>
 
 tests\test_knowledge_service.py:268: 
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-opc_workbench\knowledge_service.py:183: in search
+opc_workbench\knowledge_service.py:217: in search
     rows = visibility.query_visible("knowledge_chunks_visible", caller_role,
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
 
@@ -670,9 +905,9 @@ opc_workbench\visibility.py:75: ValueError
 
 During handling of the above exception, another exception occurred:
 
-kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x000002109B095490>
-isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-188/test_search_top_k_invalid_reje0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-188/test_search_top_k_invalid_reje0/vault')}
-write_md = <function write_md.<locals>._write at 0x0000021082EB4460>
+kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x000002077EA416D0>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-200/test_search_top_k_invalid_reje0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-200/test_search_top_k_invalid_reje0/vault')}
+write_md = <function write_md.<locals>._write at 0x00000207748FC460>
 
     def test_search_top_k_invalid_rejected(kservice, isolated_env, write_md):
         root = isolated_env["vault_dir"]
@@ -692,5 +927,5 @@ FAILED tests/test_knowledge_service.py::test_missing_doc_excluded_from_search
 FAILED tests/test_knowledge_service.py::test_search_threshold_filters_low_scores
 FAILED tests/test_knowledge_service.py::test_search_invalid_caller_fails_closed
 FAILED tests/test_knowledge_service.py::test_search_top_k_invalid_rejected - ...
-6 failed, 33 deselected in 1.75s
+6 failed, 33 deselected in 1.92s
 

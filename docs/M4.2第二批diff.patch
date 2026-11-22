@@ -158,10 +158,10 @@ index 0000000..5865f50
 \ No newline at end of file
 diff --git a/opc_workbench/knowledge_service.py b/opc_workbench/knowledge_service.py
 new file mode 100644
-index 0000000..de41420
+index 0000000..95396d5
 --- /dev/null
 +++ b/opc_workbench/knowledge_service.py
-@@ -0,0 +1,311 @@
+@@ -0,0 +1,345 @@
 +"""知识导入/更新/检索/删除的状态机（M4 第二批）。
 +
 +冻结裁决（用户 2026-11-22，C1–C6）：
@@ -178,8 +178,12 @@ index 0000000..de41420
 +1. **先校验路径再读文件**：resolve_safe_path → read → load_doc。
 +   load_doc 校验的是路径字符串而非读取行为，先读后验等于没校验。
 +2. **B8 版本保护**：嵌入在事务外做；提交时用
-+   `UPDATE ... WHERE id=? AND source_hash=?` 条件更新，rowcount==0 即判定
-+   本轮结果过期，整事务回滚，一个 chunk 都不写。indexed_hash 只在成功后前进。
++   `UPDATE ... WHERE id=? AND source_hash=? AND status<>'missing'` 条件更新，
++   rowcount==0 即判定本轮结果过期，整事务回滚，一个 chunk 都不写。
++   indexed_hash 只在成功后前进。
++   **失败路径同样受这两个条件保护**（B1）：旧轮次失败不得把新版本标成 failed。
++   **missing 不可被旧轮次复活**（B2）：mark_missing 不改 source_hash，因此
++   提交、失败标记、TX1 状态转换三处都必须显式排除 missing。
 +
 +读写边界：对外检索一律经 query_visible 治理闸门；写入事务内读取**自身索引状态**
 +（doc 行/hash）用注入 writer 的游标，属写路径内部状态，不构成 Agent 业务查询。
@@ -211,11 +215,11 @@ index 0000000..de41420
 +    def _embedder(self):
 +        return self._llm if self._llm is not None else llm_client.get_llm()
 +
-+    def _read_validated(self, rel: str) -> tuple[str, dict]:
++    def _read_validated(self, rel: str) -> tuple[str, dict, Path]:
 +        """红线1：路径校验必须发生在读取之前。"""
 +        path = vault.resolve_safe_path(self._root, rel)   # ① 先校验
 +        text = path.read_text(encoding="utf-8")           # ② 再读取
-+        return text, vault.load_doc(self._root, rel, text)  # ③ 组合入口定归属
++        return text, vault.load_doc(self._root, rel, text), path  # ③ 组合入口定归属
 +
 +    @staticmethod
 +    def _effective_visibility(meta: dict) -> str:
@@ -234,7 +238,7 @@ index 0000000..de41420
 +
 +    def ingest(self, rel: str) -> dict:
 +        """导入或更新单个文档。返回处理结果元数据（不含正文）。"""
-+        text, doc = self._read_validated(rel)
++        text, doc, path = self._read_validated(rel)
 +        meta, body = doc["meta"], doc["body"]
 +        owner = meta["owner_role"]
 +        vis = self._effective_visibility(meta)
@@ -253,18 +257,35 @@ index 0000000..de41420
 +                    (filename, rel, digest, owner, vis, now, digest, now))
 +                doc_id = cur.lastrowid
 +                already_indexed = False
++                missing_locked = False
 +            else:
 +                doc_id = row["id"]
-+                already_indexed = (row["indexed_hash"] == digest
-+                                   and row["embed_model"] == config.EMBEDDING_MODEL
-+                                   and row["embed_dim"] == config.EMBEDDING_DIM
-+                                   and row["status"] == "ready")
-+                # reindex 期间保持 ready（旧索引继续可搜）；首次导入才是 processing
-+                status = "ready" if row["indexed_hash"] is not None else "processing"
-+                cur.execute(
-+                    "UPDATE knowledge_docs SET filename=?,file_hash=?,owner_role=?,"
-+                    "visibility=?,source_hash=?,status=?,updated_at=? WHERE id=?",
-+                    (filename, digest, owner, vis, digest, status, now, doc_id))
++                # B2 同源缺口：TX1 本身也是状态转换。若 watcher 已判 missing
++                # 且文件此刻确实不在了，旧轮次不得把它改回 ready/processing。
++                # 文件重新出现时（exists 为真）才允许正常复活。
++                if row["status"] == "missing" and not path.exists():
++                    cur.execute(
++                        "UPDATE knowledge_docs SET owner_role=?,visibility=?,updated_at=? "
++                        "WHERE id=?", (owner, vis, now, doc_id))
++                    missing_locked = True
++                else:
++                    missing_locked = False
++                    already_indexed = (row["indexed_hash"] == digest
++                                       and row["embed_model"] == config.EMBEDDING_MODEL
++                                       and row["embed_dim"] == config.EMBEDDING_DIM
++                                       and row["status"] == "ready")
++                    # reindex 期间保持 ready（旧索引继续可搜）；首次导入才是 processing
++                    status = "ready" if row["indexed_hash"] is not None else "processing"
++                    cur.execute(
++                        "UPDATE knowledge_docs SET filename=?,file_hash=?,owner_role=?,"
++                        "visibility=?,source_hash=?,status=?,updated_at=? WHERE id=?",
++                        (filename, digest, owner, vis, digest, status, now, doc_id))
++
++        if missing_locked:
++            audit_log.log("INFO", "index_missing_locked", target_table="knowledge_docs",
++                          target_id=doc_id, result_code="missing_locked", source=rel)
++            return {"doc_id": doc_id, "status": "missing", "reindexed": False,
++                    "stale": True, "owner_corrected": doc["owner_corrected"]}
 +
 +        if already_indexed:
 +            return {"doc_id": doc_id, "status": "ready", "reindexed": False,
@@ -278,24 +299,37 @@ index 0000000..de41420
 +            blobs = [knowledge_index.encode_vector(v) for v in vectors]
 +        except Exception as exc:  # noqa: BLE001 — 失败只记错误码，不落正文
 +            code = f"{type(exc).__name__}:{exc}"[:200]
++            # B1 修复：失败状态同样受版本与 missing 保护。旧轮次失败不得把
++            # 新版本（或 watcher 判定的 missing）改成 failed，否则新索引会被
++            # 挤出检索视图。rowcount==0 即本轮已过期，丢弃失败标记。
 +            with self._writer.transaction() as cur:
 +                cur.execute(
 +                    "UPDATE knowledge_docs SET status='failed',last_error=?,updated_at=? "
-+                    "WHERE id=?", (code, db.now_iso(), doc_id))
++                    "WHERE id=? AND source_hash=? AND status<>'missing'",
++                    (code, db.now_iso(), doc_id, digest))
++                stale_failure = cur.rowcount == 0
++            if stale_failure:
++                audit_log.log("INFO", "index_stale_failure_discarded",
++                              target_table="knowledge_docs", target_id=doc_id,
++                              result_code="index_stale_failure_discarded", source=rel)
++                return {"doc_id": doc_id, "status": "stale", "reindexed": False,
++                        "stale": True, "owner_corrected": doc["owner_corrected"]}
 +            audit_log.log("ERROR", "knowledge_index_failed", target_table="knowledge_docs",
 +                          target_id=doc_id, result_code="index_failed", source=rel)
 +            return {"doc_id": doc_id, "status": "failed", "reindexed": False,
 +                    "stale": False, "error": code,
 +                    "owner_corrected": doc["owner_corrected"]}
 +
-+        # TX2：B8 条件提交——source_hash 仍是本轮读到的值才允许落库
++        # TX2：B8 条件提交——source_hash 仍是本轮读到的值，且文档未进入 missing
++        # （B2 修复：mark_missing 不改 source_hash，只靠 hash 条件会让旧任务
++        #  把已消失的文件复活成 ready 并重新插入 chunks）
 +        dim = len(vectors[0]) if vectors else config.EMBEDDING_DIM
 +        try:
 +            with self._writer.transaction() as cur:
 +                cur.execute(
 +                    "UPDATE knowledge_docs SET indexed_hash=?,chunk_count=?,embed_model=?,"
 +                    "embed_dim=?,status='ready',last_error=NULL,updated_at=? "
-+                    "WHERE id=? AND source_hash=?",
++                    "WHERE id=? AND source_hash=? AND status<>'missing'",
 +                    (digest, len(pieces), config.EMBEDDING_MODEL, dim,
 +                     db.now_iso(), doc_id, digest))
 +                if cur.rowcount == 0:
@@ -574,10 +608,10 @@ index 1338ac0..a39b6db 100644
  _default_lock = threading.Lock()
 diff --git a/opc_workbench/tools/knowledge_tool.py b/opc_workbench/tools/knowledge_tool.py
 new file mode 100644
-index 0000000..96aee57
+index 0000000..7dec7f7
 --- /dev/null
 +++ b/opc_workbench/tools/knowledge_tool.py
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,141 @@
 +"""knowledge_tool（PRD §5.3/§8.2，M4 第二批）。
 +
 +5 action：import_doc / search / list_docs / delete_doc / reindex。
@@ -684,10 +718,19 @@ index 0000000..96aee57
 +    # -- 非 LLM 面（UI 确认 / watcher） ---------------------------------------
 +
 +    def delete_doc(self, *, _frame_caller, _llm_args, _trusted_ctx=None, **params) -> dict:
-+        """需 UI 确认的可信上下文；无上下文一律拒绝（不暴露给 LLM）。"""
++        """需 UI 确认的可信上下文 + 显式角色授权；不暴露给 LLM。
++
++        **UI 隐藏入口不是授权边界**：方法内部必须自己校验。
++        默认口径（待最终 UI 身份约定确认）：删除是治理动作，仅 boss 可为，
++        与 PRD §8.5「治理接口仅 UI/boss 可调」一致。
++        """
 +        if _trusted_ctx is None:
 +            return _err("confirmation_required")
 +        caller = self._caller(_frame_caller, _llm_args, _trusted_ctx)
++        if caller != "boss":
++            audit_log.log("WARN", "knowledge_delete_forbidden", actor_role=caller,
++                          target_table="knowledge_docs", result_code="forbidden_role")
++            return _err("forbidden_role")
 +        rel = params.get("vault_path")
 +        if not isinstance(rel, str) or not rel:
 +            return _err("invalid_param", "vault_path")
@@ -1365,6 +1408,234 @@ index 0000000..c8b3901
 +    monkeypatch.setattr(db, "MIGRATIONS", db.MIGRATIONS[:4] + [original])
 +    assert db.init_db(path) == 5
 \ No newline at end of file
+diff --git a/tests/test_knowledge_race_guards.py b/tests/test_knowledge_race_guards.py
+new file mode 100644
+index 0000000..32b8087
+--- /dev/null
++++ b/tests/test_knowledge_race_guards.py
+@@ -0,0 +1,221 @@
++"""B1/B2 复审阻断修复的并发回归（M4 第二批）。
++
++B1：旧轮次 embedding 失败，不得把已完成的新版本标成 failed。
++B2：watcher 判定 missing 后，旧轮次不得把已消失的文件复活成 ready。
++
++全部用 Event 精确编排真实线程交错，**不用 sleep 猜时序**；
++断言先看**实际落库状态与 chunk 正文**，再看返回标志，
++保证无保护时红证直接暴露状态被污染，而不是先撞在标志位上。
++"""
++from __future__ import annotations
++
++import threading
++
++from opc_workbench import db
++from opc_workbench.knowledge_service import KnowledgeService, body_hash
++
++
++def _doc(rel):
++    rows = db.get_conn().execute(
++        "SELECT * FROM knowledge_docs WHERE stored_path=?", (rel,)).fetchall()
++    return rows[0] if rows else None
++
++
++def _chunks(doc_id):
++    return db.get_conn().execute(
++        "SELECT * FROM knowledge_chunks WHERE doc_id=? ORDER BY seq", (doc_id,)).fetchall()
++
++
++class _FailAfterGate:
++    """进入 embed 置位；放行后抛异常（模拟旧轮次嵌入失败）。"""
++
++    def __init__(self):
++        self.entered = threading.Event()
++        self.release = threading.Event()
++
++    def embed(self, texts, *, deadline=None):
++        self.entered.set()
++        if not self.release.wait(10):
++            raise RuntimeError("gate_timeout")
++        raise RuntimeError("OLD-ROUND-EMBED-FAILURE")
++
++
++# --- B1 ---------------------------------------------------------------------
++
++
++def test_stale_failure_cannot_mark_newer_version_failed(
++        kwriter, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    fake = isolated_env["fake_llm"]
++    write_md(root, "cfo/a.md", "V1-OLD")
++    gate = _FailAfterGate()
++    svc_a = KnowledgeService(kwriter, llm=gate, vault_root=root)
++    svc_b = KnowledgeService(kwriter, llm=fake, vault_root=root)
++
++    out: dict = {}
++    errors: list = []
++
++    def run_a():
++        try:
++            out["a"] = svc_a.ingest("cfo/a.md")
++        except BaseException as exc:      # noqa: BLE001
++            errors.append(exc)
++
++    t = threading.Thread(target=run_a)
++    t.start()
++    try:
++        assert gate.entered.wait(10), "A 未进入嵌入阶段"
++        write_md(root, "cfo/a.md", "V2-NEW")
++        out["b"] = svc_b.ingest("cfo/a.md")
++        assert out["b"]["status"] == "ready"
++    finally:
++        gate.release.set()
++        t.join(10)
++    assert not errors, errors
++    assert not t.is_alive()
++
++    doc = _doc("cfo/a.md")
++    # 先看实际状态：无保护时这里会变成 failed，新版本被挤出检索视图
++    assert doc["status"] == "ready"
++    assert doc["indexed_hash"] == body_hash("V2-NEW")
++    assert [c["content"] for c in _chunks(doc["id"])] == ["V2-NEW"]
++    assert doc["last_error"] is None
++    assert out["a"]["stale"] is True
++    # 新版本仍可被检索到
++    assert len(svc_b.search("V2-NEW", "cfo")) == 1
++
++
++def test_current_round_failure_still_marks_failed(kservice, isolated_env, write_md):
++    """修复不得误伤：本轮自身失败仍要正常标 failed。"""
++    root = isolated_env["vault_dir"]
++    write_md(root, "cfo/a.md", "本轮失败正文")
++    isolated_env["fake_llm"].embed_responses = [RuntimeError("boom")]
++    out = kservice.ingest("cfo/a.md")
++    assert out["status"] == "failed" and out["stale"] is False
++    doc = _doc("cfo/a.md")
++    assert doc["status"] == "failed" and "boom" in doc["last_error"]
++
++
++# --- B2 ---------------------------------------------------------------------
++
++
++def test_stale_success_cannot_resurrect_missing_doc(
++        kwriter, isolated_env, write_md, gated_embedder_cls):
++    root = isolated_env["vault_dir"]
++    fake = isolated_env["fake_llm"]
++    write_md(root, "sales/s.md", "GHOST-BODY")
++    gate = gated_embedder_cls(fake)
++    svc_a = KnowledgeService(kwriter, llm=gate, vault_root=root)
++    svc_b = KnowledgeService(kwriter, llm=fake, vault_root=root)
++
++    out: dict = {}
++    errors: list = []
++
++    def run_a():
++        try:
++            out["a"] = svc_a.ingest("sales/s.md")
++        except BaseException as exc:      # noqa: BLE001
++            errors.append(exc)
++
++    t = threading.Thread(target=run_a)
++    t.start()
++    try:
++        assert gate.entered.wait(10), "A 未进入嵌入阶段"
++        (root / "sales" / "s.md").unlink()
++        svc_b.mark_missing("sales/s.md")
++        assert _doc("sales/s.md")["status"] == "missing"
++    finally:
++        gate.release.set()
++        t.join(10)
++    assert not errors, errors
++    assert not t.is_alive()
++
++    doc = _doc("sales/s.md")
++    # 先看实际状态：无保护时旧任务会把它写回 ready
++    assert doc["status"] == "missing"
++    assert out["a"]["stale"] is True
++    # 已消失的文件不得重新出现在检索结果里
++    assert svc_b.search("GHOST-BODY", "boss") == []
++
++
++def test_stale_failure_cannot_overwrite_missing_status(
++        kwriter, isolated_env, write_md):
++    """B1+B2 交叉：旧轮次失败也不得把 missing 改成 failed。"""
++    root = isolated_env["vault_dir"]
++    write_md(root, "sales/s.md", "GHOST-FAIL-BODY")
++    gate = _FailAfterGate()
++    svc_a = KnowledgeService(kwriter, llm=gate, vault_root=root)
++    svc_b = KnowledgeService(kwriter, llm=isolated_env["fake_llm"], vault_root=root)
++    out: dict = {}
++
++    t = threading.Thread(target=lambda: out.update(a=svc_a.ingest("sales/s.md")))
++    t.start()
++    try:
++        assert gate.entered.wait(10)
++        (root / "sales" / "s.md").unlink()
++        svc_b.mark_missing("sales/s.md")
++    finally:
++        gate.release.set()
++        t.join(10)
++    assert _doc("sales/s.md")["status"] == "missing"
++    assert out["a"]["stale"] is True
++
++
++def test_missing_doc_revives_when_file_reappears(kservice, isolated_env, write_md):
++    """修复不得误伤：文件真的回来了，必须能正常复活并重建索引。"""
++    root = isolated_env["vault_dir"]
++    write_md(root, "sales/s.md", "复活验证正文")
++    kservice.ingest("sales/s.md")
++    (root / "sales" / "s.md").unlink()
++    kservice.mark_missing("sales/s.md")
++    assert _doc("sales/s.md")["status"] == "missing"
++
++    write_md(root, "sales/s.md", "复活验证正文")
++    out = kservice.ingest("sales/s.md")
++    assert out["stale"] is False
++    assert _doc("sales/s.md")["status"] == "ready"
++    assert len(kservice.search("复活验证正文", "sales")) == 1
++
++
++def test_late_tx1_cannot_resurrect_missing_doc(kwriter, isolated_env, write_md,
++                                               gated_embedder_cls):
++    """同源缺口：TX1 本身也是状态转换，晚到的 TX1 同样不得复活 missing。
++
++    构造：先让文档处于 missing 且文件不存在，再用一个"读到旧内容"的轮次
++    直接驱动 ingest——通过替身在读取后、TX1 前删除文件来精确制造该交错。
++    """
++    root = isolated_env["vault_dir"]
++    fake = isolated_env["fake_llm"]
++    write_md(root, "sales/s.md", "LATE-TX1-BODY")
++    svc = KnowledgeService(kwriter, llm=fake, vault_root=root)
++    svc.ingest("sales/s.md")
++
++    entered = threading.Event()
++    release = threading.Event()
++    original_read = type(root).read_text
++
++    def gated_read(self, *a, **kw):
++        text = original_read(self, *a, **kw)
++        if self.name == "s.md":
++            entered.set()
++            release.wait(10)          # 读完之后、TX1 之前停住
++        return text
++
++    import pathlib
++    pathlib.Path.read_text = gated_read
++    out: dict = {}
++    t = threading.Thread(target=lambda: out.update(r=svc.ingest("sales/s.md")))
++    t.start()
++    try:
++        assert entered.wait(10)
++        (root / "sales" / "s.md").unlink()
++        svc.mark_missing("sales/s.md")
++    finally:
++        release.set()
++        t.join(10)
++        pathlib.Path.read_text = original_read
++
++    doc = _doc("sales/s.md")
++    assert doc["status"] == "missing"
++    assert out["r"]["stale"] is True
++    assert svc.search("LATE-TX1-BODY", "boss") == []
+\ No newline at end of file
 diff --git a/tests/test_knowledge_service.py b/tests/test_knowledge_service.py
 new file mode 100644
 index 0000000..295d72a
@@ -1890,10 +2161,10 @@ index 0000000..295d72a
 \ No newline at end of file
 diff --git a/tests/test_knowledge_tool.py b/tests/test_knowledge_tool.py
 new file mode 100644
-index 0000000..cf8123a
+index 0000000..aabd9cd
 --- /dev/null
 +++ b/tests/test_knowledge_tool.py
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,119 @@
 +"""knowledge_tool Agent 面（M4 第二批）：身份、可见面、错误契约。"""
 +from __future__ import annotations
 +
@@ -1983,6 +2254,18 @@ index 0000000..cf8123a
 +    ktool.import_doc(_frame_caller="cfo", _llm_args={}, vault_path="cfo/a.md")
 +    out = ktool.delete_doc(_frame_caller="cfo", _llm_args={}, vault_path="cfo/a.md")
 +    assert out["error"]["code"] == "confirmation_required"
++    assert (root / "cfo" / "a.md").exists()
++
++
++def test_delete_checks_role_not_just_hidden_entry(ktool, isolated_env, write_md,
++                                                 boss_ctx):
++    """UI 隐藏入口不是授权边界：有可信上下文但角色非 boss 仍必须拒绝。"""
++    root = isolated_env["vault_dir"]
++    write_md(root, "cfo/a.md", "非 boss 不得删除")
++    ktool.import_doc(_frame_caller="cfo", _llm_args={}, vault_path="cfo/a.md")
++    out = ktool.delete_doc(_frame_caller="cfo", _llm_args={}, _trusted_ctx=boss_ctx,
++                           vault_path="cfo/a.md")
++    assert out["error"]["code"] == "forbidden_role"
 +    assert (root / "cfo" / "a.md").exists()
 +
 +
