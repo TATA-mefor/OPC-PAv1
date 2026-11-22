@@ -94,10 +94,10 @@ index 0000000..de5845a
 \ No newline at end of file
 diff --git a/opc_workbench/vault.py b/opc_workbench/vault.py
 new file mode 100644
-index 0000000..6137be2
+index 0000000..1a11d17
 --- /dev/null
 +++ b/opc_workbench/vault.py
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,225 @@
 +"""vault 文件层地基（M4 第一批：纯函数 + 受限文件 IO，零 DB、零网络）。
 +
 +职责边界（M4.1 清单 §七 B2/B5、第一批边界）：
@@ -118,7 +118,7 @@ index 0000000..6137be2
 +from datetime import datetime
 +from pathlib import Path
 +
-+from . import config, visibility
++from . import audit_log, config, visibility
 +
 +# --- 目录布局（PRD §5.8）----------------------------------------------------
 +# 8 员工 + personal 各有角色目录；shared 为全员可读共享区；attachments 存二进制。
@@ -143,14 +143,21 @@ index 0000000..6137be2
 +
 +
 +def _validate_meta(meta: dict) -> None:
++    if not isinstance(meta, dict):
++        raise FrontmatterError("frontmatter_invalid_type:meta")
 +    missing = [k for k in FM_KEYS if k not in meta]
 +    if missing:
 +        raise FrontmatterError(f"frontmatter_missing_key:{missing[0]}")
 +    extra = [k for k in meta if k not in FM_KEYS]
 +    if extra:
 +        raise FrontmatterError(f"frontmatter_unknown_key:{extra[0]}")
++    # 公开入口（serialize / validate_doc_meta）不依赖调用者传入正确类型：
++    # 五个字段一律先做类型校验，非字符串统一 FrontmatterError，绝不漏原生 TypeError
++    for k in FM_KEYS:
++        if not isinstance(meta[k], str):
++            raise FrontmatterError(f"frontmatter_invalid_type:{k}")
 +    if meta["owner_role"] not in config.ROLES:
-+        raise FrontmatterError(f"frontmatter_invalid_value:owner_role")
++        raise FrontmatterError("frontmatter_invalid_value:owner_role")
 +    if meta["visibility"] not in ("public", "private"):
 +        raise FrontmatterError("frontmatter_invalid_value:visibility")
 +    if meta["scope"] not in ("global", "session"):
@@ -172,17 +179,22 @@ index 0000000..6137be2
 +
 +
 +def parse_frontmatter(text: str) -> tuple[dict, str]:
-+    """严格解析 md 头部 YAML 子集 → (meta, body)。任何非法形态抛 FrontmatterError。"""
++    """严格解析 md 头部 YAML 子集 → (meta, body)。任何非法形态抛 FrontmatterError。
++
++    换行口径：先把 CRLF / CR 归一为 LF 再解析（兼容 Windows 编辑器与
++    Obsidian 保存的 md），返回的 body 一律使用 LF。
++    分隔符口径：起止行必须**精确等于** '---'，带空白的 ' --- ' 一律拒绝。
++    """
 +    if not isinstance(text, str):
 +        raise FrontmatterError("frontmatter_malformed")
-+    lines = text.split("\n")
-+    if not lines or lines[0].strip() != _DELIM:
++    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
++    if not lines or lines[0] != _DELIM:
 +        raise FrontmatterError("frontmatter_malformed")
 +    meta: dict[str, str] = {}
 +    end = None
 +    for i in range(1, len(lines)):
 +        raw = lines[i]
-+        if raw.strip() == _DELIM:
++        if raw == _DELIM:
 +            end = i
 +            break
 +        if raw.strip() == "":
@@ -216,6 +228,8 @@ index 0000000..6137be2
 +def serialize_frontmatter(meta: dict, body: str) -> str:
 +    """按固定键序序列化；先校验，非法不产出文本。"""
 +    _validate_meta(meta)
++    if not isinstance(body, str):
++        raise FrontmatterError("frontmatter_invalid_type:body")
 +    head = "\n".join(f"{k}: {meta[k]}" for k in FM_KEYS)
 +    return f"{_DELIM}\n{head}\n{_DELIM}\n{body}"
 +
@@ -251,8 +265,36 @@ index 0000000..6137be2
 +    raise ValueError("vault_owner_undetermined")
 +
 +
++def load_doc(root: Path | str, rel: str, text: str) -> dict:
++    """**唯一组合入口**：路径校验 → 解析 → 目录映射定归属 → 落库前语义校验。
++
++    B2 红线：owner_role 的唯一可信来源是目录映射。frontmatter 声明与目录
++    不符时**以目录为准**，记 WARN 并回显，绝不让文件内容决定归属。
++    调用方（第二批 ingest / watcher）必须经本入口，不得单独用 parse_frontmatter
++    的结果直接落库。
++
++    返回 {"meta", "body", "owner_corrected", "declared_owner"}。
++    """
++    resolve_safe_path(root, rel)                 # 非法路径先拒（含 .. 与逃逸）
++    meta, body = parse_frontmatter(text)
++    dir_owner = owner_for_relpath(rel)           # attachments/未知目录在此拒绝
++    declared = meta["owner_role"]
++    corrected = declared != dir_owner
++    if corrected:
++        audit_log.log("WARN", "frontmatter_owner_mismatch",
++                      target_path=rel, declared_owner=declared, directory_owner=dir_owner)
++        meta["owner_role"] = dir_owner
++    validate_doc_meta(meta)                      # 用归一化后的归属做持久化校验
++    return {"meta": meta, "body": body,
++            "owner_corrected": corrected, "declared_owner": declared}
++
++
 +def atomic_write(path: Path | str, text: str) -> None:
-+    """同目录 tmp + os.replace 原子落盘；失败清理 tmp，不留半成品。"""
++    """同目录 tmp + os.replace 原子落盘；失败清理 tmp，不留半成品。
++
++    耐久性口径：对文件内容 fsync 后原子替换，保证**读者不会看到半截文件**；
++    **未对父目录 fsync**，因此不宣称具备完整断电持久性保证。
++    """
 +    target = Path(path)
 +    target.parent.mkdir(parents=True, exist_ok=True)
 +    fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=".tmp-", suffix=".part")
@@ -338,10 +380,10 @@ index f3325b6..5772647 100644
  def isolated_env(request, tmp_path, monkeypatch):
 diff --git a/tests/test_chunking.py b/tests/test_chunking.py
 new file mode 100644
-index 0000000..95ae9d5
+index 0000000..d8b2b80
 --- /dev/null
 +++ b/tests/test_chunking.py
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,108 @@
 +"""M4 第一批：分块纯函数（字符预算近似，断言边界与重叠，不断言精确 token）。"""
 +from __future__ import annotations
 +
@@ -422,7 +464,34 @@ index 0000000..95ae9d5
 +def test_invalid_params_rejected(kw):
 +    with pytest.raises(ValueError):
 +        chunking.chunk_text("some text", **kw)
-\ No newline at end of file
++
++# --- 已批准的分块规则：标题不重叠，其余边界与硬切按 64 重叠 ------------------
++
++def test_heading_chunk_has_no_overlap_from_previous():
++    """审查批准规则：标题完整地位于新块开头，不带入前块尾部内容。"""
++    text = "引子" * 60 + "\n# 第二章\n" + "正文" * 200
++    chunks = chunking.chunk_text(text, target=150, overlap=10)
++    idx = next(i for i, c in enumerate(chunks) if c.startswith("# 第二章"))
++    assert idx > 0
++    prev = chunks[idx - 1]
++    assert prev.endswith("\n")                       # 前块止于标题前的换行
++    assert not prev.endswith(chunks[idx][:5])        # 无重叠带入
++
++
++def test_hard_cut_uses_default_64_overlap():
++    text = "甲" * 3000                                # 无边界 → 硬切
++    chunks = chunking.chunk_text(text)                # 默认 target=512 / overlap=64
++    for prev, nxt in zip(chunks, chunks[1:]):
++        assert prev.endswith(nxt[:64])                # 恰好 64 字符重叠
++        assert len(nxt) > 64
++
++
++def test_paragraph_boundary_keeps_overlap():
++    text = ("段落内容若干。\n\n" * 300)
++    chunks = chunking.chunk_text(text, target=120, overlap=20)
++    assert len(chunks) > 2
++    shared = sum(1 for p, n in zip(chunks, chunks[1:]) if p.endswith(n[:5]))
++    assert shared > 0                                 # 普通边界仍保留重叠
 diff --git a/tests/test_embedding_fake.py b/tests/test_embedding_fake.py
 new file mode 100644
 index 0000000..702da8f
@@ -487,10 +556,10 @@ index 0000000..702da8f
 \ No newline at end of file
 diff --git a/tests/test_vault.py b/tests/test_vault.py
 new file mode 100644
-index 0000000..6cb4231
+index 0000000..3d88c5e
 --- /dev/null
 +++ b/tests/test_vault.py
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,321 @@
 +"""M4 第一批：vault 文件层地基（frontmatter 严格解析 / 路径安全 / 原子写 / 快照纯函数）。"""
 +from __future__ import annotations
 +
@@ -698,4 +767,117 @@ index 0000000..6cb4231
 +    out = vault.diff_snapshots(old, new)
 +    assert out["added"] == ["a", "m"]                    # 有序，便于确定性断言
 +    assert old == before_old and new == before_new       # 不改入参
-\ No newline at end of file
++
++# --- 阻断修复 1：owner_role 必须由目录映射约束（组合入口 load_doc）-----------
++
++def test_load_doc_directory_overrides_frontmatter_owner(tmp_path):
++    """cfo/a.md 里写 owner_role: sales → 最终归属必须是 cfo。"""
++    out = vault.load_doc(tmp_path, "cfo/a.md", _doc(owner_role="sales"))
++    assert out["meta"]["owner_role"] == "cfo"
++    assert out["owner_corrected"] is True
++    assert out["declared_owner"] == "sales"
++
++
++def test_load_doc_shared_maps_to_coordinator(tmp_path):
++    out = vault.load_doc(tmp_path, "shared/p.md", _doc(owner_role="sales", visibility="public"))
++    assert out["meta"]["owner_role"] == "coordinator"
++    assert out["owner_corrected"] is True
++
++
++def test_load_doc_matching_owner_not_corrected(tmp_path):
++    out = vault.load_doc(tmp_path, "cfo/a.md", _doc())
++    assert out["meta"]["owner_role"] == "cfo"
++    assert out["owner_corrected"] is False
++
++
++def test_load_doc_result_passes_persist_validation(tmp_path):
++    """后续持久化校验使用的是目录归一化后的归属。"""
++    out = vault.load_doc(tmp_path, "shared/p.md", _doc(owner_role="cfo", visibility="public"))
++    vault.validate_doc_meta(out["meta"])          # 不抛
++    assert out["meta"]["owner_role"] == "coordinator"
++
++
++def test_load_doc_rejects_traversal_before_mapping(tmp_path):
++    """shared/../cfo/a.md 不得被映射成 coordinator，必须整条拒绝。"""
++    with pytest.raises(ValueError, match="vault_path_unsafe"):
++        vault.load_doc(tmp_path, "shared/../cfo/a.md", _doc())
++
++
++@pytest.mark.parametrize("rel", ["../x.md", "/abs/x.md", "attachments/x.pdf", "unknown/x.md"])
++def test_load_doc_rejects_illegal_paths(tmp_path, rel):
++    with pytest.raises(ValueError):
++        vault.load_doc(tmp_path, rel, _doc())
++
++
++def test_load_doc_rejects_session_scope_after_normalization(tmp_path):
++    with pytest.raises(ValueError, match="session_not_persistable"):
++        vault.load_doc(tmp_path, "cfo/a.md", _doc(scope="session"))
++
++
++def test_load_doc_logs_warn_on_mismatch(tmp_path):
++    from opc_workbench import config
++    vault.load_doc(tmp_path, "cfo/a.md", _doc(owner_role="sales"))
++    log = config.LOG_DIR / "audit.log"
++    assert log.exists()
++    assert "frontmatter_owner_mismatch" in log.read_text(encoding="utf-8")
++
++
++# --- 阻断修复 2：非字符串字段统一 FrontmatterError，不漏原生 TypeError -------
++
++@pytest.mark.parametrize("key,bad", [
++    ("file_hash", None), ("file_hash", 123), ("file_hash", ["a"]), ("file_hash", b"x"),
++    ("owner_role", None), ("owner_role", 7),
++    ("visibility", None), ("visibility", ["private"]),
++    ("scope", 1), ("updated_at", None), ("updated_at", 20261122),
++])
++def test_non_string_field_rejected_in_validate(key, bad):
++    with pytest.raises(vault.FrontmatterError, match="invalid_type"):
++        vault.validate_doc_meta(_meta(**{key: bad}))
++
++
++@pytest.mark.parametrize("key,bad", [
++    ("file_hash", None), ("file_hash", 123), ("owner_role", None), ("updated_at", 3.14),
++])
++def test_non_string_field_rejected_in_serialize(key, bad):
++    with pytest.raises(vault.FrontmatterError, match="invalid_type"):
++        vault.serialize_frontmatter(_meta(**{key: bad}), "正文")
++
++
++def test_non_dict_meta_rejected():
++    with pytest.raises(vault.FrontmatterError, match="invalid_type"):
++        vault.validate_doc_meta(["not", "a", "dict"])
++
++
++def test_non_string_body_rejected():
++    with pytest.raises(vault.FrontmatterError, match="invalid_type"):
++        vault.serialize_frontmatter(_meta(), None)
++
++
++# --- 非阻断项修正：分隔符精确匹配 / CRLF 兼容 --------------------------------
++
++@pytest.mark.parametrize("bad", [" --- \n", "--- \n", " ---\n"])
++def test_delimiter_must_match_exactly(bad):
++    text = bad + "\n".join(f"{k}: {v}" for k, v in _meta().items()) + "\n---\n正文"
++    with pytest.raises(vault.FrontmatterError, match="malformed"):
++        vault.parse_frontmatter(text)
++
++
++def test_closing_delimiter_must_match_exactly():
++    text = _doc().replace("\n---\n正文内容", "\n --- \n正文内容")
++    with pytest.raises(vault.FrontmatterError, match="malformed"):
++        vault.parse_frontmatter(text)
++
++
++def test_crlf_input_accepted_and_body_normalized():
++    text = _doc().replace("\n", "\r\n")
++    meta, body = vault.parse_frontmatter(text)
++    assert meta == _meta()
++    assert body == "正文内容\n"          # 归一为 LF
++    assert "\r" not in body
++
++
++def test_lone_cr_input_accepted():
++    text = _doc().replace("\n", "\r")
++    meta, body = vault.parse_frontmatter(text)
++    assert meta == _meta()
++    assert "\r" not in body

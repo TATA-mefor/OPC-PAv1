@@ -1,0 +1,1044 @@
+红证：本轮新增用例在旧提交 a6f8d5c 导出树上运行（预期变红）
+FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF.                                      [100%]
+================================== FAILURES ===================================
+_____________ test_load_doc_directory_overrides_frontmatter_owner _____________
+
+tmp_path = WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-164/test_load_doc_directory_overri0')
+
+    def test_load_doc_directory_overrides_frontmatter_owner(tmp_path):
+        """cfo/a.md 里写 owner_role: sales → 最终归属必须是 cfo。"""
+>       out = vault.load_doc(tmp_path, "cfo/a.md", _doc(owner_role="sales"))
+              ^^^^^^^^^^^^^^
+E       AttributeError: module 'opc_workbench.vault' has no attribute 'load_doc'
+
+tests\test_vault.py:213: AttributeError
+__________________ test_load_doc_shared_maps_to_coordinator ___________________
+
+tmp_path = WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-164/test_load_doc_shared_maps_to_c0')
+
+    def test_load_doc_shared_maps_to_coordinator(tmp_path):
+>       out = vault.load_doc(tmp_path, "shared/p.md", _doc(owner_role="sales", visibility="public"))
+              ^^^^^^^^^^^^^^
+E       AttributeError: module 'opc_workbench.vault' has no attribute 'load_doc'
+
+tests\test_vault.py:220: AttributeError
+_________________ test_load_doc_matching_owner_not_corrected __________________
+
+tmp_path = WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-164/test_load_doc_matching_owner_n0')
+
+    def test_load_doc_matching_owner_not_corrected(tmp_path):
+>       out = vault.load_doc(tmp_path, "cfo/a.md", _doc())
+              ^^^^^^^^^^^^^^
+E       AttributeError: module 'opc_workbench.vault' has no attribute 'load_doc'
+
+tests\test_vault.py:226: AttributeError
+_______________ test_load_doc_result_passes_persist_validation ________________
+
+tmp_path = WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-164/test_load_doc_result_passes_pe0')
+
+    def test_load_doc_result_passes_persist_validation(tmp_path):
+        """后续持久化校验使用的是目录归一化后的归属。"""
+>       out = vault.load_doc(tmp_path, "shared/p.md", _doc(owner_role="cfo", visibility="public"))
+              ^^^^^^^^^^^^^^
+E       AttributeError: module 'opc_workbench.vault' has no attribute 'load_doc'
+
+tests\test_vault.py:233: AttributeError
+_______________ test_load_doc_rejects_traversal_before_mapping ________________
+
+tmp_path = WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-164/test_load_doc_rejects_traversa0')
+
+    def test_load_doc_rejects_traversal_before_mapping(tmp_path):
+        """shared/../cfo/a.md 不得被映射成 coordinator，必须整条拒绝。"""
+        with pytest.raises(ValueError, match="vault_path_unsafe"):
+>           vault.load_doc(tmp_path, "shared/../cfo/a.md", _doc())
+            ^^^^^^^^^^^^^^
+E           AttributeError: module 'opc_workbench.vault' has no attribute 'load_doc'
+
+tests\test_vault.py:241: AttributeError
+________________ test_load_doc_rejects_illegal_paths[../x.md] _________________
+
+tmp_path = WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-164/test_load_doc_rejects_illegal_0')
+rel = '../x.md'
+
+    @pytest.mark.parametrize("rel", ["../x.md", "/abs/x.md", "attachments/x.pdf", "unknown/x.md"])
+    def test_load_doc_rejects_illegal_paths(tmp_path, rel):
+        with pytest.raises(ValueError):
+>           vault.load_doc(tmp_path, rel, _doc())
+            ^^^^^^^^^^^^^^
+E           AttributeError: module 'opc_workbench.vault' has no attribute 'load_doc'
+
+tests\test_vault.py:247: AttributeError
+_______________ test_load_doc_rejects_illegal_paths[/abs/x.md] ________________
+
+tmp_path = WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-164/test_load_doc_rejects_illegal_1')
+rel = '/abs/x.md'
+
+    @pytest.mark.parametrize("rel", ["../x.md", "/abs/x.md", "attachments/x.pdf", "unknown/x.md"])
+    def test_load_doc_rejects_illegal_paths(tmp_path, rel):
+        with pytest.raises(ValueError):
+>           vault.load_doc(tmp_path, rel, _doc())
+            ^^^^^^^^^^^^^^
+E           AttributeError: module 'opc_workbench.vault' has no attribute 'load_doc'
+
+tests\test_vault.py:247: AttributeError
+___________ test_load_doc_rejects_illegal_paths[attachments/x.pdf] ____________
+
+tmp_path = WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-164/test_load_doc_rejects_illegal_2')
+rel = 'attachments/x.pdf'
+
+    @pytest.mark.parametrize("rel", ["../x.md", "/abs/x.md", "attachments/x.pdf", "unknown/x.md"])
+    def test_load_doc_rejects_illegal_paths(tmp_path, rel):
+        with pytest.raises(ValueError):
+>           vault.load_doc(tmp_path, rel, _doc())
+            ^^^^^^^^^^^^^^
+E           AttributeError: module 'opc_workbench.vault' has no attribute 'load_doc'
+
+tests\test_vault.py:247: AttributeError
+______________ test_load_doc_rejects_illegal_paths[unknown/x.md] ______________
+
+tmp_path = WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-164/test_load_doc_rejects_illegal_3')
+rel = 'unknown/x.md'
+
+    @pytest.mark.parametrize("rel", ["../x.md", "/abs/x.md", "attachments/x.pdf", "unknown/x.md"])
+    def test_load_doc_rejects_illegal_paths(tmp_path, rel):
+        with pytest.raises(ValueError):
+>           vault.load_doc(tmp_path, rel, _doc())
+            ^^^^^^^^^^^^^^
+E           AttributeError: module 'opc_workbench.vault' has no attribute 'load_doc'
+
+tests\test_vault.py:247: AttributeError
+___________ test_load_doc_rejects_session_scope_after_normalization ___________
+
+tmp_path = WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-164/test_load_doc_rejects_session_0')
+
+    def test_load_doc_rejects_session_scope_after_normalization(tmp_path):
+        with pytest.raises(ValueError, match="session_not_persistable"):
+>           vault.load_doc(tmp_path, "cfo/a.md", _doc(scope="session"))
+            ^^^^^^^^^^^^^^
+E           AttributeError: module 'opc_workbench.vault' has no attribute 'load_doc'
+
+tests\test_vault.py:252: AttributeError
+_____________________ test_load_doc_logs_warn_on_mismatch _____________________
+
+tmp_path = WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-164/test_load_doc_logs_warn_on_mis0')
+
+    def test_load_doc_logs_warn_on_mismatch(tmp_path):
+        from opc_workbench import config
+>       vault.load_doc(tmp_path, "cfo/a.md", _doc(owner_role="sales"))
+        ^^^^^^^^^^^^^^
+E       AttributeError: module 'opc_workbench.vault' has no attribute 'load_doc'
+
+tests\test_vault.py:257: AttributeError
+_________ test_non_string_field_rejected_in_validate[file_hash-None] __________
+
+key = 'file_hash', bad = None
+
+    @pytest.mark.parametrize("key,bad", [
+        ("file_hash", None), ("file_hash", 123), ("file_hash", ["a"]), ("file_hash", b"x"),
+        ("owner_role", None), ("owner_role", 7),
+        ("visibility", None), ("visibility", ["private"]),
+        ("scope", 1), ("updated_at", None), ("updated_at", 20261122),
+    ])
+    def test_non_string_field_rejected_in_validate(key, bad):
+        with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+>           vault.validate_doc_meta(_meta(**{key: bad}))
+
+tests\test_vault.py:273: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+opc_workbench\vault.py:70: in validate_doc_meta
+    _validate_meta(meta)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+meta = {'file_hash': None, 'owner_role': 'cfo', 'scope': 'global', 'updated_at': '2026-11-22T10:00:00+08:00', ...}
+
+    def _validate_meta(meta: dict) -> None:
+        missing = [k for k in FM_KEYS if k not in meta]
+        if missing:
+            raise FrontmatterError(f"frontmatter_missing_key:{missing[0]}")
+        extra = [k for k in meta if k not in FM_KEYS]
+        if extra:
+            raise FrontmatterError(f"frontmatter_unknown_key:{extra[0]}")
+        if meta["owner_role"] not in config.ROLES:
+            raise FrontmatterError(f"frontmatter_invalid_value:owner_role")
+        if meta["visibility"] not in ("public", "private"):
+            raise FrontmatterError("frontmatter_invalid_value:visibility")
+        if meta["scope"] not in ("global", "session"):
+            raise FrontmatterError("frontmatter_invalid_value:scope")
+>       if not _HASH_RE.match(meta["file_hash"]):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: expected string or bytes-like object, got 'NoneType'
+
+opc_workbench\vault.py:58: TypeError
+__________ test_non_string_field_rejected_in_validate[file_hash-123] __________
+
+key = 'file_hash', bad = 123
+
+    @pytest.mark.parametrize("key,bad", [
+        ("file_hash", None), ("file_hash", 123), ("file_hash", ["a"]), ("file_hash", b"x"),
+        ("owner_role", None), ("owner_role", 7),
+        ("visibility", None), ("visibility", ["private"]),
+        ("scope", 1), ("updated_at", None), ("updated_at", 20261122),
+    ])
+    def test_non_string_field_rejected_in_validate(key, bad):
+        with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+>           vault.validate_doc_meta(_meta(**{key: bad}))
+
+tests\test_vault.py:273: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+opc_workbench\vault.py:70: in validate_doc_meta
+    _validate_meta(meta)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+meta = {'file_hash': 123, 'owner_role': 'cfo', 'scope': 'global', 'updated_at': '2026-11-22T10:00:00+08:00', ...}
+
+    def _validate_meta(meta: dict) -> None:
+        missing = [k for k in FM_KEYS if k not in meta]
+        if missing:
+            raise FrontmatterError(f"frontmatter_missing_key:{missing[0]}")
+        extra = [k for k in meta if k not in FM_KEYS]
+        if extra:
+            raise FrontmatterError(f"frontmatter_unknown_key:{extra[0]}")
+        if meta["owner_role"] not in config.ROLES:
+            raise FrontmatterError(f"frontmatter_invalid_value:owner_role")
+        if meta["visibility"] not in ("public", "private"):
+            raise FrontmatterError("frontmatter_invalid_value:visibility")
+        if meta["scope"] not in ("global", "session"):
+            raise FrontmatterError("frontmatter_invalid_value:scope")
+>       if not _HASH_RE.match(meta["file_hash"]):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: expected string or bytes-like object, got 'int'
+
+opc_workbench\vault.py:58: TypeError
+_________ test_non_string_field_rejected_in_validate[file_hash-bad2] __________
+
+key = 'file_hash', bad = ['a']
+
+    @pytest.mark.parametrize("key,bad", [
+        ("file_hash", None), ("file_hash", 123), ("file_hash", ["a"]), ("file_hash", b"x"),
+        ("owner_role", None), ("owner_role", 7),
+        ("visibility", None), ("visibility", ["private"]),
+        ("scope", 1), ("updated_at", None), ("updated_at", 20261122),
+    ])
+    def test_non_string_field_rejected_in_validate(key, bad):
+        with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+>           vault.validate_doc_meta(_meta(**{key: bad}))
+
+tests\test_vault.py:273: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+opc_workbench\vault.py:70: in validate_doc_meta
+    _validate_meta(meta)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+meta = {'file_hash': ['a'], 'owner_role': 'cfo', 'scope': 'global', 'updated_at': '2026-11-22T10:00:00+08:00', ...}
+
+    def _validate_meta(meta: dict) -> None:
+        missing = [k for k in FM_KEYS if k not in meta]
+        if missing:
+            raise FrontmatterError(f"frontmatter_missing_key:{missing[0]}")
+        extra = [k for k in meta if k not in FM_KEYS]
+        if extra:
+            raise FrontmatterError(f"frontmatter_unknown_key:{extra[0]}")
+        if meta["owner_role"] not in config.ROLES:
+            raise FrontmatterError(f"frontmatter_invalid_value:owner_role")
+        if meta["visibility"] not in ("public", "private"):
+            raise FrontmatterError("frontmatter_invalid_value:visibility")
+        if meta["scope"] not in ("global", "session"):
+            raise FrontmatterError("frontmatter_invalid_value:scope")
+>       if not _HASH_RE.match(meta["file_hash"]):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: expected string or bytes-like object, got 'list'
+
+opc_workbench\vault.py:58: TypeError
+___________ test_non_string_field_rejected_in_validate[file_hash-x] ___________
+
+key = 'file_hash', bad = b'x'
+
+    @pytest.mark.parametrize("key,bad", [
+        ("file_hash", None), ("file_hash", 123), ("file_hash", ["a"]), ("file_hash", b"x"),
+        ("owner_role", None), ("owner_role", 7),
+        ("visibility", None), ("visibility", ["private"]),
+        ("scope", 1), ("updated_at", None), ("updated_at", 20261122),
+    ])
+    def test_non_string_field_rejected_in_validate(key, bad):
+        with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+>           vault.validate_doc_meta(_meta(**{key: bad}))
+
+tests\test_vault.py:273: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+opc_workbench\vault.py:70: in validate_doc_meta
+    _validate_meta(meta)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+meta = {'file_hash': b'x', 'owner_role': 'cfo', 'scope': 'global', 'updated_at': '2026-11-22T10:00:00+08:00', ...}
+
+    def _validate_meta(meta: dict) -> None:
+        missing = [k for k in FM_KEYS if k not in meta]
+        if missing:
+            raise FrontmatterError(f"frontmatter_missing_key:{missing[0]}")
+        extra = [k for k in meta if k not in FM_KEYS]
+        if extra:
+            raise FrontmatterError(f"frontmatter_unknown_key:{extra[0]}")
+        if meta["owner_role"] not in config.ROLES:
+            raise FrontmatterError(f"frontmatter_invalid_value:owner_role")
+        if meta["visibility"] not in ("public", "private"):
+            raise FrontmatterError("frontmatter_invalid_value:visibility")
+        if meta["scope"] not in ("global", "session"):
+            raise FrontmatterError("frontmatter_invalid_value:scope")
+>       if not _HASH_RE.match(meta["file_hash"]):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: cannot use a string pattern on a bytes-like object
+
+opc_workbench\vault.py:58: TypeError
+_________ test_non_string_field_rejected_in_validate[owner_role-None] _________
+
+key = 'owner_role', bad = None
+
+    @pytest.mark.parametrize("key,bad", [
+        ("file_hash", None), ("file_hash", 123), ("file_hash", ["a"]), ("file_hash", b"x"),
+        ("owner_role", None), ("owner_role", 7),
+        ("visibility", None), ("visibility", ["private"]),
+        ("scope", 1), ("updated_at", None), ("updated_at", 20261122),
+    ])
+    def test_non_string_field_rejected_in_validate(key, bad):
+        with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+>           vault.validate_doc_meta(_meta(**{key: bad}))
+
+tests\test_vault.py:273: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+opc_workbench\vault.py:70: in validate_doc_meta
+    _validate_meta(meta)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+meta = {'file_hash': 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'owner_role': None, 'scope': 'global', 'updated_at': '2026-11-22T10:00:00+08:00', ...}
+
+    def _validate_meta(meta: dict) -> None:
+        missing = [k for k in FM_KEYS if k not in meta]
+        if missing:
+            raise FrontmatterError(f"frontmatter_missing_key:{missing[0]}")
+        extra = [k for k in meta if k not in FM_KEYS]
+        if extra:
+            raise FrontmatterError(f"frontmatter_unknown_key:{extra[0]}")
+        if meta["owner_role"] not in config.ROLES:
+>           raise FrontmatterError(f"frontmatter_invalid_value:owner_role")
+E           opc_workbench.vault.FrontmatterError: frontmatter_invalid_value:owner_role
+
+opc_workbench\vault.py:53: FrontmatterError
+
+During handling of the above exception, another exception occurred:
+
+key = 'owner_role', bad = None
+
+    @pytest.mark.parametrize("key,bad", [
+        ("file_hash", None), ("file_hash", 123), ("file_hash", ["a"]), ("file_hash", b"x"),
+        ("owner_role", None), ("owner_role", 7),
+        ("visibility", None), ("visibility", ["private"]),
+        ("scope", 1), ("updated_at", None), ("updated_at", 20261122),
+    ])
+    def test_non_string_field_rejected_in_validate(key, bad):
+>       with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'invalid_type'
+E         Actual message: 'frontmatter_invalid_value:owner_role'
+
+tests\test_vault.py:272: AssertionError
+__________ test_non_string_field_rejected_in_validate[owner_role-7] ___________
+
+key = 'owner_role', bad = 7
+
+    @pytest.mark.parametrize("key,bad", [
+        ("file_hash", None), ("file_hash", 123), ("file_hash", ["a"]), ("file_hash", b"x"),
+        ("owner_role", None), ("owner_role", 7),
+        ("visibility", None), ("visibility", ["private"]),
+        ("scope", 1), ("updated_at", None), ("updated_at", 20261122),
+    ])
+    def test_non_string_field_rejected_in_validate(key, bad):
+        with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+>           vault.validate_doc_meta(_meta(**{key: bad}))
+
+tests\test_vault.py:273: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+opc_workbench\vault.py:70: in validate_doc_meta
+    _validate_meta(meta)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+meta = {'file_hash': 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'owner_role': 7, 'scope': 'global', 'updated_at': '2026-11-22T10:00:00+08:00', ...}
+
+    def _validate_meta(meta: dict) -> None:
+        missing = [k for k in FM_KEYS if k not in meta]
+        if missing:
+            raise FrontmatterError(f"frontmatter_missing_key:{missing[0]}")
+        extra = [k for k in meta if k not in FM_KEYS]
+        if extra:
+            raise FrontmatterError(f"frontmatter_unknown_key:{extra[0]}")
+        if meta["owner_role"] not in config.ROLES:
+>           raise FrontmatterError(f"frontmatter_invalid_value:owner_role")
+E           opc_workbench.vault.FrontmatterError: frontmatter_invalid_value:owner_role
+
+opc_workbench\vault.py:53: FrontmatterError
+
+During handling of the above exception, another exception occurred:
+
+key = 'owner_role', bad = 7
+
+    @pytest.mark.parametrize("key,bad", [
+        ("file_hash", None), ("file_hash", 123), ("file_hash", ["a"]), ("file_hash", b"x"),
+        ("owner_role", None), ("owner_role", 7),
+        ("visibility", None), ("visibility", ["private"]),
+        ("scope", 1), ("updated_at", None), ("updated_at", 20261122),
+    ])
+    def test_non_string_field_rejected_in_validate(key, bad):
+>       with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'invalid_type'
+E         Actual message: 'frontmatter_invalid_value:owner_role'
+
+tests\test_vault.py:272: AssertionError
+_________ test_non_string_field_rejected_in_validate[visibility-None] _________
+
+key = 'visibility', bad = None
+
+    @pytest.mark.parametrize("key,bad", [
+        ("file_hash", None), ("file_hash", 123), ("file_hash", ["a"]), ("file_hash", b"x"),
+        ("owner_role", None), ("owner_role", 7),
+        ("visibility", None), ("visibility", ["private"]),
+        ("scope", 1), ("updated_at", None), ("updated_at", 20261122),
+    ])
+    def test_non_string_field_rejected_in_validate(key, bad):
+        with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+>           vault.validate_doc_meta(_meta(**{key: bad}))
+
+tests\test_vault.py:273: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+opc_workbench\vault.py:70: in validate_doc_meta
+    _validate_meta(meta)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+meta = {'file_hash': 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'owner_role': 'cfo', 'scope': 'global', 'updated_at': '2026-11-22T10:00:00+08:00', ...}
+
+    def _validate_meta(meta: dict) -> None:
+        missing = [k for k in FM_KEYS if k not in meta]
+        if missing:
+            raise FrontmatterError(f"frontmatter_missing_key:{missing[0]}")
+        extra = [k for k in meta if k not in FM_KEYS]
+        if extra:
+            raise FrontmatterError(f"frontmatter_unknown_key:{extra[0]}")
+        if meta["owner_role"] not in config.ROLES:
+            raise FrontmatterError(f"frontmatter_invalid_value:owner_role")
+        if meta["visibility"] not in ("public", "private"):
+>           raise FrontmatterError("frontmatter_invalid_value:visibility")
+E           opc_workbench.vault.FrontmatterError: frontmatter_invalid_value:visibility
+
+opc_workbench\vault.py:55: FrontmatterError
+
+During handling of the above exception, another exception occurred:
+
+key = 'visibility', bad = None
+
+    @pytest.mark.parametrize("key,bad", [
+        ("file_hash", None), ("file_hash", 123), ("file_hash", ["a"]), ("file_hash", b"x"),
+        ("owner_role", None), ("owner_role", 7),
+        ("visibility", None), ("visibility", ["private"]),
+        ("scope", 1), ("updated_at", None), ("updated_at", 20261122),
+    ])
+    def test_non_string_field_rejected_in_validate(key, bad):
+>       with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'invalid_type'
+E         Actual message: 'frontmatter_invalid_value:visibility'
+
+tests\test_vault.py:272: AssertionError
+_________ test_non_string_field_rejected_in_validate[visibility-bad7] _________
+
+key = 'visibility', bad = ['private']
+
+    @pytest.mark.parametrize("key,bad", [
+        ("file_hash", None), ("file_hash", 123), ("file_hash", ["a"]), ("file_hash", b"x"),
+        ("owner_role", None), ("owner_role", 7),
+        ("visibility", None), ("visibility", ["private"]),
+        ("scope", 1), ("updated_at", None), ("updated_at", 20261122),
+    ])
+    def test_non_string_field_rejected_in_validate(key, bad):
+        with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+>           vault.validate_doc_meta(_meta(**{key: bad}))
+
+tests\test_vault.py:273: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+opc_workbench\vault.py:70: in validate_doc_meta
+    _validate_meta(meta)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+meta = {'file_hash': 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'owner_role': 'cfo', 'scope': 'global', 'updated_at': '2026-11-22T10:00:00+08:00', ...}
+
+    def _validate_meta(meta: dict) -> None:
+        missing = [k for k in FM_KEYS if k not in meta]
+        if missing:
+            raise FrontmatterError(f"frontmatter_missing_key:{missing[0]}")
+        extra = [k for k in meta if k not in FM_KEYS]
+        if extra:
+            raise FrontmatterError(f"frontmatter_unknown_key:{extra[0]}")
+        if meta["owner_role"] not in config.ROLES:
+            raise FrontmatterError(f"frontmatter_invalid_value:owner_role")
+        if meta["visibility"] not in ("public", "private"):
+>           raise FrontmatterError("frontmatter_invalid_value:visibility")
+E           opc_workbench.vault.FrontmatterError: frontmatter_invalid_value:visibility
+
+opc_workbench\vault.py:55: FrontmatterError
+
+During handling of the above exception, another exception occurred:
+
+key = 'visibility', bad = ['private']
+
+    @pytest.mark.parametrize("key,bad", [
+        ("file_hash", None), ("file_hash", 123), ("file_hash", ["a"]), ("file_hash", b"x"),
+        ("owner_role", None), ("owner_role", 7),
+        ("visibility", None), ("visibility", ["private"]),
+        ("scope", 1), ("updated_at", None), ("updated_at", 20261122),
+    ])
+    def test_non_string_field_rejected_in_validate(key, bad):
+>       with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'invalid_type'
+E         Actual message: 'frontmatter_invalid_value:visibility'
+
+tests\test_vault.py:272: AssertionError
+_____________ test_non_string_field_rejected_in_validate[scope-1] _____________
+
+key = 'scope', bad = 1
+
+    @pytest.mark.parametrize("key,bad", [
+        ("file_hash", None), ("file_hash", 123), ("file_hash", ["a"]), ("file_hash", b"x"),
+        ("owner_role", None), ("owner_role", 7),
+        ("visibility", None), ("visibility", ["private"]),
+        ("scope", 1), ("updated_at", None), ("updated_at", 20261122),
+    ])
+    def test_non_string_field_rejected_in_validate(key, bad):
+        with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+>           vault.validate_doc_meta(_meta(**{key: bad}))
+
+tests\test_vault.py:273: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+opc_workbench\vault.py:70: in validate_doc_meta
+    _validate_meta(meta)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+meta = {'file_hash': 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'owner_role': 'cfo', 'scope': 1, 'updated_at': '2026-11-22T10:00:00+08:00', ...}
+
+    def _validate_meta(meta: dict) -> None:
+        missing = [k for k in FM_KEYS if k not in meta]
+        if missing:
+            raise FrontmatterError(f"frontmatter_missing_key:{missing[0]}")
+        extra = [k for k in meta if k not in FM_KEYS]
+        if extra:
+            raise FrontmatterError(f"frontmatter_unknown_key:{extra[0]}")
+        if meta["owner_role"] not in config.ROLES:
+            raise FrontmatterError(f"frontmatter_invalid_value:owner_role")
+        if meta["visibility"] not in ("public", "private"):
+            raise FrontmatterError("frontmatter_invalid_value:visibility")
+        if meta["scope"] not in ("global", "session"):
+>           raise FrontmatterError("frontmatter_invalid_value:scope")
+E           opc_workbench.vault.FrontmatterError: frontmatter_invalid_value:scope
+
+opc_workbench\vault.py:57: FrontmatterError
+
+During handling of the above exception, another exception occurred:
+
+key = 'scope', bad = 1
+
+    @pytest.mark.parametrize("key,bad", [
+        ("file_hash", None), ("file_hash", 123), ("file_hash", ["a"]), ("file_hash", b"x"),
+        ("owner_role", None), ("owner_role", 7),
+        ("visibility", None), ("visibility", ["private"]),
+        ("scope", 1), ("updated_at", None), ("updated_at", 20261122),
+    ])
+    def test_non_string_field_rejected_in_validate(key, bad):
+>       with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'invalid_type'
+E         Actual message: 'frontmatter_invalid_value:scope'
+
+tests\test_vault.py:272: AssertionError
+_________ test_non_string_field_rejected_in_validate[updated_at-None] _________
+
+key = 'updated_at', bad = None
+
+    @pytest.mark.parametrize("key,bad", [
+        ("file_hash", None), ("file_hash", 123), ("file_hash", ["a"]), ("file_hash", b"x"),
+        ("owner_role", None), ("owner_role", 7),
+        ("visibility", None), ("visibility", ["private"]),
+        ("scope", 1), ("updated_at", None), ("updated_at", 20261122),
+    ])
+    def test_non_string_field_rejected_in_validate(key, bad):
+        with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+>           vault.validate_doc_meta(_meta(**{key: bad}))
+
+tests\test_vault.py:273: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+opc_workbench\vault.py:70: in validate_doc_meta
+    _validate_meta(meta)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+meta = {'file_hash': 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'owner_role': 'cfo', 'scope': 'global', 'updated_at': None, ...}
+
+    def _validate_meta(meta: dict) -> None:
+        missing = [k for k in FM_KEYS if k not in meta]
+        if missing:
+            raise FrontmatterError(f"frontmatter_missing_key:{missing[0]}")
+        extra = [k for k in meta if k not in FM_KEYS]
+        if extra:
+            raise FrontmatterError(f"frontmatter_unknown_key:{extra[0]}")
+        if meta["owner_role"] not in config.ROLES:
+            raise FrontmatterError(f"frontmatter_invalid_value:owner_role")
+        if meta["visibility"] not in ("public", "private"):
+            raise FrontmatterError("frontmatter_invalid_value:visibility")
+        if meta["scope"] not in ("global", "session"):
+            raise FrontmatterError("frontmatter_invalid_value:scope")
+        if not _HASH_RE.match(meta["file_hash"]):
+            raise FrontmatterError("frontmatter_invalid_value:file_hash")
+        try:
+            stamp = datetime.fromisoformat(meta["updated_at"])
+        except (TypeError, ValueError):
+>           raise FrontmatterError("frontmatter_invalid_value:updated_at") from None
+E           opc_workbench.vault.FrontmatterError: frontmatter_invalid_value:updated_at
+
+opc_workbench\vault.py:63: FrontmatterError
+
+During handling of the above exception, another exception occurred:
+
+key = 'updated_at', bad = None
+
+    @pytest.mark.parametrize("key,bad", [
+        ("file_hash", None), ("file_hash", 123), ("file_hash", ["a"]), ("file_hash", b"x"),
+        ("owner_role", None), ("owner_role", 7),
+        ("visibility", None), ("visibility", ["private"]),
+        ("scope", 1), ("updated_at", None), ("updated_at", 20261122),
+    ])
+    def test_non_string_field_rejected_in_validate(key, bad):
+>       with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'invalid_type'
+E         Actual message: 'frontmatter_invalid_value:updated_at'
+
+tests\test_vault.py:272: AssertionError
+_______ test_non_string_field_rejected_in_validate[updated_at-20261122] _______
+
+key = 'updated_at', bad = 20261122
+
+    @pytest.mark.parametrize("key,bad", [
+        ("file_hash", None), ("file_hash", 123), ("file_hash", ["a"]), ("file_hash", b"x"),
+        ("owner_role", None), ("owner_role", 7),
+        ("visibility", None), ("visibility", ["private"]),
+        ("scope", 1), ("updated_at", None), ("updated_at", 20261122),
+    ])
+    def test_non_string_field_rejected_in_validate(key, bad):
+        with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+>           vault.validate_doc_meta(_meta(**{key: bad}))
+
+tests\test_vault.py:273: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+opc_workbench\vault.py:70: in validate_doc_meta
+    _validate_meta(meta)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+meta = {'file_hash': 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'owner_role': 'cfo', 'scope': 'global', 'updated_at': 20261122, ...}
+
+    def _validate_meta(meta: dict) -> None:
+        missing = [k for k in FM_KEYS if k not in meta]
+        if missing:
+            raise FrontmatterError(f"frontmatter_missing_key:{missing[0]}")
+        extra = [k for k in meta if k not in FM_KEYS]
+        if extra:
+            raise FrontmatterError(f"frontmatter_unknown_key:{extra[0]}")
+        if meta["owner_role"] not in config.ROLES:
+            raise FrontmatterError(f"frontmatter_invalid_value:owner_role")
+        if meta["visibility"] not in ("public", "private"):
+            raise FrontmatterError("frontmatter_invalid_value:visibility")
+        if meta["scope"] not in ("global", "session"):
+            raise FrontmatterError("frontmatter_invalid_value:scope")
+        if not _HASH_RE.match(meta["file_hash"]):
+            raise FrontmatterError("frontmatter_invalid_value:file_hash")
+        try:
+            stamp = datetime.fromisoformat(meta["updated_at"])
+        except (TypeError, ValueError):
+>           raise FrontmatterError("frontmatter_invalid_value:updated_at") from None
+E           opc_workbench.vault.FrontmatterError: frontmatter_invalid_value:updated_at
+
+opc_workbench\vault.py:63: FrontmatterError
+
+During handling of the above exception, another exception occurred:
+
+key = 'updated_at', bad = 20261122
+
+    @pytest.mark.parametrize("key,bad", [
+        ("file_hash", None), ("file_hash", 123), ("file_hash", ["a"]), ("file_hash", b"x"),
+        ("owner_role", None), ("owner_role", 7),
+        ("visibility", None), ("visibility", ["private"]),
+        ("scope", 1), ("updated_at", None), ("updated_at", 20261122),
+    ])
+    def test_non_string_field_rejected_in_validate(key, bad):
+>       with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'invalid_type'
+E         Actual message: 'frontmatter_invalid_value:updated_at'
+
+tests\test_vault.py:272: AssertionError
+_________ test_non_string_field_rejected_in_serialize[file_hash-None] _________
+
+key = 'file_hash', bad = None
+
+    @pytest.mark.parametrize("key,bad", [
+        ("file_hash", None), ("file_hash", 123), ("owner_role", None), ("updated_at", 3.14),
+    ])
+    def test_non_string_field_rejected_in_serialize(key, bad):
+        with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+>           vault.serialize_frontmatter(_meta(**{key: bad}), "正文")
+
+tests\test_vault.py:281: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+opc_workbench\vault.py:118: in serialize_frontmatter
+    _validate_meta(meta)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+meta = {'file_hash': None, 'owner_role': 'cfo', 'scope': 'global', 'updated_at': '2026-11-22T10:00:00+08:00', ...}
+
+    def _validate_meta(meta: dict) -> None:
+        missing = [k for k in FM_KEYS if k not in meta]
+        if missing:
+            raise FrontmatterError(f"frontmatter_missing_key:{missing[0]}")
+        extra = [k for k in meta if k not in FM_KEYS]
+        if extra:
+            raise FrontmatterError(f"frontmatter_unknown_key:{extra[0]}")
+        if meta["owner_role"] not in config.ROLES:
+            raise FrontmatterError(f"frontmatter_invalid_value:owner_role")
+        if meta["visibility"] not in ("public", "private"):
+            raise FrontmatterError("frontmatter_invalid_value:visibility")
+        if meta["scope"] not in ("global", "session"):
+            raise FrontmatterError("frontmatter_invalid_value:scope")
+>       if not _HASH_RE.match(meta["file_hash"]):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: expected string or bytes-like object, got 'NoneType'
+
+opc_workbench\vault.py:58: TypeError
+_________ test_non_string_field_rejected_in_serialize[file_hash-123] __________
+
+key = 'file_hash', bad = 123
+
+    @pytest.mark.parametrize("key,bad", [
+        ("file_hash", None), ("file_hash", 123), ("owner_role", None), ("updated_at", 3.14),
+    ])
+    def test_non_string_field_rejected_in_serialize(key, bad):
+        with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+>           vault.serialize_frontmatter(_meta(**{key: bad}), "正文")
+
+tests\test_vault.py:281: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+opc_workbench\vault.py:118: in serialize_frontmatter
+    _validate_meta(meta)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+meta = {'file_hash': 123, 'owner_role': 'cfo', 'scope': 'global', 'updated_at': '2026-11-22T10:00:00+08:00', ...}
+
+    def _validate_meta(meta: dict) -> None:
+        missing = [k for k in FM_KEYS if k not in meta]
+        if missing:
+            raise FrontmatterError(f"frontmatter_missing_key:{missing[0]}")
+        extra = [k for k in meta if k not in FM_KEYS]
+        if extra:
+            raise FrontmatterError(f"frontmatter_unknown_key:{extra[0]}")
+        if meta["owner_role"] not in config.ROLES:
+            raise FrontmatterError(f"frontmatter_invalid_value:owner_role")
+        if meta["visibility"] not in ("public", "private"):
+            raise FrontmatterError("frontmatter_invalid_value:visibility")
+        if meta["scope"] not in ("global", "session"):
+            raise FrontmatterError("frontmatter_invalid_value:scope")
+>       if not _HASH_RE.match(meta["file_hash"]):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: expected string or bytes-like object, got 'int'
+
+opc_workbench\vault.py:58: TypeError
+________ test_non_string_field_rejected_in_serialize[owner_role-None] _________
+
+key = 'owner_role', bad = None
+
+    @pytest.mark.parametrize("key,bad", [
+        ("file_hash", None), ("file_hash", 123), ("owner_role", None), ("updated_at", 3.14),
+    ])
+    def test_non_string_field_rejected_in_serialize(key, bad):
+        with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+>           vault.serialize_frontmatter(_meta(**{key: bad}), "正文")
+
+tests\test_vault.py:281: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+opc_workbench\vault.py:118: in serialize_frontmatter
+    _validate_meta(meta)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+meta = {'file_hash': 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'owner_role': None, 'scope': 'global', 'updated_at': '2026-11-22T10:00:00+08:00', ...}
+
+    def _validate_meta(meta: dict) -> None:
+        missing = [k for k in FM_KEYS if k not in meta]
+        if missing:
+            raise FrontmatterError(f"frontmatter_missing_key:{missing[0]}")
+        extra = [k for k in meta if k not in FM_KEYS]
+        if extra:
+            raise FrontmatterError(f"frontmatter_unknown_key:{extra[0]}")
+        if meta["owner_role"] not in config.ROLES:
+>           raise FrontmatterError(f"frontmatter_invalid_value:owner_role")
+E           opc_workbench.vault.FrontmatterError: frontmatter_invalid_value:owner_role
+
+opc_workbench\vault.py:53: FrontmatterError
+
+During handling of the above exception, another exception occurred:
+
+key = 'owner_role', bad = None
+
+    @pytest.mark.parametrize("key,bad", [
+        ("file_hash", None), ("file_hash", 123), ("owner_role", None), ("updated_at", 3.14),
+    ])
+    def test_non_string_field_rejected_in_serialize(key, bad):
+>       with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'invalid_type'
+E         Actual message: 'frontmatter_invalid_value:owner_role'
+
+tests\test_vault.py:280: AssertionError
+________ test_non_string_field_rejected_in_serialize[updated_at-3.14] _________
+
+key = 'updated_at', bad = 3.14
+
+    @pytest.mark.parametrize("key,bad", [
+        ("file_hash", None), ("file_hash", 123), ("owner_role", None), ("updated_at", 3.14),
+    ])
+    def test_non_string_field_rejected_in_serialize(key, bad):
+        with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+>           vault.serialize_frontmatter(_meta(**{key: bad}), "正文")
+
+tests\test_vault.py:281: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+opc_workbench\vault.py:118: in serialize_frontmatter
+    _validate_meta(meta)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+meta = {'file_hash': 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'owner_role': 'cfo', 'scope': 'global', 'updated_at': 3.14, ...}
+
+    def _validate_meta(meta: dict) -> None:
+        missing = [k for k in FM_KEYS if k not in meta]
+        if missing:
+            raise FrontmatterError(f"frontmatter_missing_key:{missing[0]}")
+        extra = [k for k in meta if k not in FM_KEYS]
+        if extra:
+            raise FrontmatterError(f"frontmatter_unknown_key:{extra[0]}")
+        if meta["owner_role"] not in config.ROLES:
+            raise FrontmatterError(f"frontmatter_invalid_value:owner_role")
+        if meta["visibility"] not in ("public", "private"):
+            raise FrontmatterError("frontmatter_invalid_value:visibility")
+        if meta["scope"] not in ("global", "session"):
+            raise FrontmatterError("frontmatter_invalid_value:scope")
+        if not _HASH_RE.match(meta["file_hash"]):
+            raise FrontmatterError("frontmatter_invalid_value:file_hash")
+        try:
+            stamp = datetime.fromisoformat(meta["updated_at"])
+        except (TypeError, ValueError):
+>           raise FrontmatterError("frontmatter_invalid_value:updated_at") from None
+E           opc_workbench.vault.FrontmatterError: frontmatter_invalid_value:updated_at
+
+opc_workbench\vault.py:63: FrontmatterError
+
+During handling of the above exception, another exception occurred:
+
+key = 'updated_at', bad = 3.14
+
+    @pytest.mark.parametrize("key,bad", [
+        ("file_hash", None), ("file_hash", 123), ("owner_role", None), ("updated_at", 3.14),
+    ])
+    def test_non_string_field_rejected_in_serialize(key, bad):
+>       with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'invalid_type'
+E         Actual message: 'frontmatter_invalid_value:updated_at'
+
+tests\test_vault.py:280: AssertionError
+_________________________ test_non_dict_meta_rejected _________________________
+
+    def test_non_dict_meta_rejected():
+        with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+>           vault.validate_doc_meta(["not", "a", "dict"])
+
+tests\test_vault.py:286: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+opc_workbench\vault.py:70: in validate_doc_meta
+    _validate_meta(meta)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+meta = ['not', 'a', 'dict']
+
+    def _validate_meta(meta: dict) -> None:
+        missing = [k for k in FM_KEYS if k not in meta]
+        if missing:
+>           raise FrontmatterError(f"frontmatter_missing_key:{missing[0]}")
+E           opc_workbench.vault.FrontmatterError: frontmatter_missing_key:owner_role
+
+opc_workbench\vault.py:48: FrontmatterError
+
+During handling of the above exception, another exception occurred:
+
+    def test_non_dict_meta_rejected():
+>       with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'invalid_type'
+E         Actual message: 'frontmatter_missing_key:owner_role'
+
+tests\test_vault.py:285: AssertionError
+________________________ test_non_string_body_rejected ________________________
+
+    def test_non_string_body_rejected():
+>       with pytest.raises(vault.FrontmatterError, match="invalid_type"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'opc_workbench.vault.FrontmatterError'>
+
+tests\test_vault.py:290: Failed
+_________________ test_delimiter_must_match_exactly[ --- \n] __________________
+
+bad = ' --- \n'
+
+    @pytest.mark.parametrize("bad", [" --- \n", "--- \n", " ---\n"])
+    def test_delimiter_must_match_exactly(bad):
+        text = bad + "\n".join(f"{k}: {v}" for k, v in _meta().items()) + "\n---\n正文"
+>       with pytest.raises(vault.FrontmatterError, match="malformed"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'opc_workbench.vault.FrontmatterError'>
+
+tests\test_vault.py:299: Failed
+__________________ test_delimiter_must_match_exactly[--- \n] __________________
+
+bad = '--- \n'
+
+    @pytest.mark.parametrize("bad", [" --- \n", "--- \n", " ---\n"])
+    def test_delimiter_must_match_exactly(bad):
+        text = bad + "\n".join(f"{k}: {v}" for k, v in _meta().items()) + "\n---\n正文"
+>       with pytest.raises(vault.FrontmatterError, match="malformed"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'opc_workbench.vault.FrontmatterError'>
+
+tests\test_vault.py:299: Failed
+__________________ test_delimiter_must_match_exactly[ ---\n] __________________
+
+bad = ' ---\n'
+
+    @pytest.mark.parametrize("bad", [" --- \n", "--- \n", " ---\n"])
+    def test_delimiter_must_match_exactly(bad):
+        text = bad + "\n".join(f"{k}: {v}" for k, v in _meta().items()) + "\n---\n正文"
+>       with pytest.raises(vault.FrontmatterError, match="malformed"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'opc_workbench.vault.FrontmatterError'>
+
+tests\test_vault.py:299: Failed
+__________________ test_closing_delimiter_must_match_exactly __________________
+
+    def test_closing_delimiter_must_match_exactly():
+        text = _doc().replace("\n---\n正文内容", "\n --- \n正文内容")
+>       with pytest.raises(vault.FrontmatterError, match="malformed"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'opc_workbench.vault.FrontmatterError'>
+
+tests\test_vault.py:305: Failed
+________________ test_crlf_input_accepted_and_body_normalized _________________
+
+    def test_crlf_input_accepted_and_body_normalized():
+        text = _doc().replace("\n", "\r\n")
+>       meta, body = vault.parse_frontmatter(text)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests\test_vault.py:311: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+text = '---\r\nowner_role: cfo\r\nvisibility: private\r\nscope: global\r\nfile_hash: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\nupdated_at: 2026-11-22T10:00:00+08:00\r\n---\r\n正文内容\r\n'
+
+    def parse_frontmatter(text: str) -> tuple[dict, str]:
+        """严格解析 md 头部 YAML 子集 → (meta, body)。任何非法形态抛 FrontmatterError。"""
+        if not isinstance(text, str):
+            raise FrontmatterError("frontmatter_malformed")
+        lines = text.split("\n")
+        if not lines or lines[0].strip() != _DELIM:
+            raise FrontmatterError("frontmatter_malformed")
+        meta: dict[str, str] = {}
+        end = None
+        for i in range(1, len(lines)):
+            raw = lines[i]
+            if raw.strip() == _DELIM:
+                end = i
+                break
+            if raw.strip() == "":
+                raise FrontmatterError("frontmatter_malformed")
+            if raw != raw.strip() or "\t" in raw:
+>               raise FrontmatterError("frontmatter_malformed")
+E               opc_workbench.vault.FrontmatterError: frontmatter_malformed
+
+opc_workbench\vault.py:91: FrontmatterError
+_________________________ test_lone_cr_input_accepted _________________________
+
+    def test_lone_cr_input_accepted():
+        text = _doc().replace("\n", "\r")
+>       meta, body = vault.parse_frontmatter(text)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests\test_vault.py:319: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+text = '---\rowner_role: cfo\rvisibility: private\rscope: global\rfile_hash: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\rupdated_at: 2026-11-22T10:00:00+08:00\r---\r正文内容\r'
+
+    def parse_frontmatter(text: str) -> tuple[dict, str]:
+        """严格解析 md 头部 YAML 子集 → (meta, body)。任何非法形态抛 FrontmatterError。"""
+        if not isinstance(text, str):
+            raise FrontmatterError("frontmatter_malformed")
+        lines = text.split("\n")
+        if not lines or lines[0].strip() != _DELIM:
+>           raise FrontmatterError("frontmatter_malformed")
+E           opc_workbench.vault.FrontmatterError: frontmatter_malformed
+
+opc_workbench\vault.py:80: FrontmatterError
+=========================== short test summary info ===========================
+FAILED tests/test_vault.py::test_load_doc_directory_overrides_frontmatter_owner
+FAILED tests/test_vault.py::test_load_doc_shared_maps_to_coordinator - Attrib...
+FAILED tests/test_vault.py::test_load_doc_matching_owner_not_corrected - Attr...
+FAILED tests/test_vault.py::test_load_doc_result_passes_persist_validation - ...
+FAILED tests/test_vault.py::test_load_doc_rejects_traversal_before_mapping - ...
+FAILED tests/test_vault.py::test_load_doc_rejects_illegal_paths[../x.md] - At...
+FAILED tests/test_vault.py::test_load_doc_rejects_illegal_paths[/abs/x.md] - ...
+FAILED tests/test_vault.py::test_load_doc_rejects_illegal_paths[attachments/x.pdf]
+FAILED tests/test_vault.py::test_load_doc_rejects_illegal_paths[unknown/x.md]
+FAILED tests/test_vault.py::test_load_doc_rejects_session_scope_after_normalization
+FAILED tests/test_vault.py::test_load_doc_logs_warn_on_mismatch - AttributeEr...
+FAILED tests/test_vault.py::test_non_string_field_rejected_in_validate[file_hash-None]
+FAILED tests/test_vault.py::test_non_string_field_rejected_in_validate[file_hash-123]
+FAILED tests/test_vault.py::test_non_string_field_rejected_in_validate[file_hash-bad2]
+FAILED tests/test_vault.py::test_non_string_field_rejected_in_validate[file_hash-x]
+FAILED tests/test_vault.py::test_non_string_field_rejected_in_validate[owner_role-None]
+FAILED tests/test_vault.py::test_non_string_field_rejected_in_validate[owner_role-7]
+FAILED tests/test_vault.py::test_non_string_field_rejected_in_validate[visibility-None]
+FAILED tests/test_vault.py::test_non_string_field_rejected_in_validate[visibility-bad7]
+FAILED tests/test_vault.py::test_non_string_field_rejected_in_validate[scope-1]
+FAILED tests/test_vault.py::test_non_string_field_rejected_in_validate[updated_at-None]
+FAILED tests/test_vault.py::test_non_string_field_rejected_in_validate[updated_at-20261122]
+FAILED tests/test_vault.py::test_non_string_field_rejected_in_serialize[file_hash-None]
+FAILED tests/test_vault.py::test_non_string_field_rejected_in_serialize[file_hash-123]
+FAILED tests/test_vault.py::test_non_string_field_rejected_in_serialize[owner_role-None]
+FAILED tests/test_vault.py::test_non_string_field_rejected_in_serialize[updated_at-3.14]
+FAILED tests/test_vault.py::test_non_dict_meta_rejected - AssertionError: Reg...
+FAILED tests/test_vault.py::test_non_string_body_rejected - Failed: DID NOT R...
+FAILED tests/test_vault.py::test_delimiter_must_match_exactly[ --- \n] - Fail...
+FAILED tests/test_vault.py::test_delimiter_must_match_exactly[--- \n] - Faile...
+FAILED tests/test_vault.py::test_delimiter_must_match_exactly[ ---\n] - Faile...
+FAILED tests/test_vault.py::test_closing_delimiter_must_match_exactly - Faile...
+FAILED tests/test_vault.py::test_crlf_input_accepted_and_body_normalized - op...
+FAILED tests/test_vault.py::test_lone_cr_input_accepted - opc_workbench.vault...
+34 failed, 1 passed, 66 deselected in 1.63s
