@@ -147,6 +147,10 @@ def isolated_env(request, tmp_path, monkeypatch):
 
     db.close_thread_conns()
     llm_client.set_llm(None)
+    # 测试卫生：用例中途失败时防止 owner 会话名额跨用例泄漏
+    # （正常路径由持有名额的 Application.close() 释放）。
+    from opc_workbench import _owner_session
+    _owner_session.release()
 
 
 @pytest.fixture()
@@ -350,22 +354,28 @@ def gated_embedder_cls():
     return GatedEmbedder
 
 
-class OwnerAdapter:
-    """主窗口适配器替身：只接收框架注入的提交端口，不接触任何身份对象。"""
+def _run_module_entry():
+    """以标准库 runpy 真实执行可信入口（等价 `python -m opc_workbench.app`）。
 
-    def __init__(self):
-        self.submit = None
+    runpy 就是 `-m` 的实现：以真实模块 spec + 临时 `__main__` 命名空间
+    **重新执行入口模块源码**，不能注入适配器、不能跳过入口代码；与
+    exec 伪造调用帧（只改 `__name__`，不执行入口模块）有本质区别。
+    返回 (application, adapter)，adapter 由入口流程内部创建。
+    """
+    import runpy
+    import warnings
+    with warnings.catch_warnings():
+        # 模块已被正常导入过时的预期提示（双实例正是入口语义）
+        warnings.simplefilter("ignore", RuntimeWarning)
+        ns = runpy.run_module("opc_workbench.app", run_name="__main__",
+                              alter_sys=True)
+    return ns["_entry_application"], ns["_entry_adapter"]
 
-    def bind(self, submit):
-        self.submit = submit
 
-
-def _call_as_entry_point(adapter):
-    """以 `__main__` 身份调用 app.main(adapter)，模拟真实进程入口。"""
-    g = {"__name__": "__main__", "adapter": adapter}
-    exec(compile("from opc_workbench import app\n"
-                 "result = app.main(adapter)\n", "<entry>", "exec"), g)
-    return g["result"]
+@pytest.fixture()
+def module_entry():
+    """真实入口执行器：返回 (application, adapter)。"""
+    return _run_module_entry
 
 
 @pytest.fixture()
@@ -374,11 +384,9 @@ def owner_entry(isolated_env):
     opened = []
 
     def run():
-        adapter = OwnerAdapter()
-        application = _call_as_entry_point(adapter)
-        assert adapter.submit is not None, "主聊天提交端口未注入"
+        application, adapter = _run_module_entry()
         opened.append(application)
-        return application, adapter.submit
+        return application, adapter.send
 
     yield run
     for application in opened:

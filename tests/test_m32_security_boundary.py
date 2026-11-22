@@ -288,7 +288,7 @@ def test_attack_ordinary_call_does_not_preempt_startup(isolated_env, db_conn,
     """攻击：普通业务模块抢先调用公开工厂。
 
     断言一：拿不到原始生产 writer（任何公开属性）。
-    断言二：不影响真正启动——随后 app.main() 的启动器仍装配出可用应用。
+    断言二：不影响真正启动——随后模块入口仍装配出可用应用。
     断言三：修复后真实调用链（工具注册 / CAS / 披露）端到端仍正常。
     """
     # ① 普通模块抢先调用（修复前此处即可取得生产 writer）
@@ -299,9 +299,9 @@ def test_attack_ordinary_call_does_not_preempt_startup(isolated_env, db_conn,
     with pytest.raises(PermissionError, match="disclosure_service_writer_not_exposed"):
         grabbed.disclosure._writer
 
-    # ② 普通模块调用入口被拒；真实入口（__main__）仍装配出独立可用应用
+    # ② 普通模块调用入口被拒；真实模块入口仍装配出独立可用应用
     with pytest.raises(PermissionError, match="owner_entry_point_only"):
-        app.main()
+        app._run_entry()
     started, _submit = owner_entry()
     assert started is not grabbed
     assert not hasattr(started, "writer")

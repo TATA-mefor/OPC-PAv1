@@ -18,14 +18,16 @@
 - 业务调用只能经 `Application.dispatcher.dispatch(envelope, ...)` 或两个
   Channel 句柄；原始工具注册表不对外暴露。
 - boss 身份只由主聊天入口（OwnerChannelBackend → register_session →
-  issue_proof → mint_boss_context）产出；来源令牌由组合根在 `__main__` 入口
-  装配时铸造，只交给主窗口适配器持有的提交端口——没有可获取的通道对象，
-  也不接受任何调用方传入 source="main_chat"。
+  issue_proof → mint_boss_context）产出；来源令牌只在
+  `python -m opc_workbench.app` 以模块入口执行时由启动流程铸造，交给
+  **框架内部创建**的主窗口适配器（bind(submit)）——没有可获取的通道对象，
+  不接受调用方传入 source="main_chat"，也不接受外部传入适配器。
 - `confirm_action` 继续 fail closed（delete_doc 的 UI 确认留到 M5-b）。
 
-生命周期：build_application() 只构造不缓存；进程级单例与关停由
-ApplicationLauncher 实例持有；boss 来源只在 `__main__` 入口（main）铸造
-一次，并直接交给主窗口适配器。
+生命周期：build_application() 只构造不缓存、不占有 owner 会话名额；
+进程级单例与关停由 ApplicationLauncher 实例持有；owner 会话名额在
+`_owner_session` 模块（全进程一份），只由真正持有名额的 Application
+在 close() 中释放。
 """
 from __future__ import annotations
 
@@ -37,53 +39,35 @@ import sys
 import threading
 
 from . import cas, config, db, identity, llm_client, visibility
+from . import _owner_session
 from .config import agent_roles as _agent_roles_snapshot
 from .dispatch import _mint_envelope, build_dispatcher
 from .knowledge_service import KnowledgeService
+from .main_window import MainWindowAdapter
 from .vault_watcher import VaultWatcher
 
 
 # ---------------------------------------------------------------------------
-# 可信启动边界（M5-a B1）
-# 主聊天来源不是"可获取的通道对象"，而是框架在 `__main__` 入口装配时铸造的
-# 内部令牌 + 提交端口。下面两个守卫保证：普通模块既调不到带 boss 来源的
-# 装配，也不能在进程内并存第二个 owner 会话。
+# 可信启动边界（M5-a B1，用户裁决 2026-11-23）
+# 唯一可信启动命令：`python -m opc_workbench.app`。
+# 验证的不是"调用栈里出现 __main__"（帧可被 exec 伪造），而是进程真实的
+# 主模块：sys.modules["__main__"] 必须带有 `-m` 启动生成的模块 spec
+# （name == "opc_workbench.app"），且其命名空间就是**当前正在执行的这份
+# 模块代码**的命名空间。python -c、普通脚本、被导入模块、exec 伪造帧
+# 一律不满足；即便在真实 `-m` 进程里另行 import 本模块，那份副本的
+# 命名空间也不是主模块命名空间，同样拒绝。
 # ---------------------------------------------------------------------------
-_ENTRY_POINT_MODULE = "__main__"
 _APP_FILE = os.path.abspath(__file__)
-_OWNER_SESSION_LOCK = threading.Lock()
-_OWNER_SESSION_STATE = {"active": False}
 
 
 def _require_entry_point() -> None:
-    """调用链上必须出现真正的进程入口帧，否则拒绝。
-
-    两种合法形态：
-    - `python -m opc_workbench.app`：本模块自身以 `__main__` 身份执行；
-    - 入口脚本/适配层以 `__main__` 身份调用 `main()`。
-    普通被导入模块（`__name__` 为包名或测试模块名）一律拒绝。
-    """
-    frame = sys._getframe(1)
-    while frame is not None:
-        name = frame.f_globals.get("__name__")
-        if name == _ENTRY_POINT_MODULE:
-            return
-        if os.path.abspath(frame.f_code.co_filename) != _APP_FILE:
-            break
-        frame = frame.f_back
-    raise PermissionError("owner_entry_point_only")
-
-
-def _claim_owner_session() -> None:
-    with _OWNER_SESSION_LOCK:
-        if _OWNER_SESSION_STATE["active"]:
-            raise PermissionError("owner_session_already_active")
-        _OWNER_SESSION_STATE["active"] = True
-
-
-def _release_owner_session() -> None:
-    with _OWNER_SESSION_LOCK:
-        _OWNER_SESSION_STATE["active"] = False
+    entry = sys.modules.get("__main__")
+    spec = getattr(entry, "__spec__", None)
+    if (spec is None
+            or getattr(spec, "name", None) != "opc_workbench.app"
+            or getattr(entry, "__dict__", None) is not globals()
+            or os.path.abspath(getattr(entry, "__file__", "")) != _APP_FILE):
+        raise PermissionError("owner_entry_point_only")
 
 
 
@@ -182,16 +166,17 @@ class Application:
     """
 
     __slots__ = ("identity_api", "cas_service", "disclosure", "dispatcher",
-                 "_watcher", "_closed")
+                 "_watcher", "_closed", "_owns_owner_session")
 
     def __init__(self, *, identity_api, cas_service, disclosure, dispatcher,
-                 watcher):
+                 watcher, owns_owner_session=False):
         object.__setattr__(self, "identity_api", identity_api)
         object.__setattr__(self, "cas_service", cas_service)
         object.__setattr__(self, "disclosure", disclosure)
         object.__setattr__(self, "dispatcher", dispatcher)
         object.__setattr__(self, "_watcher", watcher)
         object.__setattr__(self, "_closed", False)
+        object.__setattr__(self, "_owns_owner_session", bool(owns_owner_session))
 
     def __setattr__(self, *a):
         raise PermissionError("application_immutable")
@@ -204,7 +189,7 @@ class Application:
     # -- 生命周期 -----------------------------------------------------------
 
     def start_background(self) -> None:
-        """启动后台 vault 扫描（幂等）。只在 main() 调用。"""
+        """启动后台 vault 扫描（幂等）。只在入口启动流程调用。"""
         if object.__getattribute__(self, "_closed"):
             raise PermissionError("application_closed")
         object.__getattribute__(self, "_watcher").start()
@@ -216,25 +201,37 @@ class Application:
         return object.__getattribute__(self, "_watcher").scan_once()
 
     def close(self) -> None:
-        """有界关停（幂等）：先停 watcher（join），再关内部写连接。"""
+        """有界关停（幂等）：先停 watcher（join），再关内部写连接。
+
+        owner 会话名额只由**实际持有名额**的应用释放（build_application()
+        产物不占有名额，关闭不影响活动 owner 会话）；释放放在 finally，
+        watcher/写连接关闭异常也不会把名额遗留为活动状态。
+        """
         if object.__getattribute__(self, "_closed"):
             return
         object.__setattr__(self, "_closed", True)
-        object.__getattribute__(self, "_watcher").stop()
-        self.cas_service.close()
-        _release_owner_session()
+        try:
+            try:
+                object.__getattribute__(self, "_watcher").stop()
+            finally:
+                self.cas_service.close()
+        finally:
+            if object.__getattribute__(self, "_owns_owner_session"):
+                object.__setattr__(self, "_owns_owner_session", False)
+                _owner_session.release()
 
 
 def _compose(*, with_owner_channel: bool):
-    """内部装配：返回 (Application, MainChatChannel | None)。
+    """内部装配：返回 (Application, owner_submit | None)。
 
-    带 boss 通道的装配是**入口点专属**：调用链上最近的非本模块帧必须是
-    `__main__`（真实进程入口），且同一进程只允许一个活动 owner 会话。
-    因此普通模块直接 import 调用本函数也拿不到通道。
+    带 boss 来源的装配是**模块入口专属**：进程必须以
+    `python -m opc_workbench.app` 启动且当前执行的就是入口模块本体，
+    且同一进程只允许一个活动 owner 会话。普通模块直接 import 调用、
+    exec 伪造 `__main__` 帧、`python -c` 一律被拒。
     """
     if with_owner_channel:
         _require_entry_point()
-        _claim_owner_session()
+        _owner_session.claim()
     _conn = None
     try:
         db.init_db()                                   # 迁移先行（零播种）
@@ -273,7 +270,8 @@ def _compose(*, with_owner_channel: bool):
         watcher = VaultWatcher(knowledge_service)
         application = Application(
             identity_api=identity_api, cas_service=cas_service,
-            disclosure=disclosure, dispatcher=dispatcher, watcher=watcher)
+            disclosure=disclosure, dispatcher=dispatcher, watcher=watcher,
+            owns_owner_session=with_owner_channel)
         owner_submit = None
         if with_owner_channel:
             provenance = object.__getattribute__(dispatcher, "_owner_provenance")
@@ -290,7 +288,7 @@ def _compose(*, with_owner_channel: bool):
         if _conn is not None:
             _conn.close()
         if with_owner_channel:
-            _release_owner_session()
+            _owner_session.release()
         raise
 
 
@@ -306,8 +304,9 @@ def build_application() -> Application:
 class ApplicationLauncher:
     """进程级生命周期持有者：单例装配 + 关停。
 
-    `build()` 只装配有界应用（**不含**主对话通道）；boss 通道只由
-    `main()` 在入口点铸造并交给适配器，不挂在启动器上。
+    `build()` 只装配有界应用（**不含**主对话来源，也不占有 owner 会话
+    名额）；boss 来源只由模块入口启动流程铸造并交给内部创建的适配器，
+    不挂在启动器上。
     """
 
     __slots__ = ("_application", "_lock")
@@ -340,21 +339,26 @@ class ApplicationLauncher:
             current.close()
 
 
-def main(adapter=None) -> Application:
-    """进程入口（唯一可信启动点）：只有 `__main__` 帧可调用。
+def _run_entry():
+    """模块入口启动流程（私有，无参数）：只在本文件 `__main__` 块调用。
 
-    装配一次后，把**主聊天提交端口**（普通函数，来源由框架注入）交给
-    `adapter.bind(submit)`（主窗口适配器，M6 接 Gradio）；不返回、不挂载
-    任何"老板通道对象"。返回有界 Application 供显式收尾（不含 boss 能力）。
+    适配器由本流程**内部创建**（M6 换 Gradio 实现，契约不变 bind(submit)），
+    不接受外部传入；绑定或后台启动失败时关闭应用（释放 owner 名额、
+    停 watcher、关写连接）后再抛，绝不遗留活动会话或悬挂资源。
     """
-    _require_entry_point()
     application, owner_submit = _compose(with_owner_channel=True)
-    application.start_background()
-    if adapter is not None:
+    try:
+        adapter = MainWindowAdapter()
         adapter.bind(owner_submit)
+        application.start_background()
+    except BaseException:
+        application.close()
+        raise
     atexit.register(application.close)
-    return application
+    return application, adapter
 
 
 if __name__ == "__main__":
-    main()
+    # 唯一可信启动：python -m opc_workbench.app
+    # M6 在此接入主窗口事件循环；当前批次装配 + 绑定后即收尾（atexit 关停）。
+    _entry_application, _entry_adapter = _run_entry()
