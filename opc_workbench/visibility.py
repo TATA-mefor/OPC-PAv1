@@ -60,6 +60,12 @@ _QUERYABLE: dict[str, frozenset[str]] = {
     "tasks": frozenset({"status", "owner_role", "visibility", "priority", "due_at"}),
     "schedules": frozenset({"status", "owner_role", "visibility", "remind_at"}),
     "knowledge_docs": frozenset({"owner_role", "visibility", "status"}),
+    # M4 第二批 C1（用户裁决 2026-11-22）：受控**只读视图**接入治理。
+    # owner_role/visibility 由 knowledge_docs JOIN 取得，单一真源不变；
+    # visible_filter / query_visible 执行逻辑零改动。视图不可写，
+    # chunk 写入仍只经组合根注入的 WriteCapability。
+    "knowledge_chunks_visible": frozenset(
+        {"owner_role", "visibility", "status", "doc_id", "embed_model", "embed_dim"}),
     "memory": frozenset({"owner_role", "visibility", "kind"}),
     "artifacts": frozenset({"owner_role", "visibility", "kind", "period_key"}),
 }

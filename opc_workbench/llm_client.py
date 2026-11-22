@@ -79,6 +79,9 @@ class LLMClient:
         self.base_url = base_url or config.DASHSCOPE_BASE_URL
         self.model = model or config.DASHSCOPE_MODEL
         self.breaker = CircuitBreaker()
+        # C3（用户裁决 2026-11-22）：embed 独立熔断器。批量索引失败不得把
+        # 日常对话一起熔断；chat 仍只用 self.breaker，行为零改动。
+        self.embed_breaker = CircuitBreaker()
         self._client = None
         if self.api_key:
             from openai import OpenAI  # 延迟导入：无 Key/测试环境不触碰 SDK
@@ -125,6 +128,83 @@ class LLMClient:
                         raise LLMFailure("deadline_exceeded") from exc
                 time.sleep(backoff)
         raise LLMFailure(f"llm_error:{type(last_err).__name__}") from last_err
+
+    def embed(self, texts: list[str], *, deadline: float | None = None) -> list[list[float]]:
+        """文本向量化（M4 第二批）。返回顺序与输入严格对齐。
+
+        纪律与 chat 同款：无 Key → LLMFailure；独立 embed_breaker 熔断；
+        仅对 RETRYABLE_STATUS 重试，退避 0.8*(n+1)，越过 deadline 立即停。
+        分批上限 10 条/请求（text-embedding-v4 规格），维度固定 config.EMBEDDING_DIM。
+        **不信任服务端返回顺序**：按 item.index 复位；缺项/多项/维度不符一律失败。
+        本方法不打印文本原文与 Key（日志红线）。
+        """
+        if not isinstance(texts, list) or any(not isinstance(t, str) for t in texts):
+            raise LLMFailure("embed_invalid_input")
+        if not texts:
+            return []
+        if not self.available:
+            raise LLMFailure("no_api_key")
+        out: list[list[float]] = []
+        size = config.EMBED_BATCH_SIZE
+        for start in range(0, len(texts), size):
+            batch = texts[start:start + size]
+            out.extend(self._embed_batch(batch, deadline=deadline))
+        return out
+
+    def _embed_batch(self, batch: list[str], *, deadline: float | None) -> list[list[float]]:
+        if not self.embed_breaker.allow():
+            raise LLMFailure("circuit_open")
+        last_err: Exception | None = None
+        for attempt in range(config.LLM_ATTEMPTS):
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise LLMFailure("deadline_exceeded")
+            timeout = config.LLM_TIMEOUT_S if remaining is None else min(
+                config.LLM_TIMEOUT_S, remaining)
+            try:
+                resp = self._client.embeddings.create(
+                    model=config.EMBEDDING_MODEL, input=batch,
+                    dimensions=config.EMBEDDING_DIM, timeout=timeout,
+                )
+                vectors = self._order_vectors(resp, len(batch))
+                self.embed_breaker.record(True)
+                return vectors
+            except LLMFailure:
+                self.embed_breaker.record(False)
+                raise
+            except Exception as exc:  # noqa: BLE001 — 分类后决定是否重试
+                last_err = exc
+                status = getattr(exc, "status_code", None)
+                retryable = status in config.RETRYABLE_STATUS
+                self.embed_breaker.record(False)
+                if not retryable or attempt + 1 >= config.LLM_ATTEMPTS:
+                    break
+                backoff = 0.8 * (attempt + 1)
+                if deadline is not None and deadline - time.monotonic() <= backoff:
+                    raise LLMFailure("deadline_exceeded") from exc
+                time.sleep(backoff)
+        raise LLMFailure(f"embed_error:{type(last_err).__name__}") from last_err
+
+    @staticmethod
+    def _order_vectors(resp, expected: int) -> list[list[float]]:
+        """按 index 复位并校验完整性/维度；任何缺口都不得静默补位。"""
+        items = list(resp.data)
+        if len(items) != expected:
+            raise LLMFailure("embed_count_mismatch")
+        ordered: list[list[float] | None] = [None] * expected
+        for item in items:
+            idx = item.index
+            if not isinstance(idx, int) or not 0 <= idx < expected:
+                raise LLMFailure("embed_index_invalid")
+            if ordered[idx] is not None:
+                raise LLMFailure("embed_index_duplicate")
+            vec = list(item.embedding)
+            if len(vec) != config.EMBEDDING_DIM:
+                raise LLMFailure("embed_dim_mismatch")
+            ordered[idx] = vec
+        if any(v is None for v in ordered):
+            raise LLMFailure("embed_index_missing")
+        return [v for v in ordered if v is not None]
 
 
 _default: LLMClient | None = None

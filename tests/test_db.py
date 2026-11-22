@@ -10,6 +10,7 @@ from opc_workbench import config, db
 EXPECTED_TABLES = {
     "schema_version", "tasks", "schedules", "knowledge_docs",
     "knowledge_chunks", "memory", "artifacts", "approvals",
+    "pending_deletions", "pending_vault_writes", "vault_path_state",
 }
 
 
@@ -21,7 +22,7 @@ def _tables(conn):
 
 def test_init_creates_all_tables(db_conn):
     assert EXPECTED_TABLES <= _tables(db_conn)
-    assert db.current_version(db_conn) == len(db.MIGRATIONS) == 4  # M3: +m003/m004
+    assert db.current_version(db_conn) == len(db.MIGRATIONS) == 6  # M4: +m005,+m006
 
 
 def test_init_idempotent_rerun(db_conn):
@@ -32,9 +33,9 @@ def test_init_idempotent_rerun(db_conn):
             ("保留我", "sales", db.now_iso(), db.now_iso()),
         )
     v = db.init_db()
-    assert v == 4
+    assert v == 6
     assert db_conn.execute("SELECT COUNT(*) c FROM tasks").fetchone()["c"] == 1
-    assert db_conn.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 4
+    assert db_conn.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 6
 
 
 def test_zero_seeding(db_conn):
@@ -163,7 +164,7 @@ def test_m001_rerun_after_failure_succeeds(isolated_env, monkeypatch):
     assert db.current_version(db.get_read_conn()) == 0
 
     v = db.init_db()  # 第二次完整成功
-    assert v == 4
+    assert v == 6
     conn = db.get_read_conn()
     assert EXPECTED_TABLES <= _tables(conn)
     for table in EXPECTED_TABLES - {"schema_version"}:

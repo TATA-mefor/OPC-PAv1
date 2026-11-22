@@ -32,6 +32,7 @@ class FakeLLM:
         self.calls: list[dict] = []
         self.available = True
         self.breaker = llm_client.CircuitBreaker()
+        self.embed_breaker = llm_client.CircuitBreaker()   # C3：与 chat 熔断隔离
 
     def chat(self, messages, *, max_tokens=1500, deadline=None):
         self.calls.append({"messages": messages, "max_tokens": max_tokens})
@@ -248,3 +249,84 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "live" in item.keywords:
             item.add_marker(skip)
+
+
+# ---------------------------------------------------------------------------
+# M4 第二批：知识链路夹具（tests 目录非包，共享工具一律以 fixture 暴露，
+# 不用 from tests.xxx import，避免与 site-packages 同名包冲突）
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def write_md():
+    """在临时 vault 播种一篇合法 frontmatter 文档，返回正文 hash。"""
+    from datetime import datetime, timezone
+
+    from opc_workbench import vault
+    from opc_workbench.knowledge_service import body_hash
+
+    def _write(root, rel, body, *, visibility="public", owner_role=None):
+        owner = owner_role or vault.owner_for_relpath(rel)
+        meta = {
+            "owner_role": owner, "visibility": visibility, "scope": "global",
+            "file_hash": body_hash(body),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(vault.serialize_frontmatter(meta, body), encoding="utf-8")
+        return meta["file_hash"]
+
+    return _write
+
+
+@pytest.fixture()
+def kdim(monkeypatch):
+    """测试用 8 维模型：与 FakeLLM.embed_dim 对齐，避免维度混算。"""
+    monkeypatch.setattr(config, "EMBEDDING_DIM", 8)
+    return 8
+
+
+@pytest.fixture()
+def kwriter(isolated_env):
+    w = db._open_test_writer(config.DB_PATH)
+    yield w
+    w.close()
+
+
+@pytest.fixture()
+def kservice(kwriter, isolated_env, kdim, identity_api):
+    from opc_workbench.knowledge_service import KnowledgeService
+    return KnowledgeService(kwriter, llm=isolated_env["fake_llm"],
+                            vault_root=isolated_env["vault_dir"],
+                            identity_api=identity_api)
+
+
+@pytest.fixture()
+def kboss_ident(identity_api, boss_ctx):
+    """框架签发的 boss Identity 实例（删除服务的唯一可接受身份形态）。"""
+    return identity_api.resolve_identity("boss", {}, boss_ctx)
+
+
+@pytest.fixture()
+def ksales_ident(identity_api):
+    return identity_api.resolve_identity("sales", {})
+
+
+@pytest.fixture()
+def gated_embedder_cls():
+    """并发编排替身类：进入 embed 置位，放行后才返回（不用 sleep 猜时序）。"""
+    import threading
+
+    class GatedEmbedder:
+        def __init__(self, inner):
+            self.inner = inner
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def embed(self, texts, *, deadline=None):
+            self.entered.set()
+            if not self.release.wait(10):
+                raise RuntimeError("gate_timeout")
+            return self.inner.embed(texts, deadline=deadline)
+
+    return GatedEmbedder

@@ -78,7 +78,7 @@ def v2_conn(isolated_env, monkeypatch):
 def test_m003_adds_version_updated_at_and_boss_check(v2_conn):
     """迁移后新列存在、boss 归属可写、10 角色仍可写、未知角色仍拒。"""
     seeded = _seed_legacy_artifacts(v2_conn)
-    assert db.init_db() == 4
+    assert db.init_db() == 6   # 尖端含 M4 m005/m006
     cols = _art_columns(v2_conn)
     assert "version" in cols and "updated_at" in cols
     with v2_conn:
@@ -101,7 +101,7 @@ def test_m003_legacy_rows_preserved_field_by_field(v2_conn):
     _seed_legacy_artifacts(v2_conn)
     old_cols = _art_columns(v2_conn)
     before = {r["id"]: dict(r) for r in v2_conn.execute("SELECT * FROM artifacts")}
-    assert db.init_db() == 4
+    assert db.init_db() == 6   # 尖端含 M4 m005/m006
     after = {r["id"]: dict(r) for r in v2_conn.execute("SELECT * FROM artifacts")}
     assert set(before) == set(after) and len(after) == 3
     for rid, old in before.items():
@@ -117,7 +117,7 @@ def test_m003_unique_and_indexes_preserved(v2_conn):
     迁移前后索引清单逐项一致（名称/列/唯一性）。"""
     _seed_legacy_artifacts(v2_conn)
     idx_before = _art_indexes(v2_conn)
-    assert db.init_db() == 4
+    assert db.init_db() == 6   # 尖端含 M4 m005/m006
     idx_after = _art_indexes(v2_conn)
     # 表约束自动索引名随重建改变属预期，比对 (唯一性, 列) 多重集合
     assert sorted(idx_before.values()) == sorted(idx_after.values())
@@ -132,10 +132,10 @@ def test_m003_unique_and_indexes_preserved(v2_conn):
 def test_m003_rerun_idempotent(v2_conn):
     """成功迁移后再次 init_db 零变化（行数/版本记录/字段值均不动）。"""
     _seed_legacy_artifacts(v2_conn)
-    assert db.init_db() == 4
+    assert db.init_db() == 6   # 尖端含 M4 m005/m006
     snapshot = [dict(r) for r in v2_conn.execute("SELECT * FROM artifacts ORDER BY id")]
     n_ver = v2_conn.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"]
-    assert db.init_db() == 4
+    assert db.init_db() == 6   # 尖端含 M4 m005/m006
     assert [dict(r) for r in v2_conn.execute("SELECT * FROM artifacts ORDER BY id")] == snapshot
     assert v2_conn.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == n_ver
 
@@ -171,7 +171,7 @@ def test_m003_failure_rolls_back_completely(v2_conn, monkeypatch):
         "SELECT name FROM sqlite_master WHERE type='table'")}
     # 修复后重跑完整成功（精确恢复迁移列表，不动其他隔离补丁）
     monkeypatch.setattr(db, "MIGRATIONS", full)
-    assert db.init_db() == 4
+    assert db.init_db() == 6   # 尖端含 M4 m005/m006
     after = {r["id"]: dict(r) for r in v2_conn.execute("SELECT * FROM artifacts")}
     for old in before:
         for col in cols_before:
@@ -179,8 +179,8 @@ def test_m003_failure_rolls_back_completely(v2_conn, monkeypatch):
 
 
 def test_m003_fresh_db_boss_writable(isolated_env):
-    """全新库直接走到 v4：boss 归属可写、version 默认 1、updated_at 必填。"""
-    assert db.init_db() == 4
+    """全新库直接走到尖端（含 M4 m005/m006）：boss 归属可写、version 默认 1、updated_at 必填。"""
+    assert db.init_db() == 6   # 尖端含 M4 m005/m006
     import sqlite3
     conn = sqlite3.connect(str(config.DB_PATH), timeout=5.0)
     conn.row_factory = sqlite3.Row
@@ -204,7 +204,7 @@ def test_m004_adds_three_nullable_columns(v2_conn):
             "INSERT INTO schedules(title,remind_at,owner_role,created_at,updated_at) "
             "VALUES('旧日程','2026-11-21T09:00:00+08:00','personal',?,?)",
             (db.now_iso(), db.now_iso()))
-    assert db.init_db() == 4
+    assert db.init_db() == 6   # 尖端含 M4 m005/m006
     a_cols = [r["name"] for r in v2_conn.execute("PRAGMA table_info(approvals)")]
     s_cols = [r["name"] for r in v2_conn.execute("PRAGMA table_info(schedules)")]
     assert "digest" in a_cols

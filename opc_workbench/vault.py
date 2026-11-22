@@ -135,12 +135,20 @@ def serialize_frontmatter(meta: dict, body: str) -> str:
     return f"{_DELIM}\n{head}\n{_DELIM}\n{body}"
 
 
-def resolve_safe_path(root: Path | str, rel: str) -> Path:
-    """把 vault 相对路径解析为根内绝对路径；越界一律拒绝。
+def normalize_relpath(rel: str) -> str:
+    """**唯一路径身份入口**：任意可接受写法 → 规范 POSIX 相对路径（DB 键）。
 
-    **平台无关**：不依赖本机 Path  flavour。Windows 驱动器/UNC 前缀用
-    ntpath.splitdrive 识别（在 Linux 上 PurePosixPath 不会识别 C:\\），
-    反斜杠统一按分隔符处理，避免同一路径在两个平台判定不一致。
+    为什么必须有它：`resolve_safe_path` 只回绝对 Path，DB 却以相对串为身份
+    （knowledge_docs.stored_path / vault_path_state.stored_path）。若把调用方
+    原始串直接落库，`cfo\\a.md` 与 `cfo/a.md` 会变成两个身份：反斜杠导入后
+    用正斜杠删除，盘上文件被删、文档行与 chunks 却查不到而残留（B5）。
+
+    规则（校验与归一同一处，读/写文件前调用）：
+    - 反斜杠按分隔符处理；丢弃空段与 `.` 段（`./cfo//a.md` → `cfo/a.md`）；
+    - 拒绝：空串、NUL、驱动器/UNC 前缀、任何 `:`（NTFS ADS）、前导 `/`、
+      任一 `..` 段。
+    剩余形态即为存储身份，ingest/delete/write_doc/mark_missing/purge/recover
+    与 watcher 一律使用本函数结果，不得各自再造一套。
     """
     if not isinstance(rel, str) or rel == "":
         raise ValueError("vault_path_unsafe")
@@ -149,15 +157,27 @@ def resolve_safe_path(root: Path | str, rel: str) -> Path:
     # 驱动器号 / UNC / NTFS 备用数据流（"a.md:stream"）一律拒绝
     if ntpath.splitdrive(rel)[0]:
         raise ValueError("vault_path_unsafe")
-    normalized = rel.replace("\\", "/")
     # 冒号一律拒绝：驱动器前缀与 NTFS 备用数据流（ntpath 只认单字母驱动器）
-    if ":" in normalized:
+    if ":" in rel:
         raise ValueError("vault_path_unsafe")
+    normalized = rel.replace("\\", "/")
     if normalized.startswith("/"):
         raise ValueError("vault_path_unsafe")
-    parts = PurePosixPath(normalized).parts
-    if any(part == ".." for part in parts):
+    parts = [p for p in normalized.split("/") if p not in ("", ".")]
+    if not parts or any(p == ".." for p in parts):
         raise ValueError("vault_path_unsafe")
+    return "/".join(parts)
+
+
+def resolve_safe_path(root: Path | str, rel: str) -> Path:
+    """把 vault 相对路径解析为根内绝对路径；越界一律拒绝。
+
+    **平台无关**：不依赖本机 Path  flavour。Windows 驱动器/UNC 前缀用
+    ntpath.splitdrive 识别（在 Linux 上 PurePosixPath 不会识别 C:\\），
+    反斜杠统一按分隔符处理，避免同一路径在两个平台判定不一致。
+    规则与 normalize_relpath 同源：先归一为规范相对串，再拼根并复核逃逸。
+    """
+    normalized = normalize_relpath(rel)
     root_abs = Path(root).resolve()
     target = (root_abs / PurePosixPath(normalized)).resolve()   # 跟随符号链接 → 逃逸在此暴露
     if target != root_abs and not target.is_relative_to(root_abs):
@@ -166,8 +186,12 @@ def resolve_safe_path(root: Path | str, rel: str) -> Path:
 
 
 def owner_for_relpath(rel: str) -> str:
-    """目录映射 → owner_role（唯一可信来源）。attachments 与未知目录拒绝。"""
-    parts = Path(rel).parts
+    """目录映射 → owner_role（唯一可信来源）。attachments 与未知目录拒绝。
+
+    分隔符归一与 resolve_safe_path 同口径：反斜杠按分隔符处理，
+    避免 `cfo\\a.md` 在 Windows 可映射、在 Linux 却判未确定的平台不一致。
+    """
+    parts = PurePosixPath(rel.replace("\\", "/")).parts
     if not parts:
         raise ValueError("vault_owner_undetermined")
     top = parts[0]
@@ -194,8 +218,11 @@ def load_doc(root: Path | str, rel: str, text: str) -> dict:
     declared = meta["owner_role"]
     corrected = declared != dir_owner
     if corrected:
+        # 字段必须落在 audit_log 白名单内，否则会被静默丢弃、日志无法追溯出处。
+        # actor_role=目录归属，result_code 携带 frontmatter 谎报值，source=相对路径。
         audit_log.log("WARN", "frontmatter_owner_mismatch",
-                      target_path=rel, declared_owner=declared, directory_owner=dir_owner)
+                      actor_role=dir_owner, target_table="knowledge_docs",
+                      result_code=f"declared:{declared}", source=rel)
         meta["owner_role"] = dir_owner
     validate_doc_meta(meta)                      # 用归一化后的归属做持久化校验
     return {"meta": meta, "body": body,

@@ -21,6 +21,13 @@ DASHSCOPE_BASE_URL = os.getenv(
 ).strip()
 DASHSCOPE_MODEL = os.getenv("DASHSCOPE_MODEL", "qwen-plus").strip()
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-v4").strip()
+# M4 第二批 C5（用户裁决 2026-11-22）：维度固定 1024；模型/维度变化由老板
+# 显式触发重建，不自动全量调用 API。批上限 10 条/请求为 text-embedding-v4 规格。
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1024"))
+EMBED_BATCH_SIZE = 10
+KNOWLEDGE_TOP_K = 5           # 检索默认返回块数
+KNOWLEDGE_MIN_SCORE = 0.35    # 余弦阈值，低于视为未命中（PRD §5.3）
+MISSING_RETENTION_DAYS = 7    # watcher 判定消失后索引保留天数（PRD §5.3）
 
 # ---- 路径（测试经 fixture 重定向，业务代码一律引用本模块常量） ----
 DATA_DIR = PROJECT_ROOT / "data"

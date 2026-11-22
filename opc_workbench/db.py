@@ -533,8 +533,84 @@ def m004_bulk_delete_recovery(conn) -> None:
     conn.execute("ALTER TABLE schedules ADD COLUMN recovery_enqueued_at TEXT")
 
 
+def m005_knowledge_index(conn) -> None:
+    """M4 第二批：索引版本列 + 意图表 + 受控可见性视图（不重建 knowledge_docs）。
+
+    本版本内容已在第二轮复审审定，**不再改动**；B3/B4 的新增列与墓碑表
+    由 m006_knowledge_race_fix 承接（用户第三轮裁决：版本边界不折中）。
+
+    用户裁决 C1/C2（2026-11-22）：
+    - C1 方案 A：建 knowledge_chunks_visible 视图，owner_role/visibility 由
+      knowledge_docs 单一真源 JOIN 取得；chunk 检索因此能经 query_visible 治理。
+      **视图只读**：SQLite 无 INSTEAD OF 触发器的视图不可写，写入仍只经注入 writer。
+    - C2 不做内容级去重：**不建 (owner_role,file_hash) 唯一索引**。文档身份是
+      stored_path；不同路径即使正文相同也各自入库，互不覆盖、不串权限。
+    - status 保持四态（重建表才能扩 CHECK）：reindex 期间维持 ready，
+      删除走 pending_deletions 意图表而非新状态位。
+    """
+    for stmt in (
+        "ALTER TABLE knowledge_docs ADD COLUMN source_hash TEXT",
+        "ALTER TABLE knowledge_docs ADD COLUMN indexed_hash TEXT",
+        "ALTER TABLE knowledge_docs ADD COLUMN embed_model TEXT",
+        "ALTER TABLE knowledge_docs ADD COLUMN embed_dim INTEGER",
+        "ALTER TABLE knowledge_docs ADD COLUMN updated_at TEXT",
+        "ALTER TABLE knowledge_docs ADD COLUMN last_error TEXT",
+    ):
+        conn.execute(stmt)
+    # 历史行回填：既有 file_hash 视为"已成功索引"，绝不触发历史重嵌入。
+    conn.execute(
+        "UPDATE knowledge_docs SET indexed_hash=file_hash, source_hash=file_hash "
+        "WHERE indexed_hash IS NULL"
+    )
+    conn.execute(
+        "CREATE TABLE pending_deletions ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "doc_id INTEGER,"
+        "stored_path TEXT NOT NULL UNIQUE,"
+        "created_at TEXT NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE pending_vault_writes ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "stored_path TEXT NOT NULL UNIQUE,"
+        "content TEXT NOT NULL,"
+        "created_at TEXT NOT NULL)"
+    )
+    conn.execute(
+        "CREATE VIEW knowledge_chunks_visible AS "
+        "SELECT c.id AS id, c.doc_id AS doc_id, c.seq AS seq, "
+        "c.content AS content, c.embedding AS embedding, "
+        "d.owner_role AS owner_role, d.visibility AS visibility, "
+        "d.stored_path AS stored_path, d.filename AS filename, "
+        "d.status AS status, d.embed_model AS embed_model, d.embed_dim AS embed_dim "
+        "FROM knowledge_chunks c JOIN knowledge_docs d ON d.id = c.doc_id"
+    )
+
+
+def m006_knowledge_race_fix(conn) -> None:
+    """M4 第二批 B3/B4 并发保护（独立版本，m005 已审定内容一字不动）。
+
+    - `knowledge_docs.snapshot_hash`：文件原文（frontmatter+正文）快照标识。
+      与 body_hash 分工：body_hash 决定是否需要重新 embedding（C6 冻结口径，
+      不含 frontmatter），snapshot_hash 只判定"本轮读到的文件是否仍是最新"，
+      因此仅改 visibility 也会得到不同快照，旧轮次不能把 DB 权限覆盖回旧值。
+    - `vault_path_state(stored_path, generation, updated_at)`：删除代次墓碑。
+      显式 delete / purge_missing 在同一个写事务内先推进代次，再清理文档行与
+      chunks；文档行删除后墓碑仍保留，已在途的旧 ingest 轮次（TX1/TX2 比对
+      代次）因此失效，不得重新创建文档。删除后原位重建须由**新轮次**完成。
+    """
+    conn.execute("ALTER TABLE knowledge_docs ADD COLUMN snapshot_hash TEXT")
+    conn.execute(
+        "CREATE TABLE vault_path_state ("
+        "stored_path TEXT PRIMARY KEY,"
+        "generation INTEGER NOT NULL DEFAULT 0,"
+        "updated_at TEXT NOT NULL)"
+    )
+
+
 MIGRATIONS = [m001_init, m002_task_idempotency,
-              m003_report_identity_version, m004_bulk_delete_recovery]
+              m003_report_identity_version, m004_bulk_delete_recovery,
+              m005_knowledge_index, m006_knowledge_race_fix]
 
 
 # 属性白名单：正常接口只允许这些名字，其余（含 _conn/_cur 内部槽、
