@@ -1,0 +1,124 @@
+# M4 第二批第三轮红证原始输出（逐条撤销保护 → 目标用例变红）
+# 环境：隔离 venv / Python 3.14.3 / pytest（工作树复制副本，未改动真实工作树）
+
+==============================================================================
+# red_b5_no_relpath_normalize: B5：ingest 不再归一化路径身份
+# cmd: C:\Users\1\AppData\Local\Doubao\User Data\Default\.doubao\agent_mode\workspace\.sessions\38455536748631554\agents\m_0cweYiCX2vW\wt\m4ingest\.venv\Scripts\python.exe -m pytest tests/test_knowledge_path_identity.py -k backslash_ingest_then_posix_delete -m not live -q --no-header -p no:cacheprovider
+
+F                                                                        [100%]
+================================== FAILURES ===================================
+__________ test_backslash_ingest_then_posix_delete_clears_everything __________
+
+kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x0000026B59F6D400>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-235/test_backslash_ingest_then_pos0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-235/test_backslash_ingest_then_pos0/vault')}
+write_md = <function write_md.<locals>._write at 0x0000026B43C27A00>
+kboss_ident = <opc_workbench.identity.Identity object at 0x0000026B43C43A00>
+
+    def test_backslash_ingest_then_posix_delete_clears_everything(
+            kservice, isolated_env, write_md, kboss_ident):
+        root = isolated_env["vault_dir"]
+        write_md(root, "cfo/a.md", "路径身份正文")
+    
+        out = kservice.ingest("cfo\\a.md")                 # Windows 写法导入
+        assert out["status"] == "ready"
+>       assert _doc("cfo/a.md") is not None                 # 只落规范键
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: assert None is not None
+E        +  where None = _doc('cfo/a.md')
+
+tests\test_knowledge_path_identity.py:76: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_knowledge_path_identity.py::test_backslash_ingest_then_posix_delete_clears_everything
+1 failed, 22 deselected in 1.14s
+
+==============================================================================
+# red_purge_no_generation: purge：清理 missing 不推进删除代次
+# cmd: C:\Users\1\AppData\Local\Doubao\User Data\Default\.doubao\agent_mode\workspace\.sessions\38455536748631554\agents\m_0cweYiCX2vW\wt\m4ingest\.venv\Scripts\python.exe -m pytest tests/test_knowledge_race_guards.py -k purge_missing_cannot_resurrect -m not live -q --no-header -p no:cacheprovider
+
+F                                                                        [100%]
+================================== FAILURES ===================================
+__________ test_inflight_ingest_after_purge_missing_cannot_resurrect __________
+
+kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x000001A5CEB15550>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-236/test_inflight_ingest_after_pur0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-236/test_inflight_ingest_after_pur0/vault')}
+write_md = <function write_md.<locals>._write at 0x000001A5CEB4A2A0>
+
+    def test_inflight_ingest_after_purge_missing_cannot_resurrect(
+            kservice, isolated_env, write_md):
+        """purge 也清除文档身份：先推进代次，旧轮次不得在文件重现后重建旧记录。"""
+        from datetime import datetime, timedelta, timezone
+    
+        from opc_workbench import config
+    
+        root = isolated_env["vault_dir"]
+        write_md(root, "sales/s.md", "PURGED-BODY")
+        old_id = kservice.ingest("sales/s.md")["doc_id"]
+        original_text = (root / "sales" / "s.md").read_text(encoding="utf-8")
+    
+        out: dict = {}
+        errors: list = []
+    
+        def run_a():
+            try:
+                out["a"] = kservice.ingest("sales/s.md")
+            except BaseException as exc:      # noqa: BLE001
+                errors.append(exc)
+    
+        with _first_read_gate("s.md") as (entered, release):
+            t = threading.Thread(target=run_a)
+            t.start()
+            try:
+                assert entered.wait(10), "A 未停在读完文件之后"
+                # 文件消失 → missing；保留期已过 → purge（应推进代次）
+                (root / "sales" / "s.md").unlink()
+                assert kservice.mark_missing("sales/s.md")["missing"] is True
+                later = datetime.now(timezone.utc) + timedelta(
+                    days=config.MISSING_RETENTION_DAYS + 1)
+                assert kservice.purge_missing(now=later)["purged"] == 1
+                assert _doc("sales/s.md") is None
+                assert _chunks(old_id) == []
+                # 文件以原样字节重新出现（快照与 A 读到的一致，只有代次能拦住）
+                (root / "sales" / "s.md").write_text(original_text, encoding="utf-8")
+            finally:
+                release.set()
+                t.join(10)
+        assert not errors, errors
+        assert not t.is_alive()
+    
+        # 红证点：purge 不推进代次时，A 会重新插入已 purge 的文档并写 chunks
+>       assert _doc("sales/s.md") is None
+E       AssertionError: assert <sqlite3.Row object at 0x000001A5CEB5A650> is None
+E        +  where <sqlite3.Row object at 0x000001A5CEB5A650> = _doc('sales/s.md')
+
+tests\test_knowledge_race_guards.py:479: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_knowledge_race_guards.py::test_inflight_ingest_after_purge_missing_cannot_resurrect
+1 failed, 11 deselected in 1.20s
+
+==============================================================================
+# red_delete_no_boss_check: delete：服务层不再限定 boss
+# cmd: C:\Users\1\AppData\Local\Doubao\User Data\Default\.doubao\agent_mode\workspace\.sessions\38455536748631554\agents\m_0cweYiCX2vW\wt\m4ingest\.venv\Scripts\python.exe -m pytest tests/test_knowledge_service.py -k rejects_non_boss_identity -m not live -q --no-header -p no:cacheprovider
+
+F                                                                        [100%]
+================================== FAILURES ===================================
+____________________ test_delete_rejects_non_boss_identity ____________________
+
+kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x00000258676B1A90>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-237/test_delete_rejects_non_boss_i0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-237/test_delete_rejects_non_boss_i0/vault')}
+write_md = <function write_md.<locals>._write at 0x0000025867745900>
+ksales_ident = <opc_workbench.identity.Identity object at 0x00000258677513F0>
+
+    def test_delete_rejects_non_boss_identity(kservice, isolated_env, write_md, ksales_ident):
+        root = isolated_env["vault_dir"]
+        write_md(root, "cfo/a.md", "非 boss")
+        kservice.ingest("cfo/a.md")
+>       with pytest.raises(KnowledgeServiceDeleteDenied) as exc:
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'opc_workbench.knowledge_service.DeleteDenied'>
+
+tests\test_knowledge_service.py:453: Failed
+=========================== short test summary info ===========================
+FAILED tests/test_knowledge_service.py::test_delete_rejects_non_boss_identity
+1 failed, 41 deselected in 1.13s
+
+
