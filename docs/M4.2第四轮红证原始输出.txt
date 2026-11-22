@@ -1,0 +1,64 @@
+# red_purge_no_candidate_recheck: purge：事务内不复核候选是否仍是 missing
+# cmd: C:\Users\1\AppData\Local\Doubao\User Data\Default\.doubao\agent_mode\workspace\.sessions\38455536748631554\agents\m_0cweYiCX2vW\wt\m4ingest\.venv\Scripts\python.exe -m pytest tests/test_knowledge_race_guards.py -k restored_between_scan_and_transaction -m not live -q --no-header -p no:cacheprovider
+
+F                                                                        [100%]
+================================== FAILURES ===================================
+_________ test_purge_skips_doc_restored_between_scan_and_transaction __________
+
+kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x0000019C26BDD940>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-247/test_purge_skips_doc_restored_0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-247/test_purge_skips_doc_restored_0/vault')}
+write_md = <function write_md.<locals>._write at 0x0000019C26C2A140>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x0000019C26BBDF30>
+
+    def test_purge_skips_doc_restored_between_scan_and_transaction(
+            kservice, isolated_env, write_md, monkeypatch):
+        """A 取到过期 missing 候选后暂停；B 恢复文件并成功 ingest；放行 A 后：
+        文档必须保持 ready、chunks 完整、代次不得被错误推进、purge 必须跳过。"""
+        from datetime import datetime, timedelta, timezone
+    
+        from opc_workbench import config
+    
+        root = isolated_env["vault_dir"]
+        write_md(root, "sales/s.md", "RESTORED-BODY")
+        old_id = kservice.ingest("sales/s.md")["doc_id"]
+        original_text = (root / "sales" / "s.md").read_text(encoding="utf-8")
+    
+        (root / "sales" / "s.md").unlink()
+        assert kservice.mark_missing("sales/s.md")["missing"] is True
+        later = datetime.now(timezone.utc) + timedelta(
+            days=config.MISSING_RETENTION_DAYS + 1)
+    
+        result: dict = {}
+        errors: list = []
+    
+        def run_purge():
+            try:
+                result["p"] = kservice.purge_missing(now=later)
+            except BaseException as exc:      # noqa: BLE001
+                errors.append(exc)
+    
+        with _purge_scan_gate(monkeypatch) as (entered, release):
+            t = threading.Thread(target=run_purge)
+            t.start()
+            try:
+                assert entered.wait(10), "purge 未停在候选取回之后"
+                # B：文件恢复并成功 ingest → status ready、新 chunks 落库
+                (root / "sales" / "s.md").write_text(original_text, encoding="utf-8")
+                fresh = kservice.ingest("sales/s.md")
+                assert fresh["stale"] is False and fresh["reindexed"] is True
+                assert _doc("sales/s.md")["status"] == "ready"
+            finally:
+                release.set()
+                t.join(10)
+        assert not errors, errors
+        assert not t.is_alive()
+    
+        # 红证点：事务内不复核候选时，A 会按旧 id 删掉刚恢复的 ready 文档
+        doc = _doc("sales/s.md")
+>       assert doc is not None and doc["status"] == "ready"
+E       assert (None is not None)
+
+tests\test_knowledge_race_guards.py:583: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_knowledge_race_guards.py::test_purge_skips_doc_restored_between_scan_and_transaction
+1 failed, 12 deselected in 1.19s
