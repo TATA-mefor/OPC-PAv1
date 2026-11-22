@@ -1,0 +1,18 @@
+........................................................................ [ 15%]
+........................................................................ [ 30%]
+........................................................................ [ 46%]
+........................................................................ [ 61%]
+........................................................................ [ 77%]
+........................................................................ [ 92%]
+..................................                                       [100%]
+============================== warnings summary ===============================
+..\..\..\..\..\..\..\..\..\..\..\..\..\Roaming\Python\Python314\site-packages\typer\__init__.py:24
+  C:\Users\1\AppData\Roaming\Python\Python314\site-packages\typer\__init__.py:24: DeprecationWarning: 'click.utils.get_binary_stream' is deprecated and will be removed in Click 9.0.
+    from click.utils import get_binary_stream as get_binary_stream
+
+..\..\..\..\..\..\..\..\..\..\..\..\..\Roaming\Python\Python314\site-packages\typer\__init__.py:25
+  C:\Users\1\AppData\Roaming\Python\Python314\site-packages\typer\__init__.py:25: DeprecationWarning: 'click.utils.get_text_stream' is deprecated and will be removed in Click 9.0.
+    from click.utils import get_text_stream as get_text_stream
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+466 passed, 1 deselected, 2 warnings in 21.51s

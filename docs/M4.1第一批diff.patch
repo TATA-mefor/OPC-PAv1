@@ -1,0 +1,701 @@
+diff --git a/opc_workbench/chunking.py b/opc_workbench/chunking.py
+new file mode 100644
+index 0000000..de5845a
+--- /dev/null
++++ b/opc_workbench/chunking.py
+@@ -0,0 +1,87 @@
++"""分块纯函数（M4 第一批）。
++
++PRD §5.3 目标 512 token/块、重叠 64、标题/段落边界优先。
++**显式工程近似**（M4.1 §五.2 已获审查通过）：不引入 tokenizer，按字符权重
++估算 token —— CJK 等宽字符计 1，其余计 0.25；断言块数边界与重叠语义，
++不断言精确 token 数。
++
++纯函数：无 IO、无外部依赖、确定性；ingest（第二批）import 使用。
++"""
++from __future__ import annotations
++
++DEFAULT_TARGET = 512
++DEFAULT_OVERLAP = 64
++
++# 边界优先级：标题 > 空行段落 > 换行 > 句末
++_BOUNDARIES = ("\n#", "\n\n", "\n", "。", "！", "？", ". ", "! ", "? ")
++
++
++def _weight(ch: str) -> float:
++    """CJK 及全角符号按 1 token 估，其余按 4 字符≈1 token 估。"""
++    return 1.0 if ord(ch) >= 0x2E80 else 0.25
++
++
++def _estimate(text: str) -> float:
++    return sum(_weight(c) for c in text)
++
++
++def _find_cut(text: str, start: int, window: int, hi: int) -> tuple[int, bool] | None:
++    """找语义边界 → (切点, 是否标题边界)。
++
++    标题在**整块范围**内搜索（标题是天然块首，宁可块短也要对齐）；
++    段落/换行/句末只在尾部窗口内搜索，避免块被切得过短。
++    """
++    idx = text.rfind("\n#", start + 1, hi)
++    if idx >= 0:
++        cut = idx + 1
++        if start < cut < hi:
++            return cut, True
++    for marker in _BOUNDARIES[1:]:
++        idx = text.rfind(marker, window, hi)
++        if idx < 0:
++            continue
++        cut = idx + len(marker)
++        if window <= cut < hi and cut > start:
++            return cut, False
++    return None
++
++
++def chunk_text(text: str, *, target: int = DEFAULT_TARGET,
++               overlap: int = DEFAULT_OVERLAP) -> list[str]:
++    """按预算切块，块间保留重叠；空文本返回 []。"""
++    if target <= 0:
++        raise ValueError("chunk_target_invalid")
++    if overlap < 0 or overlap >= target:
++        raise ValueError("chunk_overlap_invalid")
++    if not text or not text.strip():
++        return []
++
++    chunks: list[str] = []
++    n = len(text)
++    start = 0
++    while start < n:
++        acc = 0.0
++        end = start
++        while end < n and acc + _weight(text[end]) <= target:
++            acc += _weight(text[end])
++            end += 1
++        if end >= n:                                   # 尾块
++            chunks.append(text[start:])
++            break
++        window = max(start + 1, end - max(1, target // 5))
++        found = _find_cut(text, start, window, end)
++        cut, at_heading = found if found else (end, False)
++        if cut <= start:
++            cut, at_heading = end, False
++        chunks.append(text[start:cut])
++
++        if at_heading:
++            # 标题是天然块首：不回退重叠，避免把标题裹进上一块尾部
++            start = cut
++            continue
++        back, acc2 = cut, 0.0                          # 回退 overlap 个估算 token
++        while back > start and acc2 + _weight(text[back - 1]) <= overlap:
++            acc2 += _weight(text[back - 1])
++            back -= 1
++        start = back if back > start else cut          # 保证前进，绝不空转
++    return chunks
+\ No newline at end of file
+diff --git a/opc_workbench/vault.py b/opc_workbench/vault.py
+new file mode 100644
+index 0000000..6137be2
+--- /dev/null
++++ b/opc_workbench/vault.py
+@@ -0,0 +1,183 @@
++"""vault 文件层地基（M4 第一批：纯函数 + 受限文件 IO，零 DB、零网络）。
++
++职责边界（M4.1 清单 §七 B2/B5、第一批边界）：
++- 角色目录映射是 owner_role 的**唯一可信来源**，frontmatter 不得伪造归属；
++- frontmatter 解析**严格 fail closed**：只认固定 5 键，拒绝重复键/未知键/
++  缺键/类型错配/畸形分隔符（不引入 pyyaml，锁定依赖清单无它）；
++- 路径安全：resolve 后必须仍在 vault 根内，拒绝 ../、绝对路径与符号链接逃逸；
++- 原子写：同目录 tmp + os.replace，失败不留半成品；
++- 快照比较是**纯函数**（diff_snapshots），不做任何文件系统 IO。
++
++本模块**不实现** ingest / delete / search / watcher 线程，也不修改 app.py。
++"""
++from __future__ import annotations
++
++import os
++import re
++import tempfile
++from datetime import datetime
++from pathlib import Path
++
++from . import config, visibility
++
++# --- 目录布局（PRD §5.8）----------------------------------------------------
++# 8 员工 + personal 各有角色目录；shared 为全员可读共享区；attachments 存二进制。
++ROLE_DIRS: tuple[str, ...] = (
++    "customer_service", "sales", "cfo", "legal",
++    "product", "research", "marketing", "hr", "personal",
++)
++SHARED_DIR = "shared"
++SHARED_OWNER = "coordinator"          # 固定映射，文档不得自行伪造
++ATTACHMENTS_DIR = "attachments"
++
++# --- frontmatter 契约（固定 5 键，顺序即序列化顺序）-------------------------
++FM_KEYS: tuple[str, ...] = ("owner_role", "visibility", "scope", "file_hash", "updated_at")
++
++_DELIM = "---"
++_KEY_RE = re.compile(r"^[a-z_]+$")
++_HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
++
++
++class FrontmatterError(ValueError):
++    """frontmatter 非法（一切非法形态统一 fail closed）。"""
++
++
++def _validate_meta(meta: dict) -> None:
++    missing = [k for k in FM_KEYS if k not in meta]
++    if missing:
++        raise FrontmatterError(f"frontmatter_missing_key:{missing[0]}")
++    extra = [k for k in meta if k not in FM_KEYS]
++    if extra:
++        raise FrontmatterError(f"frontmatter_unknown_key:{extra[0]}")
++    if meta["owner_role"] not in config.ROLES:
++        raise FrontmatterError(f"frontmatter_invalid_value:owner_role")
++    if meta["visibility"] not in ("public", "private"):
++        raise FrontmatterError("frontmatter_invalid_value:visibility")
++    if meta["scope"] not in ("global", "session"):
++        raise FrontmatterError("frontmatter_invalid_value:scope")
++    if not _HASH_RE.match(meta["file_hash"]):
++        raise FrontmatterError("frontmatter_invalid_value:file_hash")
++    try:
++        stamp = datetime.fromisoformat(meta["updated_at"])
++    except (TypeError, ValueError):
++        raise FrontmatterError("frontmatter_invalid_value:updated_at") from None
++    if stamp.tzinfo is None:                 # 时间统一 aware（CLAUDE.md 规范）
++        raise FrontmatterError("frontmatter_invalid_value:updated_at")
++
++
++def validate_doc_meta(meta: dict) -> None:
++    """落库前的语义校验：复用 M2 治理规则，session 不可持久化。"""
++    _validate_meta(meta)
++    visibility.validate_persist(meta["owner_role"], meta["visibility"], meta["scope"])
++
++
++def parse_frontmatter(text: str) -> tuple[dict, str]:
++    """严格解析 md 头部 YAML 子集 → (meta, body)。任何非法形态抛 FrontmatterError。"""
++    if not isinstance(text, str):
++        raise FrontmatterError("frontmatter_malformed")
++    lines = text.split("\n")
++    if not lines or lines[0].strip() != _DELIM:
++        raise FrontmatterError("frontmatter_malformed")
++    meta: dict[str, str] = {}
++    end = None
++    for i in range(1, len(lines)):
++        raw = lines[i]
++        if raw.strip() == _DELIM:
++            end = i
++            break
++        if raw.strip() == "":
++            raise FrontmatterError("frontmatter_malformed")
++        if raw != raw.strip() or "\t" in raw:
++            raise FrontmatterError("frontmatter_malformed")
++        if raw.count(":") < 1:
++            raise FrontmatterError("frontmatter_malformed")
++        key, _, value = raw.partition(":")
++        if not _KEY_RE.match(key):
++            raise FrontmatterError("frontmatter_malformed")
++        if not value.startswith(" ") or value.strip() == "":
++            raise FrontmatterError("frontmatter_malformed")
++        value = value[1:]
++        if value == "" or value != value.strip():
++            raise FrontmatterError("frontmatter_malformed")
++        if key in ("owner_role", "visibility", "scope") and ":" in value:
++            raise FrontmatterError("frontmatter_malformed")
++        if key in meta:
++            raise FrontmatterError(f"frontmatter_duplicate_key:{key}")
++        if key not in FM_KEYS:
++            raise FrontmatterError(f"frontmatter_unknown_key:{key}")
++        meta[key] = value
++    if end is None:
++        raise FrontmatterError("frontmatter_malformed")
++    _validate_meta(meta)
++    body = "\n".join(lines[end + 1:])
++    return meta, body
++
++
++def serialize_frontmatter(meta: dict, body: str) -> str:
++    """按固定键序序列化；先校验，非法不产出文本。"""
++    _validate_meta(meta)
++    head = "\n".join(f"{k}: {meta[k]}" for k in FM_KEYS)
++    return f"{_DELIM}\n{head}\n{_DELIM}\n{body}"
++
++
++def resolve_safe_path(root: Path | str, rel: str) -> Path:
++    """把 vault 相对路径解析为根内绝对路径；越界一律拒绝。"""
++    if not isinstance(rel, str) or rel == "":
++        raise ValueError("vault_path_unsafe")
++    if "\x00" in rel:
++        raise ValueError("vault_path_unsafe")
++    p = Path(rel)
++    if p.is_absolute() or p.drive or rel.startswith(("/", "\\")):
++        raise ValueError("vault_path_unsafe")
++    if any(part == ".." for part in p.parts):
++        raise ValueError("vault_path_unsafe")
++    root_abs = Path(root).resolve()
++    target = (root_abs / p).resolve()        # resolve 跟随符号链接 → 逃逸在此暴露
++    if target != root_abs and not target.is_relative_to(root_abs):
++        raise ValueError("vault_path_unsafe")
++    return target
++
++
++def owner_for_relpath(rel: str) -> str:
++    """目录映射 → owner_role（唯一可信来源）。attachments 与未知目录拒绝。"""
++    parts = Path(rel).parts
++    if not parts:
++        raise ValueError("vault_owner_undetermined")
++    top = parts[0]
++    if top == SHARED_DIR:
++        return SHARED_OWNER
++    if top in ROLE_DIRS:
++        return top
++    raise ValueError("vault_owner_undetermined")
++
++
++def atomic_write(path: Path | str, text: str) -> None:
++    """同目录 tmp + os.replace 原子落盘；失败清理 tmp，不留半成品。"""
++    target = Path(path)
++    target.parent.mkdir(parents=True, exist_ok=True)
++    fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=".tmp-", suffix=".part")
++    tmp = Path(tmp_name)
++    try:
++        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
++            fh.write(text)
++            fh.flush()
++            os.fsync(fh.fileno())
++        os.replace(tmp, target)
++    except BaseException:
++        tmp.unlink(missing_ok=True)
++        raise
++
++
++def diff_snapshots(old: dict, new: dict) -> dict:
++    """纯函数：比较两次文件快照 {rel: (mtime, size)}，不做任何 IO。
++
++    返回 added / removed / changed 三个**有序**列表；mtime 或 size 任一变化
++    即视为候选变更（真实是否重索引由后续 hash 复核决定，属第二批）。
++    """
++    old_keys, new_keys = set(old), set(new)
++    changed = [k for k in old_keys & new_keys if tuple(old[k]) != tuple(new[k])]
++    return {
++        "added": sorted(new_keys - old_keys),
++        "removed": sorted(old_keys - new_keys),
++        "changed": sorted(changed),
++    }
+\ No newline at end of file
+diff --git a/tests/conftest.py b/tests/conftest.py
+index f3325b6..5772647 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -7,6 +7,8 @@ autouse fixture 保证：
+ """
+ from __future__ import annotations
+ 
++import hashlib
++import math
+ import socket
+ import sys
+ from pathlib import Path
+@@ -23,8 +25,10 @@ from opc_workbench import config, db, llm_client  # noqa: E402
+ class FakeLLM:
+     """确定性替身：记录调用、可编排响应/异常，零网络。"""
+ 
+-    def __init__(self, responses=None):
++    def __init__(self, responses=None, embed_responses=None, embed_dim=8):
+         self.responses = list(responses or ["fake-ok"])
++        self.embed_responses = list(embed_responses or [])
++        self.embed_dim = embed_dim
+         self.calls: list[dict] = []
+         self.available = True
+         self.breaker = llm_client.CircuitBreaker()
+@@ -36,6 +40,28 @@ class FakeLLM:
+             raise item
+         return item
+ 
++    def embed(self, texts, *, deadline=None):
++        """M4 第一批测试替身：确定性、已归一化、零网络；可编排异常/异常向量。
++
++        生产 embed() 属第二批，本替身仅用于纯函数与分块/检索地基测试。
++        """
++        self.calls.append({"kind": "embed", "texts": list(texts)})
++        if self.embed_responses:
++            item = self.embed_responses.pop(0)
++            if isinstance(item, Exception):
++                raise item
++            return item
++        return [self._vector(t) for t in texts]
++
++    def _vector(self, text: str) -> list[float]:
++        digest = hashlib.sha256(text.encode("utf-8")).digest()
++        raw = [(digest[i % len(digest)] / 255.0) - 0.5 for i in range(self.embed_dim)]
++        norm = math.sqrt(sum(v * v for v in raw))
++        if norm == 0.0:                       # 零向量兜底为单位向量，绝不返回全零
++            raw = [1.0] + [0.0] * (self.embed_dim - 1)
++            norm = 1.0
++        return [v / norm for v in raw]
++
+ 
+ @pytest.fixture(autouse=True)
+ def isolated_env(request, tmp_path, monkeypatch):
+diff --git a/tests/test_chunking.py b/tests/test_chunking.py
+new file mode 100644
+index 0000000..95ae9d5
+--- /dev/null
++++ b/tests/test_chunking.py
+@@ -0,0 +1,80 @@
++"""M4 第一批：分块纯函数（字符预算近似，断言边界与重叠，不断言精确 token）。"""
++from __future__ import annotations
++
++import pytest
++
++from opc_workbench import chunking
++
++
++def _est(text: str) -> float:
++    """独立事实源：测试自行估算，不复用被测模块的私有函数。"""
++    return sum(1.0 if ord(c) >= 0x2E80 else 0.25 for c in text)
++
++
++@pytest.mark.parametrize("text", ["", "   ", "\n\n\t  \n"])
++def test_empty_text_yields_no_chunks(text):
++    assert chunking.chunk_text(text) == []
++
++
++def test_short_text_single_chunk_verbatim():
++    text = "短文本，无需切分。"
++    assert chunking.chunk_text(text) == [text]
++
++
++def test_long_cjk_respects_budget():
++    text = "财" * 2000
++    chunks = chunking.chunk_text(text, target=100, overlap=10)
++    assert len(chunks) > 1
++    assert all(_est(c) <= 100 for c in chunks)
++    assert all(c for c in chunks)
++
++
++def test_every_chunk_is_substring_and_ends_match():
++    text = "段落内容。" * 400
++    chunks = chunking.chunk_text(text, target=120, overlap=20)
++    assert text.startswith(chunks[0])
++    assert text.endswith(chunks[-1])
++    assert all(c in text for c in chunks)
++
++
++def test_overlap_present_between_consecutive_chunks():
++    text = "甲" * 1000
++    chunks = chunking.chunk_text(text, target=100, overlap=20)
++    for prev, nxt in zip(chunks, chunks[1:]):
++        assert prev.endswith(nxt[:10])          # 后块开头来自前块尾部
++        assert len(nxt) > 0
++
++
++def test_heading_boundary_starts_new_chunk():
++    body = "引子" * 60
++    text = body + "\n# 第二章\n" + "正文" * 200
++    chunks = chunking.chunk_text(text, target=150, overlap=10)
++    assert any(c.startswith("# 第二章") for c in chunks)
++
++
++def test_unbroken_long_paragraph_hard_cut_terminates():
++    text = "x" * 20000                            # 无任何语义边界
++    chunks = chunking.chunk_text(text, target=200, overlap=20)
++    assert len(chunks) > 1
++    assert all(_est(c) <= 200 for c in chunks)
++    assert "".join(chunks[:1]) == text[:len(chunks[0])]
++
++
++def test_deterministic():
++    text = "混合 content 中文与 English words。" * 100
++    assert chunking.chunk_text(text) == chunking.chunk_text(text)
++
++
++def test_default_budget_matches_prd_approximation():
++    text = "中" * 1200
++    chunks = chunking.chunk_text(text)          # 默认 512 / 64
++    assert all(_est(c) <= 512 for c in chunks)
++    assert len(chunks) >= 2
++
++
++@pytest.mark.parametrize("kw", [
++    {"target": 0}, {"target": -1}, {"overlap": -1}, {"overlap": 100, "target": 100},
++])
++def test_invalid_params_rejected(kw):
++    with pytest.raises(ValueError):
++        chunking.chunk_text("some text", **kw)
+\ No newline at end of file
+diff --git a/tests/test_embedding_fake.py b/tests/test_embedding_fake.py
+new file mode 100644
+index 0000000..702da8f
+--- /dev/null
++++ b/tests/test_embedding_fake.py
+@@ -0,0 +1,55 @@
++"""M4 第一批：FakeLLM.embed 测试替身契约（确定性 / 归一化 / 可编排异常，零网络）。"""
++from __future__ import annotations
++
++import math
++
++import pytest
++
++from opc_workbench import llm_client
++
++
++def test_embed_deterministic_and_text_sensitive(isolated_env):
++    fake = llm_client.get_llm()
++    a1, b1 = fake.embed(["财务口径", "销售话术"])
++    a2 = fake.embed(["财务口径"])[0]
++    assert a1 == a2                      # 同文本同向量
++    assert a1 != b1                      # 不同文本不同向量
++
++
++def test_embed_vectors_normalized(isolated_env):
++    fake = llm_client.get_llm()
++    for vec in fake.embed(["甲", "乙", "丙"]):
++        assert math.isclose(math.sqrt(sum(v * v for v in vec)), 1.0, rel_tol=1e-9)
++
++
++def test_embed_dim_configurable():
++    FakeLLM = type(llm_client.get_llm())   # 避免 tests 包名与 site-packages 冲突
++    fake = FakeLLM(embed_dim=16)
++    assert all(len(v) == 16 for v in fake.embed(["x", "y"]))
++
++
++def test_embed_no_nan_inf_or_zero_vector(isolated_env):
++    fake = llm_client.get_llm()
++    for vec in fake.embed(["", "a", "中文"]):
++        assert all(math.isfinite(v) for v in vec)
++        assert any(v != 0.0 for v in vec)
++
++
++def test_embed_failure_orchestrable():
++    FakeLLM = type(llm_client.get_llm())   # 避免 tests 包名与 site-packages 冲突
++    fake = FakeLLM(embed_responses=[llm_client.LLMFailure("boom")])
++    with pytest.raises(llm_client.LLMFailure):
++        fake.embed(["x"])
++
++
++def test_embed_explicit_vectors_orchestrable():
++    FakeLLM = type(llm_client.get_llm())   # 避免 tests 包名与 site-packages 冲突
++    fake = FakeLLM(embed_responses=[[[1.0, 0.0], [0.0, 1.0]]])
++    assert fake.embed(["x", "y"]) == [[1.0, 0.0], [0.0, 1.0]]
++
++
++def test_embed_calls_recorded_without_touching_chat(isolated_env):
++    fake = llm_client.get_llm()
++    fake.embed(["块一", "块二"])
++    assert fake.calls[-1] == {"kind": "embed", "texts": ["块一", "块二"]}
++    assert fake.chat([{"role": "user", "content": "hi"}]) == "fake-ok"   # chat 语义零改动
+\ No newline at end of file
+diff --git a/tests/test_vault.py b/tests/test_vault.py
+new file mode 100644
+index 0000000..6cb4231
+--- /dev/null
++++ b/tests/test_vault.py
+@@ -0,0 +1,207 @@
++"""M4 第一批：vault 文件层地基（frontmatter 严格解析 / 路径安全 / 原子写 / 快照纯函数）。"""
++from __future__ import annotations
++
++import os
++from pathlib import Path
++
++import pytest
++
++from opc_workbench import vault
++
++
++def _meta(**over):
++    base = {
++        "owner_role": "cfo",
++        "visibility": "private",
++        "scope": "global",
++        "file_hash": "sha256:" + "a" * 64,
++        "updated_at": "2026-11-22T10:00:00+08:00",
++    }
++    base.update(over)
++    return base
++
++
++def _doc(**over):
++    return vault.serialize_frontmatter(_meta(**over), "正文内容\n")
++
++
++# --- frontmatter 往返与严格拒绝 -------------------------------------------
++
++def test_frontmatter_roundtrip():
++    meta, body = vault.parse_frontmatter(_doc())
++    assert meta == _meta()
++    assert body == "正文内容\n"
++
++
++def test_frontmatter_body_kept_verbatim():
++    text = vault.serialize_frontmatter(_meta(), "# 标题\n\n段落一\n段落二\n")
++    _m, body = vault.parse_frontmatter(text)
++    assert body == "# 标题\n\n段落一\n段落二\n"
++
++
++@pytest.mark.parametrize("bad", [
++    "",                                   # 空
++    "no frontmatter here\n",              # 无起始分隔符
++    "---\nowner_role: cfo\n",             # 无结束分隔符
++    "---\n\nowner_role: cfo\n---\n",      # 块内空行
++    "---\nowner_role:cfo\n---\n",         # 冒号后无空格
++    "---\nowner_role: \n---\n",           # 空值
++    "---\n owner_role: cfo\n---\n",       # 缩进
++    "---\nowner_role:\tcfo\n---\n",       # 制表符
++])
++def test_frontmatter_malformed_rejected(bad):
++    with pytest.raises(vault.FrontmatterError):
++        vault.parse_frontmatter(bad)
++
++
++def test_frontmatter_duplicate_key_rejected():
++    text = _doc().replace("visibility: private", "visibility: private\nvisibility: public")
++    with pytest.raises(vault.FrontmatterError, match="duplicate_key"):
++        vault.parse_frontmatter(text)
++
++
++def test_frontmatter_unknown_key_rejected():
++    text = _doc().replace("scope: global", "scope: global\nis_admin: true")
++    with pytest.raises(vault.FrontmatterError, match="unknown_key"):
++        vault.parse_frontmatter(text)
++
++
++def test_frontmatter_missing_key_rejected():
++    text = "\n".join(l for l in _doc().split("\n") if not l.startswith("scope:"))
++    with pytest.raises(vault.FrontmatterError, match="missing_key"):
++        vault.parse_frontmatter(text)
++
++
++@pytest.mark.parametrize("over", [
++    {"owner_role": "boss"},                       # 非 config.ROLES 角色
++    {"owner_role": "hacker"},
++    {"visibility": "internal"},
++    {"visibility": "PUBLIC"},
++    {"scope": "team"},
++    {"file_hash": "md5:abc"},
++    {"file_hash": "sha256:" + "z" * 64},
++    {"updated_at": "2026-11-22T10:00:00"},        # naive，无时区
++    {"updated_at": "昨天"},
++])
++def test_frontmatter_invalid_value_rejected(over):
++    with pytest.raises(vault.FrontmatterError, match="invalid_value"):
++        vault.parse_frontmatter(_doc(**over))
++
++
++def test_serialize_rejects_invalid_meta():
++    with pytest.raises(vault.FrontmatterError):
++        vault.serialize_frontmatter(_meta(visibility="internal"), "x")
++
++
++def test_doc_meta_rejects_session_scope():
++    """落库语义校验复用 M2 规则：session 不可持久化。"""
++    vault.validate_doc_meta(_meta())              # global 合法
++    with pytest.raises(ValueError, match="session_not_persistable"):
++        vault.validate_doc_meta(_meta(scope="session"))
++
++
++# --- 目录映射（owner_role 唯一可信来源）-----------------------------------
++
++@pytest.mark.parametrize("rel,expected", [
++    ("cfo/report.md", "cfo"),
++    ("sales/a/b.md", "sales"),
++    ("personal/note.md", "personal"),
++    ("shared/policy.md", "coordinator"),
++])
++def test_owner_from_directory(rel, expected):
++    assert vault.owner_for_relpath(rel) == expected
++
++
++@pytest.mark.parametrize("rel", ["attachments/x.pdf", "unknown/x.md", "", "x.md"])
++def test_owner_undetermined_rejected(rel):
++    with pytest.raises(ValueError, match="vault_owner_undetermined"):
++        vault.owner_for_relpath(rel)
++
++
++# --- 路径安全 ---------------------------------------------------------------
++
++def test_safe_path_normal(tmp_path):
++    got = vault.resolve_safe_path(tmp_path, "cfo/a.md")
++    assert got == (tmp_path / "cfo" / "a.md").resolve()
++    assert got.is_relative_to(tmp_path.resolve())
++
++
++@pytest.mark.parametrize("rel", [
++    "../escape.md", "cfo/../../escape.md", "..", "cfo/..",
++    "/etc/passwd", "\\windows\\system32", "C:\\evil.txt", "", "cfo/\x00.md",
++])
++def test_unsafe_path_rejected(tmp_path, rel):
++    with pytest.raises(ValueError, match="vault_path_unsafe"):
++        vault.resolve_safe_path(tmp_path, rel)
++
++
++def test_symlink_escape_rejected(tmp_path):
++    root = tmp_path / "vault"          # isolated_env 已建
++    root.mkdir(exist_ok=True)
++    outside = tmp_path / "outside"
++    outside.mkdir(exist_ok=True)
++    (outside / "secret.md").write_text("机密", encoding="utf-8")
++    link = root / "link"
++    try:
++        link.symlink_to(outside, target_is_directory=True)
++    except (OSError, NotImplementedError):
++        # Windows 无符号链接权限时用目录联接（junction）兜底，无需管理员
++        import subprocess
++        r = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(outside)],
++                           capture_output=True)
++        if r.returncode != 0 or not link.exists():
++            pytest.skip("本机既无符号链接权限也无法创建目录联接")
++    with pytest.raises(ValueError, match="vault_path_unsafe"):
++        vault.resolve_safe_path(root, "link/secret.md")
++
++
++# --- 原子写 -----------------------------------------------------------------
++
++def test_atomic_write_creates_and_overwrites(tmp_path):
++    target = tmp_path / "cfo" / "a.md"
++    vault.atomic_write(target, "第一版")
++    assert target.read_text(encoding="utf-8") == "第一版"
++    vault.atomic_write(target, "第二版")
++    assert target.read_text(encoding="utf-8") == "第二版"
++    assert list(target.parent.glob(".tmp-*")) == []      # 无残留 tmp
++
++
++def test_atomic_write_failure_leaves_no_partial(tmp_path, monkeypatch):
++    target = tmp_path / "a.md"
++    vault.atomic_write(target, "原始")
++
++    def boom(*a, **kw):
++        raise OSError("replace_failed")
++
++    monkeypatch.setattr(vault.os, "replace", boom)
++    with pytest.raises(OSError, match="replace_failed"):
++        vault.atomic_write(target, "新内容")
++    assert target.read_text(encoding="utf-8") == "原始"   # 原文件未被破坏
++    assert list(tmp_path.glob(".tmp-*")) == []            # tmp 已清理
++
++
++# --- 快照比较（纯函数，无 IO）-----------------------------------------------
++
++def test_diff_snapshots_categorizes():
++    old = {"a.md": (1.0, 10), "b.md": (2.0, 20), "c.md": (3.0, 30)}
++    new = {"b.md": (2.0, 20), "c.md": (9.0, 30), "d.md": (4.0, 40)}
++    assert vault.diff_snapshots(old, new) == {
++        "added": ["d.md"], "removed": ["a.md"], "changed": ["c.md"],
++    }
++
++
++def test_diff_snapshots_size_only_change_detected():
++    assert vault.diff_snapshots({"a": (1.0, 10)}, {"a": (1.0, 11)})["changed"] == ["a"]
++
++
++def test_diff_snapshots_identical_is_empty():
++    snap = {"a": (1.0, 10), "b": (2.0, 20)}
++    assert vault.diff_snapshots(snap, dict(snap)) == {"added": [], "removed": [], "changed": []}
++
++
++def test_diff_snapshots_is_pure_and_sorted():
++    old, new = {"z": (1, 1)}, {"m": (1, 1), "a": (1, 1)}
++    before_old, before_new = dict(old), dict(new)
++    out = vault.diff_snapshots(old, new)
++    assert out["added"] == ["a", "m"]                    # 有序，便于确定性断言
++    assert old == before_old and new == before_new       # 不改入参
+\ No newline at end of file
