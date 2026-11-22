@@ -1,7 +1,7 @@
 # M5-a 组合根接线与统一调度入口 — 交付清单
 
 分支：`feat/m5-a-dispatch`（新建，已推送）
-提交：`53627c1`（合并 M3 writer boundary）→ `cfc321a`（M5-a 本体）→ `8e85617`（B1/B2 修复）
+提交：`53627c1`（合并 M3 writer boundary）→ `cfc321a`（M5-a 本体）→ `8e85617`（B1/B2 修复）→ `5594a8e`（注释同步）
 基线：`62ff27a`（M4.2 验收通过的 `feat/m4-ingest` 头）
 `feat/m4-ingest` 与 `docs/m41-checklist` 未做任何改动（分别停在 `62ff27a` / `c51b528`）。
 
@@ -103,7 +103,7 @@
 - boss 不是 `config.ROLES` 里的业务角色，工具层对 boss 归属有明确拒绝：`main_chat.submit("task.create", {...})` 实测返回 `{"error":{"code":"invalid_param","message":"boss_owns_no_tasks"}}`。因此 boss 目前可执行的是不依赖 `owner_role` 的动作（知识导入/检索/清单）；boss 代员工写入（如"给销售建一条任务"）需要先定义 owner 归属与 UI 确认策略，留给 M6/M5-b，本轮不擅自改变。
 - 非阻断遗留（未处理）：watcher 失败不重试；`normalize_relpath` 无大小写折叠；m006 不回写历史 `stored_path`；`delete_doc` UI 确认与 `source_credential` 正名留到 M5-b。
 
-## 6. 初审阻断 B1/B2 的修复（`8e85617`）
+## 6. 初审阻断 B1/B2 的修复（`8e85617`，注释同步 `5594a8e`）
 
 初审结论：M3 整合与 writer 注入方向通过，但发现两处"可信对象被公开获取"，不属于信封字段伪造。
 
@@ -132,7 +132,7 @@
 | `red_b2_public_register_agent` | 目标用例 1 failed（`assert not hasattr(... register_agent)`）；探针 `EXPLOIT_OK version=1 owner_role=cfo`（自选角色注册后建任务） |
 | 全量 | `687 passed, 1 deselected`（26.29s） |
 
-原始输出：`docs\M5a-B1B2红证原始输出.txt`、`docs\M5a-B1B2全量测试输出.txt`；增量 diff：`docs\M5a-B1B2修复diff.patch`（`cfc321a..8e85617`，7 文件 +215/−98）。
+原始输出：`docs\M5a-B1B2红证原始输出.txt`、`docs\M5a-B1B2全量测试输出.txt`；增量 diff：`docs\M5a-B1B2修复diff.patch`（`cfc321a..5594a8e`，7 文件 +224/−105）。
 
 ### 6.4 本轮未做的事（按裁决保持范围）
 
