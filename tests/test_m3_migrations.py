@@ -214,7 +214,7 @@ def test_m004_adds_three_nullable_columns(v2_conn):
     assert s["notified_at"] is None and s["recovery_enqueued_at"] is None
 
 
-def test_m004_disclosure_digest_stays_null(db_conn):
+def test_m004_disclosure_digest_stays_null(db_conn, disclosure):
     """M2 披露函数零改动的直接证据：走 request_disclosure 的单 digest 恒 NULL。"""
     from opc_workbench import visibility as vis
     conn = db_conn
@@ -222,6 +222,6 @@ def test_m004_disclosure_digest_stays_null(db_conn):
         cur = conn.execute(
             "INSERT INTO tasks(title,owner_role,visibility,created_at,updated_at) "
             "VALUES('私密','cfo','private',?,?)", (db.now_iso(), db.now_iso()))
-    aid = vis.request_disclosure("tasks", cur.lastrowid, "cfo", "sales", "交接")
+    aid = disclosure.request_disclosure("tasks", cur.lastrowid, "cfo", "sales", "交接")
     row = conn.execute("SELECT digest FROM approvals WHERE id=?", (aid,)).fetchone()
     assert row["digest"] is None

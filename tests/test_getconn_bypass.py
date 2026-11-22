@@ -79,16 +79,16 @@ def test_test_writer_refuses_production_path(isolated_env):
     w.close()
 
 
-def test_m2_disclosure_still_writes_via_controlled_capability(db_conn):
+def test_m2_disclosure_still_writes_via_controlled_capability(db_conn, disclosure):
     """兼容改造后 M2 披露全链仍正常写（语义不变的直接证据）。"""
     rid = _seed(db_conn)
     with db_conn:
         db_conn.execute("UPDATE tasks SET visibility='private', owner_role='cfo' "
                         "WHERE id=?", (rid,))
-    aid = visibility.request_disclosure("tasks", rid, "cfo", "sales", "交接")
+    aid = disclosure.request_disclosure("tasks", rid, "cfo", "sales", "交接")
     assert isinstance(aid, int)
-    visibility.resolve_disclosure(aid, "approved", actor="boss")
-    got = visibility.consume_grant(aid, "sales")
+    disclosure.resolve_disclosure(aid, "approved", actor="boss")
+    got = disclosure.consume_grant(aid, "sales")
     assert got["title"] == "目标行"
     assert db_conn.execute("SELECT status FROM approvals WHERE id=?",
                            (aid,)).fetchone()["status"] == "expired"

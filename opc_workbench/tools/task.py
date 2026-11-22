@@ -121,8 +121,8 @@ class TaskTool:
     def _ident(self, frame_caller, llm_args, trusted_ctx):
         return self._identity_api.resolve_identity(frame_caller, llm_args, trusted_ctx)
 
-    def _writer(self):
-        return object.__getattribute__(self._cas, "_writer")
+    # M3.2① 复审：原 _writer() 是公开方法，任何拿到工具实例的调用方都能
+    # 取出原始 WriteCapability 绕过 CAS。已删除，改为使用点内联取用。
 
     # -- create -------------------------------------------------------------
 
@@ -145,7 +145,7 @@ class TaskTool:
             visibility.validate_persist(role, vis, scope)
         except ValueError as exc:
             return _err("invalid_param", str(exc))
-        writer = self._writer()
+        writer = object.__getattribute__(object.__getattribute__(self, "_cas"), "_writer")
         now = db.now_iso()
         with writer.transaction() as cur:
             if p.idempotency_key is not None:

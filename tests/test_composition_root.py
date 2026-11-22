@@ -15,7 +15,7 @@ from opc_workbench import app, cas, config, db, identity
 def application(isolated_env):
     a = app.build_application()
     yield a
-    a.writer.close()
+    a.close()
 
 
 def test_10_normal_startup_full_chain(application, db_conn):
@@ -75,13 +75,17 @@ def test_5_parallel_identity_rejected_by_application(application, auth_backend, 
                                            ident=ident, title="平行链")
 
 
-def test_6_repeated_build_does_not_replace(application):
-    """⑥ 组合根创建后重复创建 → 应用持有的实例不变；
-    第二次 build 因生产 writer 已占用而 fail fast（不静默降级）。"""
-    before = application.cas_service
-    with pytest.raises(RuntimeError, match="production_writer_already_taken"):
-        app.build_application()
-    assert application.cas_service is before
+def test_6_repeated_build_does_not_replace(isolated_env):
+    """⑥ 启动器内重复装配幂等：同一实例，不重复铸造、不替换既有服务。
+    幂等状态在启动器**实例**上，不在模块全局。"""
+    launcher = app.ApplicationLauncher()
+    application = launcher.build()
+    try:
+        before = application.cas_service
+        assert launcher.build() is application
+        assert application.cas_service is before
+    finally:
+        launcher.close()
 
 
 def test_7_cross_instance_mix_rejected(application, auth_backend, db_conn):

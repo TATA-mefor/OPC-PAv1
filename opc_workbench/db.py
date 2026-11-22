@@ -41,8 +41,8 @@ def get_conn(db_path: Path | str | None = None) -> sqlite3.Connection:
     与 Identity 的生产写旁路，与自建服务伪造授权属同一安全边界，不可作为
     兼容方案保留。现降级为 query_only 只读（与 get_read_conn 同缓存槽）：
     任何 INSERT/UPDATE/DELETE/DDL/BEGIN IMMEDIATE 在执行时被 SQLite 拒绝。
-    写操作唯一路径 = 组合根注入的 WriteCapability（M2 披露写经内部受控
-    写能力 _internal_writer，见下）。
+    写操作唯一路径 = 组合根注入的 WriteCapability（M3.2 起 M2 披露写经
+    显式注入的 DisclosureService，db 不再提供任何内部 writer 获取函数）。
     """
     return get_read_conn(db_path)
 
@@ -83,7 +83,7 @@ def close_thread_conns() -> None:
 # 写能力隔离（M3.1 清单 v10.2 §三.3）
 #
 # 安全依据 = 对象所有权与依赖注入，不是命名/一次性标志：
-# - WriteCapability 不可直构；生产 writer 只由组合根经 _open_production_writer
+# - WriteCapability 不可直构；生产 writer 只由组合根在 build_application
 #   取得并封入应用 CASService（构造期固定，无 setter/rebind）；
 # - 一次性取得**不是安全依据**（同 bind 槽教训）——抢先到者得到的 writer
 #   进不了应用服务，且应用组合根因取得失败而启动失败（fail fast）；
@@ -122,16 +122,20 @@ class WriteCapability:
     def in_transaction(self) -> bool:
         return object.__getattribute__(self, "_conn").in_transaction
 
-    def _bind_authorize(self, authorize) -> None:
-        """装配期一次性绑定 authorize（仅 CASService 构造内部调用）。
+    @property
+    def bound_authorize(self):
+        """组合根绑定的可信 authority（未绑定为 None）。"""
+        return object.__getattribute__(self, "_bound_authorize")
 
-        配对校验依据：生产 writer 只能与同一组合根装配的 authorize 配对；
-        已绑定后任何再次绑定（含同一函数）一律拒绝——伪造 authorize
-        拿生产 writer 构造服务的路径在构造期即断。
+    def _bind_authorize(self, authority) -> None:
+        """组合根取得 writer 后**立即**一次性绑定可信 authority。
+
+        M3.2 复审：绑定前移到组合根，CASService 构造期只校验不绑定，
+        消除"谁先构造谁赢"的先到先得窗口。已绑定后任何再次绑定一律拒绝。
         """
         if object.__getattribute__(self, "_bound_authorize") is not None:
             raise PermissionError("write_capability_already_paired")
-        object.__setattr__(self, "_bound_authorize", authorize)
+        object.__setattr__(self, "_bound_authorize", authority)
 
     def transaction(self):
         """with writer.transaction() as cur: ... —— 单事务写原语。
@@ -189,16 +193,33 @@ class _WriteTransaction:
         return False
 
 
-def _mint_writer(path: Path | str, cap_id: str) -> WriteCapability:
-    """内部铸造：打开专用写连接并封入不可变句柄（失败原样抛错，fail fast）。"""
+def apply_write_pragmas(conn: sqlite3.Connection) -> None:
+    """为**调用方已自行打开**的写连接施加统一 PRAGMA。
+
+    纯配置函数：不打开连接、不铸造句柄、不发放任何能力。
+    组合根自行打开生产连接后调用它，避免 PRAGMA 策略在两处重复。
+    """
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(f"PRAGMA busy_timeout={config.DB_BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _mint_test_writer(path: Path | str, cap_id: str) -> WriteCapability:
+    """**测试专用**铸造：拒绝真实生产库默认路径。
+
+    M3.2① 复审修复：原 _mint_writer 无任何守卫、无一次性限制、cap_id 可
+    任意传入，是比 _open_production_writer 更短的生产写获取入口（已实证
+    可反复铸造指向生产库的 writer 并绕过 CAS 直接写入）。现统一加生产
+    路径守卫，且只供 _open_test_writer 使用。
+    """
     p = Path(path)
+    if p.resolve() == _PRODUCTION_DB_DEFAULT.resolve():
+        raise PermissionError("test_writer_cannot_target_production_db")
     p.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(p), timeout=config.DB_BUSY_TIMEOUT_MS / 1000,
                            check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute(f"PRAGMA busy_timeout={config.DB_BUSY_TIMEOUT_MS}")
-    conn.execute("PRAGMA foreign_keys=ON")
+    apply_write_pragmas(conn)
     w = object.__new__(WriteCapability)
     object.__setattr__(w, "_conn", conn)
     object.__setattr__(w, "_db_path", str(p))
@@ -208,30 +229,28 @@ def _mint_writer(path: Path | str, cap_id: str) -> WriteCapability:
     return w
 
 
-_production_writer_taken = False
-_production_writer_lock = threading.Lock()
-
-
-def _open_production_writer() -> WriteCapability:
-    """组合根专用：进程内首个调用者取得生产写能力，后续调用抛错。
-
-    一次性不是安全依据（见上方注释）；取得失败原样抛错 → 组合根启动失败，
-    不静默降级。路径取 config.DB_PATH（测试经 fixture 重定向到 tmp）。
-    """
-    global _production_writer_taken
-    with _production_writer_lock:
-        if _production_writer_taken:
-            raise RuntimeError("production_writer_already_taken")
-        w = _mint_writer(config.DB_PATH, cap_id="production")
-        _production_writer_taken = True
-        return w
+# ---------------------------------------------------------------------------
+# 生产写能力获取入口：**本模块不提供任何此类函数**（M3.2① 复审修复）
+#
+# 原 _open_production_writer() 已整体删除。它虽有一次性锁，但只拦得住第二个
+# 调用者，不能证明第一个调用者就是组合根——普通业务模块可在 app 启动前抢先
+# 调用它取得 production WriteCapability，再用公开的 transaction() 绕过 CAS
+# 直接写生产库（已实证）。一次性标志不是访问控制。
+#
+# 现行边界：生产 writer 由 app.build_application() **在函数体内部**自行打开
+# 连接并铸造，db 侧不存在任何返回生产写能力的模块级可调用对象。
+# 威胁模型（用户既定口径）：不要求进程内绝对不可绕过的沙箱——直接
+# sqlite3.connect(config.DB_PATH) 或 object.__new__(WriteCapability) 属于
+# 特权逃逸，不在防护范围；要求的是项目 API 中不存在普通模块可直接调用的
+# 生产写能力获取入口。
+# ---------------------------------------------------------------------------
 
 
 def _open_test_writer(db_path: Path | str) -> WriteCapability:
     """测试组合根专用：打开独立测试库写能力，与生产库物理隔离。
 
     对新库自动应用全部迁移（零播种），开箱即有完整 schema。
-    可多次创建（并发用例需要）；不占用生产一次性名额。
+    可多次创建（并发用例需要）。
     **拒绝指向真实生产库默认路径**（防借测试工厂取生产写能力，用户裁决
     第4点）。判定基准是未被测试重定向的默认路径 config.DATA_DIR/personal_agent.db
     的原始值——测试经 fixture 把 config.DB_PATH 重定向到 tmp 后，
@@ -241,44 +260,20 @@ def _open_test_writer(db_path: Path | str) -> WriteCapability:
     if Path(db_path).resolve() == _PRODUCTION_DB_DEFAULT.resolve():
         raise PermissionError("test_writer_cannot_target_production_db")
     init_db(db_path)
-    return _mint_writer(db_path, cap_id=f"test:{db_path}")
+    return _mint_test_writer(db_path, cap_id=f"test:{db_path}")
 
 
 # ---------------------------------------------------------------------------
-# 内部受控写能力（M2 披露写路径专用，用户裁决第2点）
+# M2 披露写能力（M3.2 复审：全局获取入口已删除）
 #
-# 定性：这不是公开工厂——模块级函数任何导入方可调，其约束与 get_conn 旧
-# 入口相同（进程内无硬边界）。保留它的唯一理由是 M2 披露函数签名零改动
-# （无注入参数）且业务语义/状态机不变；写 SQL 仍只经 WriteCapability 事务
-# 原语，与 M3 写路径同款纪律。真正封死的旁路是 get_conn 只读化：普通模块
-# 无法再经兼容符号取得可写连接执行任意 SQL。
+# 原 _internal_writer() / _close_internal_writer() / _internal_writer_local
+# 已整体移除：它们是普通模块可直接调用的生产写能力获取入口，且其 cap_id
+# 不等于 "production"，会跳过 CAS 配对校验（已实证可伪造 boss 越权写入）。
+#
+# 现行边界：生产写能力由组合根在 build_application() 内部铸造并立即绑定
+# 可信 authority；M2 披露写经组合根显式注入
+# visibility.DisclosureService(writer)，本模块不再提供任何披露写获取函数。
 # ---------------------------------------------------------------------------
-
-_internal_writer_local = threading.local()
-
-
-def _internal_writer() -> WriteCapability:
-    """M2 披露写路径的受控写能力（线程本地，指向 config.DB_PATH）。
-
-    仅供 visibility.py 披露三函数内部使用；M3 业务写一律经组合根注入实例。
-    测试经 conftest 重定向 config.DB_PATH 到 tmp 库，天然隔离。
-    """
-    w = getattr(_internal_writer_local, "writer", None)
-    key = str(Path(config.DB_PATH).resolve())
-    if w is None or object.__getattribute__(w, "_db_path") != key:
-        if w is not None:
-            w.close()
-        w = _mint_writer(config.DB_PATH, cap_id="internal:m2_disclosure")
-        _internal_writer_local.writer = w
-    return w
-
-
-def _close_internal_writer() -> None:
-    """测试清理：关闭当前线程内部写能力。"""
-    w = getattr(_internal_writer_local, "writer", None)
-    if w is not None:
-        w.close()
-        _internal_writer_local.writer = None
 
 
 # ---------------------------------------------------------------------------

@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from opc_workbench import config, db, llm_client  # noqa: E402
+from opc_workbench import app, config, db, llm_client, cas, visibility  # noqa: E402
 
 
 class FakeLLM:
@@ -94,8 +94,8 @@ def isolated_env(request, tmp_path, monkeypatch):
     monkeypatch.setattr(audit_log, "_logger", None, raising=False)
     monkeypatch.setattr(audit_log, "_logger_dir", None, raising=False)
 
-    # 生产写能力一次性名额重置（M3 v10.2）：每个测试独立，互不抢占
-    monkeypatch.setattr(db, "_production_writer_taken", False, raising=False)
+    # M3.2①：app 侧已无模块级应用槽/名额，无需重置；
+    # 每个测试自行 build_application() 或持有 ApplicationLauncher 实例。
 
     # socket 层禁外网：仅真回环放行；@live 显式解除。
     is_live = "live" in request.keywords
@@ -135,7 +135,6 @@ def isolated_env(request, tmp_path, monkeypatch):
     yield {"data_dir": data_dir, "vault_dir": vault_dir, "fake_llm": fake}
 
     db.close_thread_conns()
-    db._close_internal_writer()
     llm_client.set_llm(None)
 
 
@@ -230,6 +229,14 @@ def auth_backend():
 def identity_api(auth_backend):
     from opc_workbench import identity
     return identity._build_identity(auth_backend)
+
+
+@pytest.fixture()
+def disclosure(isolated_env):
+    """M2 披露服务：写能力显式注入，隔离测试库（M3.2 修正版 A）。"""
+    w = db._open_test_writer(config.DB_PATH)
+    yield visibility.DisclosureService(w)
+    w.close()
 
 
 @pytest.fixture()

@@ -1,7 +1,7 @@
 """生产写能力隔离专项（M3.1 清单 v10.2 §三.3，九项验收）。
 
 安全依据 = 对象所有权与依赖注入（非命名/导入顺序/一次性标志）：
-- WriteCapability 不可直构；生产 writer 只由组合根经 _open_production_writer 取得；
+- WriteCapability 不可直构；生产 writer 只由组合根在 build_application 内部铸造；
 - db.py 写路径无模块级 get_conn()（读连接 query_only，物理拒绝写 SQL）；
 - 自建 CASService + 伪造 authorize 也没有生产库可写（端到端负向实测）。
 
@@ -14,7 +14,7 @@ import sqlite3
 
 import pytest
 
-from opc_workbench import config, db
+from opc_workbench import app, config, db
 
 
 def _make_writer(db_path):
@@ -54,27 +54,36 @@ def test_db_module_has_no_public_writer_factory():
     assert callable(db.get_read_conn)
     assert not hasattr(db, "open_writer")          # 无公开写工厂
     assert not hasattr(db, "get_write_conn")
-    assert callable(db._open_production_writer)    # 仅组合根内部入口
+    assert not hasattr(db, "_open_production_writer")   # M3.2①：入口已删除
+    assert not hasattr(db, "_mint_writer")              # 无守卫铸造入口已删除
     assert callable(db._open_test_writer)
 
 
-def test_production_writer_first_call_wins_then_raises(isolated_env):
-    """先手抢占语义：首个调用者取得，后续调用抛错（含组合根 → fail fast）。
-    一次性本身不是安全依据（抢到也进不了应用服务），此处验证声明行为。"""
-    w = db._open_production_writer()
-    assert isinstance(w, db.WriteCapability)
-    with pytest.raises(RuntimeError, match="production_writer_already_taken"):
-        db._open_production_writer()
-    w.close()
+def test_production_writer_only_via_composition_root(isolated_env):
+    """M3.2①：生产 writer 只在组合根函数体内铸造，任何公开面都取不到。
+
+    原 _open_production_writer 的"首个调用者赢"语义已废除——一次性锁
+    只拦第二个调用者，不能证明第一个是组合根。工厂只构造不缓存，
+    单例语义由 ApplicationLauncher 实例承担。
+    """
+    a = app.build_application()
+    b = app.build_application()
+    try:
+        assert not hasattr(a, "writer")      # 不暴露原始写能力
+        assert not hasattr(b, "writer")
+        assert b is not a                    # 工厂只构造，各自独立
+    finally:
+        a.close()
+        b.close()
 
 
 def test_production_writer_failure_fail_fast(isolated_env, monkeypatch):
     """⑨ 组合根取得 writer 失败 → 抛错，不静默降级返回 None。"""
     def boom(*a, **kw):
         raise sqlite3.OperationalError("unable to open database file")
-    monkeypatch.setattr(db.sqlite3, "connect", boom)
+    monkeypatch.setattr(app.sqlite3, "connect", boom)
     with pytest.raises(sqlite3.OperationalError):
-        db._open_production_writer()
+        app.build_application()
 
 
 # ---------------------------------------------------------------------------
