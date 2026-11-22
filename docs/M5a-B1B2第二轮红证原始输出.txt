@@ -1,0 +1,95 @@
+# red_b1_ordinary_main: 去掉入口点守卫：普通模块可直接 app.main(adapter)
+# cmd: C:\Users\1\AppData\Local\Doubao\User Data\Default\.doubao\agent_mode\workspace\.sessions\38455536748631554\agents\m_0cweYiCX2vW\wt\m4ingest\.venv\Scripts\python.exe -m pytest tests/test_m5a_dispatch.py -k ordinary_module_cannot_enter_owner_boundary -m not live -q --no-header -p no:cacheprovider
+
+F                                                                        [100%]
+================================== FAILURES ===================================
+______________ test_ordinary_module_cannot_enter_owner_boundary _______________
+
+    def test_ordinary_module_cannot_enter_owner_boundary():
+        """普通模块（测试模块）调用入口 = 被拒，不是"拿到但没用"。"""
+>       with pytest.raises(PermissionError, match="owner_entry_point_only"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'PermissionError'>
+
+tests\test_m5a_dispatch.py:94: Failed
+=========================== short test summary info ===========================
+FAILED tests/test_m5a_dispatch.py::test_ordinary_module_cannot_enter_owner_boundary
+1 failed, 13 deselected in 1.35s
+
+# probe cmd: C:\Users\1\AppData\Local\Doubao\User Data\Default\.doubao\agent_mode\workspace\.sessions\38455536748631554\agents\m_0cweYiCX2vW\wt\m4ingest\.venv\Scripts\python.exe -m pytest tests/test_zz_red_probe.py -m not live -q -s --no-header -p no:cacheprovider
+
+EXPLOIT_OK status=ready
+.
+1 passed in 0.35s
+
+# red_b1_launcher_owner: 守卫去掉且启动器重新暴露 _build_owner()/main_chat
+# cmd: C:\Users\1\AppData\Local\Doubao\User Data\Default\.doubao\agent_mode\workspace\.sessions\38455536748631554\agents\m_0cweYiCX2vW\wt\m4ingest\.venv\Scripts\python.exe -m pytest tests/test_m5a_dispatch.py -k no_boss_source -m not live -q --no-header -p no:cacheprovider
+
+F                                                                        [100%]
+================================== FAILURES ===================================
+__________________ test_build_application_has_no_boss_source __________________
+
+application = <opc_workbench.app.Application object at 0x00000262349E2520>
+
+    def test_build_application_has_no_boss_source(application):
+        assert not hasattr(application.dispatcher, "main_chat")
+        with pytest.raises(AttributeError):
+            application.dispatcher.main_chat
+        with pytest.raises(PermissionError, match="dispatcher_internal_not_exposed"):
+            application.dispatcher._owner_provenance
+        # 调度器里没有可外发的通道/令牌，也没有 owner 提交入口
+        assert not hasattr(application.dispatcher, "owner_submit")
+    
+        launcher = app.ApplicationLauncher()
+        built = launcher.build()
+        try:
+            assert not hasattr(launcher, "main_chat")
+>           assert not hasattr(launcher, "_build_owner")
+E           AssertionError: assert not True
+E            +  where True = hasattr(<opc_workbench.app.ApplicationLauncher object at 0x00000262348AAB00>, '_build_owner')
+
+tests\test_m5a_dispatch.py:86: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_m5a_dispatch.py::test_build_application_has_no_boss_source
+1 failed, 13 deselected in 1.37s
+
+# probe cmd: C:\Users\1\AppData\Local\Doubao\User Data\Default\.doubao\agent_mode\workspace\.sessions\38455536748631554\agents\m_0cweYiCX2vW\wt\m4ingest\.venv\Scripts\python.exe -m pytest tests/test_zz_red_probe.py -m not live -q -s --no-header -p no:cacheprovider
+
+EXPLOIT_OK status=ready
+.
+1 passed in 0.39s
+
+# red_b2_mutable_roles: 角色快照退回公开可变字典 config.AGENT_ROLES
+# cmd: C:\Users\1\AppData\Local\Doubao\User Data\Default\.doubao\agent_mode\workspace\.sessions\38455536748631554\agents\m_0cweYiCX2vW\wt\m4ingest\.venv\Scripts\python.exe -m pytest tests/test_m5a_dispatch.py -k cannot_register_roles -m not live -q --no-header -p no:cacheprovider
+
+F                                                                        [100%]
+================================== FAILURES ===================================
+_________________ test_ordinary_module_cannot_register_roles __________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001F01B982B10>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-305/test_ordinary_module_cannot_re0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-305/test_ordinary_module_cannot_re0/vault')}
+kdim = 8
+
+    def test_ordinary_module_cannot_register_roles(monkeypatch, isolated_env, kdim):
+        """改公开属性 / 换公开函数 / 改快照副本都不能进入装配结果。"""
+        original_snapshot = config.agent_roles
+        # ① 重新绑一个同名公开属性：组合根不读它
+        monkeypatch.setattr(config, "AGENT_ROLES",
+                            {"my-agent": "cfo"}, raising=False)
+        a = app.build_application()
+        try:
+>           with pytest.raises(PermissionError, match="agent_not_provisioned"):
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           Failed: DID NOT RAISE <class 'PermissionError'>
+
+tests\test_m5a_dispatch.py:203: Failed
+=========================== short test summary info ===========================
+FAILED tests/test_m5a_dispatch.py::test_ordinary_module_cannot_register_roles
+1 failed, 13 deselected in 1.37s
+
+# probe cmd: C:\Users\1\AppData\Local\Doubao\User Data\Default\.doubao\agent_mode\workspace\.sessions\38455536748631554\agents\m_0cweYiCX2vW\wt\m4ingest\.venv\Scripts\python.exe -m pytest tests/test_zz_red_probe.py -m not live -q -s --no-header -p no:cacheprovider
+
+EXPLOIT_OK version=1 owner_role=cfo
+.
+1 passed in 0.35s
+

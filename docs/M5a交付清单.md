@@ -146,3 +146,84 @@
 - `_compose(with_owner_channel=True)` 仍是模块内函数，同进程代码理论上可直接 `import` 调用；当前防护是"私有命名 + 不写入任何公开 API"，主入口只经 `main()`。若要更强，可加"每进程仅允许 main 调用一次"的运行期守卫，本轮未擅自增加。
 - `ApplicationLauncher._build_owner()` 为私有方法；测试统一走 `app.main()`。若先 `build()` 再 `main()`，启动器复用已有应用且无通道，`launcher.main_chat` 抛 `owner_channel_not_launched`（该用法的语义尚未定义）。
 - `AGENT_ROLES` 默认空表意味着 v1 生产没有员工 Agent 通道；真实 Agent 进程的注册来源（配置文件/部署注入）留到 M6 定义。
+
+## 7. 设计裁决（冻结）：老板来源是消息属性，不是通道对象
+
+冻结日期 2026-11-23，适用于 M5-a 及其后里程碑；改动此裁决需重新裁决，不得在实现层自行放宽。
+
+### 7.1 老板来源原本承担的职责
+
+只区分指令来源，不做自然人识别、不做登录：
+
+| 来源 | 系统识别角色 | 权限含义 |
+| --- | --- | --- |
+| 主聊天窗口 | `boss` | 老板直接下达的指令 |
+| 员工 Agent | 对应员工角色 | 按员工权限执行 |
+| watcher | `system` | 后台维护，不具备老板权限 |
+| 普通脚本 | 无可信身份 | 不得获得老板权限 |
+
+因此：主聊天窗口的「删除这份知识文档」可进入老板授权路径；销售 Agent 转述「老板让我删」仍是销售 Agent 的消息，不继承老板权限；watcher 只能做维护操作。
+
+### 7.2 裁决结论
+
+- 取消「老板通道对象」：删除 `MainChatChannel`，不暴露 `main_chat` 属性，不在业务代码间传递老板句柄。
+- 全工作台只有一个业务入口：`Dispatcher.dispatch()`。
+- 老板来源改为**消息携带的可信来源属性**：主聊天入口在框架边界内注入 `source=main_chat`，并由此得到 `actor_role=boss`。
+- Agent 消息按直接发起者角色授权；watcher 走 `system`；普通脚本无可信身份。
+- 不增加登录、密码或老板身份认证（v1 口径不变：主对话窗口即 boss）。
+- 前提：普通代码不能自己构造 `source="main_chat"` 就拿到老板权限。
+
+### 7.3 由此得到的两条实现约束
+
+1. 来源令牌只能在可信启动边界铸造，且只交给主窗口适配器一次，不经普通 `Application`/`ApplicationLauncher` API 暴露。
+2. Agent 角色注册表必须是可信配置加载后生成的不可变快照，运行期不可写。
+
+## 8. 第二轮修复（`0a7b717`，基于 `5594a8e`）
+
+### 8.1 B1：老板来源回归消息属性
+
+- `dispatch.py`：删 `MainChatChannel`；`MessageEnvelope.__slots__` 为 `_source/_agent_id/_message_id/_parent_message_id/_origin`，不提供 `origin` property；`_mint_envelope(*, source, agent_id, parent_message_id, origin)` 为模块私有，`AgentChannel` 铸造时把自身写入 `origin`。`Dispatcher` 以 `_owner_provenance` 取代原通道字段，`__getattribute__` 拒绝 `_registry/_backend/_owner_credential/_owner_provenance`（`dispatcher_internal_not_exposed`）；`_resolve_main_chat` 要求 `envelope._origin is provenance`，否则 `PermissionError("main_chat_provenance_required")`；`_resolve_agent` 要求 `channels.get(agent_id) is envelope._origin`，否则 `agent_envelope_mismatch`，角色取自快照，未登记 → `agent_not_provisioned`。角色解析链不变：`backend.authenticate` → `register_session` → `issue_proof` → `mint_boss_context`。
+- `app.py`：新增入口守卫 `_require_entry_point()`，按 `f_code.co_filename == _APP_FILE` 识别本模块帧，扫描中遇 `__name__ == "__main__"` 放行，遇非本文件帧抛 `PermissionError("owner_entry_point_only")`；`_claim_owner_session()/_release_owner_session()` 保证每进程只铸一次（重复 → `owner_session_already_active`）。`_compose(*, with_owner_channel)` 在 `True` 时先过守卫与占位，装配异常时先关连接再释放占位，并返回 `(application, owner_submit)`；`owner_submit` 是闭包，内部用 `_mint_envelope(source="main_chat", agent_id=None, parent_message_id=None, origin=provenance)` 后 `dispatch`。`ApplicationLauncher` 收敛为 `__slots__=("_application","_lock")` 加 `build()/close()`，`__getattribute__` 拒绝 `_application`（`launcher_application_not_exposed`）。`main(adapter=None)` 过守卫后 `_compose(True)`、`start_background()`、`adapter.bind(owner_submit)`、注册 `atexit`，返回的是有界 `Application`，**不返回提交端口**。
+- 删除上一轮的 `ApplicationLauncher._build_owner()` 与 `main_chat` property；`build_application()` 仍为 `_compose(False)[0]`，无老板来源。
+
+### 8.2 B2：角色注册表改为导入期不可变快照
+
+- `config.py`：删可变 `AGENT_ROLES` 与 `_reload_agent_roles`；新增 `AGENT_ROLES_ENV="OPC_AGENT_ROLES"`、`_parse_agent_roles(raw)`（空串 → `{}`，JSON 必须是 object，agent_id 为非空 str，role 必须在 `ROLES` 内，否则 `ValueError`）；`_AGENT_ROLES_SNAPSHOT = MappingProxyType(_parse_agent_roles(os.getenv(AGENT_ROLES_ENV, "")))` 在导入期固化；`agent_roles()` 只返回该快照，快照本身无 `update`/`__setitem__`。
+- `build_dispatcher(..., agent_roles=None, ...)` 再校验角色合法性与 `ROLES` 一致，并再包一层 `MappingProxyType(dict(...))` 存入调度器，配置快照与调度器快照互不影响。
+- 测试夹具在导入 `opc_workbench` 之前用 `os.environ.setdefault("OPC_AGENT_ROLES", ...)` 注入 `test-agent-<role>` 十角色；生产路径默认空表。
+
+### 8.3 验收：五条红证逐条对账
+
+| 裁决要求 | 落点 | 当前结果 |
+| --- | --- | --- |
+| ① 普通模块调 `app.main()` 不得老板通道 | `test_ordinary_module_cannot_enter_owner_boundary`（断言 `app.main()` 与 `_compose(True)` 均抛 `owner_entry_point_only`）；`test_owner_session_is_entry_scoped` | 通过 |
+| ② 普通模块调 `launcher._build_owner()` 不得老板通道 | `test_build_application_has_no_boss_source`（断言启动器既无 `main_chat` 也无 `_build_owner`） | 通过（方法已删除） |
+| ③ 改角色注册表不能自封 CFO | `test_ordinary_module_cannot_register_roles`、`test_agent_roles_come_from_configured_snapshot`（快照无写入口、赋值抛 `TypeError`）、`test_production_registry_is_empty_by_default`（子进程默认空表） | 通过 |
+| ④ 正常主窗口 `main_chat → knowledge.import_doc → knowledge.search` | `test_main_chat_import_then_search`（经 `main(adapter)` 的 `bind` 端口提交） | 通过 |
+| ⑤ 已配置 Agent 角色固定不可改写 | `test_agent_roles_come_from_configured_snapshot`、`test_agent_cannot_impersonate_another_agent`、`test_agent_content_cannot_claim_boss` | 通过 |
+
+变体红证（把当轮保护改回上一轮形态后复跑目标用例 + 利用探针）：
+
+| 变体 | 撤掉的保护 | 目标用例 | 探针 |
+| --- | --- | --- | --- |
+| `red_b1_ordinary_main` | `_require_entry_point` 函数体改为 `return` | `DID NOT RAISE PermissionError` | 普通测试模块直接 `app.main(adapter)` 后导入 → `EXPLOIT_OK status=ready` |
+| `red_b1_launcher_owner` | 同上，且启动器重新长出 `_build_owner()`/`main_chat` | `assert not hasattr(launcher, "_build_owner")` 失败 | `launcher._build_owner()` 后 `launcher.main_chat("knowledge.import_doc", ...)` → `EXPLOIT_OK status=ready` |
+| `red_b2_mutable_roles` | `agent_roles()` 改回返回公开可变 `AGENT_ROLES` 字典 | `DID NOT RAISE ... agent_not_provisioned` | 写 `config.AGENT_ROLES["attacker"]="cfo"` 后建任务 → `version=1 owner_role=cfo` |
+
+三条变体都变红且探针可复现利用，说明当轮保护是该路径上的唯一拦截点；也说明 ①-③ 不是靠命名约定而是靠可验证的拒绝路径成立。
+
+### 8.4 边界与残留披露
+
+- 已明确边界：Python 同进程内无法防御反射、内存改写、直接改运行时对象；本次只封项目提供的普通调用 API，不承诺 OS 级隔离。
+- 未定口径（需裁决）：`python -c` 或任意以 `__main__` 执行的脚本调用 `app.main(adapter)` 当前会被视作入口并取得提交端口。若要求严格「只有 `python -m opc_workbench.app` 自身算入口」，需把守卫从「`__main__` 帧」收窄到「入口模块路径 + `-m` 自运行」，本轮未擅自收窄。
+- `main()` 无 adapter 时（`__main__` 块即 `main()`）令牌铸造后无处交付、端口丢弃；M6 Gradio 适配器的正式契约（`bind(submit)` 还是适配器对象）未定。
+- `Application.close()` 无条件调用 `_release_owner_session()`（含 `build_application()` 产出的无 owner 应用），当前幂等无害，语义是否接受未确认。
+- `AGENT_ROLES` 真实来源定为环境变量 `OPC_AGENT_ROLES`（JSON），v1 默认空表；真实 Agent 进程注册来源仍按原裁决留到 M6。
+- 未做项：未合 `master`、未打 tag、未动 M4（`feat/m4-ingest@62ff27a`）、未重做 `KnowledgeService`/watcher/CAS/Identity。
+
+### 8.5 本轮材料
+
+- 增量 diff：`docs\M5a-B1B2第二轮修复diff.patch`（`5594a8e..0a7b717`，6 文件 +366/−184）。
+- 红证原始输出：`docs\M5a-B1B2第二轮红证原始输出.txt`（三变体的目标用例与探针输出）。
+- 全量测试：`docs\M5a-B1B2第二轮全量测试输出.txt`（`691 passed, 1 deselected`，34.73s）。
+

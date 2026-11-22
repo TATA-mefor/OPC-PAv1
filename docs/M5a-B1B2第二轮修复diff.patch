@@ -1,0 +1,944 @@
+diff --git a/opc_workbench/app.py b/opc_workbench/app.py
+index dad335c..03d66dd 100644
+--- a/opc_workbench/app.py
++++ b/opc_workbench/app.py
+@@ -17,27 +17,76 @@
+   / Dispatcher 都不公开原始 WriteCapability；普通属性访问取不到。
+ - 业务调用只能经 `Application.dispatcher.dispatch(envelope, ...)` 或两个
+   Channel 句柄；原始工具注册表不对外暴露。
+-- boss 身份只由主对话入口（MainChatChannel → OwnerChannelBackend →
+-  register_session → issue_proof → mint_boss_context）产出；本机单用户 v1
+-  不校验自然人身份，也**不接受**任何调用方传入 source="main_chat"。
++- boss 身份只由主聊天入口（OwnerChannelBackend → register_session →
++  issue_proof → mint_boss_context）产出；来源令牌由组合根在 `__main__` 入口
++  装配时铸造，只交给主窗口适配器持有的提交端口——没有可获取的通道对象，
++  也不接受任何调用方传入 source="main_chat"。
+ - `confirm_action` 继续 fail closed（delete_doc 的 UI 确认留到 M5-b）。
+ 
+ 生命周期：build_application() 只构造不缓存；进程级单例与关停由
+-ApplicationLauncher 实例持有，启动器由 main 创建并持有。
++ApplicationLauncher 实例持有；boss 来源只在 `__main__` 入口（main）铸造
++一次，并直接交给主窗口适配器。
+ """
+ from __future__ import annotations
+ 
+ import atexit
++import os
+ import secrets
+ import sqlite3
++import sys
+ import threading
+ 
+ from . import cas, config, db, identity, llm_client, visibility
+-from .dispatch import build_dispatcher
++from .config import agent_roles as _agent_roles_snapshot
++from .dispatch import _mint_envelope, build_dispatcher
+ from .knowledge_service import KnowledgeService
+ from .vault_watcher import VaultWatcher
+ 
+ 
++# ---------------------------------------------------------------------------
++# 可信启动边界（M5-a B1）
++# 主聊天来源不是"可获取的通道对象"，而是框架在 `__main__` 入口装配时铸造的
++# 内部令牌 + 提交端口。下面两个守卫保证：普通模块既调不到带 boss 来源的
++# 装配，也不能在进程内并存第二个 owner 会话。
++# ---------------------------------------------------------------------------
++_ENTRY_POINT_MODULE = "__main__"
++_APP_FILE = os.path.abspath(__file__)
++_OWNER_SESSION_LOCK = threading.Lock()
++_OWNER_SESSION_STATE = {"active": False}
++
++
++def _require_entry_point() -> None:
++    """调用链上必须出现真正的进程入口帧，否则拒绝。
++
++    两种合法形态：
++    - `python -m opc_workbench.app`：本模块自身以 `__main__` 身份执行；
++    - 入口脚本/适配层以 `__main__` 身份调用 `main()`。
++    普通被导入模块（`__name__` 为包名或测试模块名）一律拒绝。
++    """
++    frame = sys._getframe(1)
++    while frame is not None:
++        name = frame.f_globals.get("__name__")
++        if name == _ENTRY_POINT_MODULE:
++            return
++        if os.path.abspath(frame.f_code.co_filename) != _APP_FILE:
++            break
++        frame = frame.f_back
++    raise PermissionError("owner_entry_point_only")
++
++
++def _claim_owner_session() -> None:
++    with _OWNER_SESSION_LOCK:
++        if _OWNER_SESSION_STATE["active"]:
++            raise PermissionError("owner_session_already_active")
++        _OWNER_SESSION_STATE["active"] = True
++
++
++def _release_owner_session() -> None:
++    with _OWNER_SESSION_LOCK:
++        _OWNER_SESSION_STATE["active"] = False
++
++
++
+ class _OwnerEntryCredential:
+     """主对话入口凭证：不透明对象，只由 OwnerChannelBackend 持有并交给组合根。
+ 
+@@ -173,23 +222,29 @@ class Application:
+         object.__setattr__(self, "_closed", True)
+         object.__getattribute__(self, "_watcher").stop()
+         self.cas_service.close()
++        _release_owner_session()
+ 
+ 
+ def _compose(*, with_owner_channel: bool):
+     """内部装配：返回 (Application, MainChatChannel | None)。
+ 
+-    只有可信启动入口（main → ApplicationLauncher._build_owner）才请求带 boss
+-    通道的实例；公开的 build_application() 永远拿不到通道。
++    带 boss 通道的装配是**入口点专属**：调用链上最近的非本模块帧必须是
++    `__main__`（真实进程入口），且同一进程只允许一个活动 owner 会话。
++    因此普通模块直接 import 调用本函数也拿不到通道。
+     """
+-    db.init_db()                                   # 迁移先行（零播种）
+-    backend = OwnerChannelBackend()                # app 内部创建
+-    identity_api = identity._build_identity(backend)
+-    # 生产写能力铸造：**只存在于本函数体内部**，不暴露为任何模块级可调用
+-    # 对象，也不经 Application / CASService / 工具实例向外泄露。
+-    _conn = sqlite3.connect(str(config.DB_PATH),
+-                            timeout=config.DB_BUSY_TIMEOUT_MS / 1000,
+-                            check_same_thread=False)
++    if with_owner_channel:
++        _require_entry_point()
++        _claim_owner_session()
++    _conn = None
+     try:
++        db.init_db()                                   # 迁移先行（零播种）
++        backend = OwnerChannelBackend()                # app 内部创建
++        identity_api = identity._build_identity(backend)
++        # 生产写能力铸造：**只存在于本函数体内部**，不暴露为任何模块级可调用
++        # 对象，也不经 Application / CASService / 工具实例向外泄露。
++        _conn = sqlite3.connect(str(config.DB_PATH),
++                                timeout=config.DB_BUSY_TIMEOUT_MS / 1000,
++                                check_same_thread=False)
+         _conn.row_factory = sqlite3.Row
+         db.apply_write_pragmas(_conn)
+         production_writer = object.__new__(db.WriteCapability)
+@@ -213,19 +268,29 @@ def _compose(*, with_owner_channel: bool):
+         dispatcher = build_dispatcher(
+             identity_api=identity_api, registry=registry, backend=backend,
+             owner_credential=backend._entry_credential(),
+-            agent_roles=config.AGENT_ROLES,
++            agent_roles=_agent_roles_snapshot(),
+             main_chat=with_owner_channel)
+         watcher = VaultWatcher(knowledge_service)
+         application = Application(
+             identity_api=identity_api, cas_service=cas_service,
+             disclosure=disclosure, dispatcher=dispatcher, watcher=watcher)
+-        channel = None
++        owner_submit = None
+         if with_owner_channel:
+-            channel = object.__getattribute__(dispatcher, "_main_chat")
+-        return application, channel
++            provenance = object.__getattribute__(dispatcher, "_owner_provenance")
++
++            def owner_submit(action: str, params: dict | None = None) -> dict:
++                """主聊天提交端口：来源令牌由框架在此注入，调用方无从指定。"""
++                env = _mint_envelope(source="main_chat", agent_id=None,
++                                     parent_message_id=None, origin=provenance)
++                return dispatcher.dispatch(env, action, params)
++
++        return application, owner_submit
+     except BaseException:
+         # 装配中途失败：关闭已打开的生产连接后再抛，绝不遗留悬挂连接
+-        _conn.close()
++        if _conn is not None:
++            _conn.close()
++        if with_owner_channel:
++            _release_owner_session()
+         raise
+ 
+ 
+@@ -233,40 +298,29 @@ def build_application() -> Application:
+     """公开组装工厂：**只构造，不缓存，也不产出 boss 通道**。
+ 
+     普通业务模块即便反复调用，也只得到有界服务集合；主对话通道只能由
+-    可信启动入口（main）创建并交给主窗口适配器。
++    `__main__` 进程入口铸造，并直接交给主窗口适配器。
+     """
+     return _compose(with_owner_channel=False)[0]
+ 
+ 
+-
+ class ApplicationLauncher:
+-    """可信启动入口持有的生命周期对象：单例装配 + 关停 + boss 通道。
++    """进程级生命周期持有者：单例装配 + 关停。
+ 
+-    `build()` 只装配有界应用（**不含**主对话通道）；`main()` 走
+-    `_build_owner()`，额外铸造并持有 MainChatChannel，供主窗口适配器使用。
+-    普通模块调用 `build()` 或 `build_application()` 都拿不到 boss 通道。
++    `build()` 只装配有界应用（**不含**主对话通道）；boss 通道只由
++    `main()` 在入口点铸造并交给适配器，不挂在启动器上。
+     """
+ 
+-    __slots__ = ("_application", "_main_chat", "_lock")
++    __slots__ = ("_application", "_lock")
+ 
+     def __init__(self):
+         object.__setattr__(self, "_application", None)
+-        object.__setattr__(self, "_main_chat", None)
+         object.__setattr__(self, "_lock", threading.Lock())
+ 
+     def __getattribute__(self, name):
+-        if name in ("_application", "_main_chat"):
+-            raise PermissionError("launcher_internal_not_exposed")
++        if name == "_application":
++            raise PermissionError("launcher_application_not_exposed")
+         return object.__getattribute__(self, name)
+ 
+-    @property
+-    def main_chat(self):
+-        """主对话句柄：只有经 main() 启动的启动器才持有，否则拒绝。"""
+-        channel = object.__getattribute__(self, "_main_chat")
+-        if channel is None:
+-            raise PermissionError("owner_channel_not_launched")
+-        return channel
+-
+     def build(self) -> Application:
+         with object.__getattribute__(self, "_lock"):
+             current = object.__getattribute__(self, "_application")
+@@ -276,17 +330,6 @@ class ApplicationLauncher:
+             object.__setattr__(self, "_application", application)
+             return application
+ 
+-    def _build_owner(self) -> Application:
+-        """可信启动入口专用：装配应用并持有 boss 通道。"""
+-        with object.__getattribute__(self, "_lock"):
+-            current = object.__getattribute__(self, "_application")
+-            if current is not None:
+-                return current
+-            application, channel = _compose(with_owner_channel=True)
+-            object.__setattr__(self, "_application", application)
+-            object.__setattr__(self, "_main_chat", channel)
+-            return application
+-
+     def close(self) -> None:
+         """幂等关停：先清状态再关连接，避免关 stopped 实例被再次取用。"""
+         with object.__getattribute__(self, "_lock"):
+@@ -294,20 +337,23 @@ class ApplicationLauncher:
+             if current is None:
+                 return
+             object.__setattr__(self, "_application", None)
+-            object.__setattr__(self, "_main_chat", None)
+             current.close()
+ 
+ 
+-def main() -> ApplicationLauncher:
+-    """进程入口（可信启动点）：装配一次、铸造 boss 通道、启动后台扫描。
++def main(adapter=None) -> Application:
++    """进程入口（唯一可信启动点）：只有 `__main__` 帧可调用。
+ 
+-    通道留给主窗口适配器（M6 Gradio）；退出时由 atexit / 显式 close 收尾。
++    装配一次后，把**主聊天提交端口**（普通函数，来源由框架注入）交给
++    `adapter.bind(submit)`（主窗口适配器，M6 接 Gradio）；不返回、不挂载
++    任何"老板通道对象"。返回有界 Application 供显式收尾（不含 boss 能力）。
+     """
+-    launcher = ApplicationLauncher()
+-    application = launcher._build_owner()
++    _require_entry_point()
++    application, owner_submit = _compose(with_owner_channel=True)
+     application.start_background()
+-    atexit.register(launcher.close)
+-    return launcher
++    if adapter is not None:
++        adapter.bind(owner_submit)
++    atexit.register(application.close)
++    return application
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/opc_workbench/config.py b/opc_workbench/config.py
+index 3a124d8..2bdcde1 100644
+--- a/opc_workbench/config.py
++++ b/opc_workbench/config.py
+@@ -8,6 +8,7 @@ from __future__ import annotations
+ 
+ import os
+ from pathlib import Path
++from types import MappingProxyType
+ 
+ from dotenv import load_dotenv
+ 
+@@ -129,10 +130,41 @@ DEFAULT_PRIVATE_ROLES = frozenset(
+ )
+ 
+ # 可信 Agent 注册表（M5-a B2）：agent_id → 角色。
+-# 只由框架/部署方在启动前写入（组合根读取快照）；业务调用方不能通过任何
+-# 接口追加条目或指定角色。v1 还没有真实员工 Agent 进程，故默认空表：
+-# 生产里不预置任何角色通道，调用方也就拿不到 cfo/sales 的身份句柄。
+-AGENT_ROLES: dict[str, str] = {}
++# 唯一来源是**进程启动时**的部署配置 `OPC_AGENT_ROLES`（JSON 对象字符串），
++# 在模块导入时解析成不可变快照；本模块不提供运行期写入/重载接口。
++# 组合根在装配时取副本传给 dispatcher，因此运行期改环境变量或改公开属性都
++# 不会影响已/新装配实例。v1 无真实员工 Agent，默认空快照。
++AGENT_ROLES_ENV = "OPC_AGENT_ROLES"
++
++
++def _parse_agent_roles(raw: str) -> dict[str, str]:
++    import json
++    if not raw.strip():
++        return {}
++    try:
++        data = json.loads(raw)
++    except json.JSONDecodeError as exc:
++        raise ValueError(f"invalid_agent_roles_json:{exc}") from exc
++    if not isinstance(data, dict):
++        raise ValueError("invalid_agent_roles_json:not_object")
++    snapshot: dict[str, str] = {}
++    for agent_id, role in data.items():
++        if not isinstance(agent_id, str) or not agent_id:
++            raise ValueError("invalid_agent_id")
++        if role not in ROLES:
++            raise ValueError(f"unknown_role:{role!r}")
++        snapshot[agent_id] = role
++    return snapshot
++
++
++_AGENT_ROLES_SNAPSHOT = MappingProxyType(
++    _parse_agent_roles(os.getenv(AGENT_ROLES_ENV, "")))
++
++
++def agent_roles():
++    """返回启动时固化的角色快照（不可变；没有写入方法）。"""
++    return _AGENT_ROLES_SNAPSHOT
++
+ 
+ 
+ # 敏感词升级表（PRD §4.2 规则2，M2.1 v3 §四.7）：命中即 private，宁可错杀，
+diff --git a/opc_workbench/dispatch.py b/opc_workbench/dispatch.py
+index cee9013..66ae184 100644
+--- a/opc_workbench/dispatch.py
++++ b/opc_workbench/dispatch.py
+@@ -12,19 +12,21 @@
+   转述不继承原消息权限：Agent 转述老板要求，仍按该 Agent 注册角色授权。
+ 
+ 两种来源：
+-- `main_chat`：`MainChatChannel` 只由可信启动入口（`app.main()`）取得，
+-  持有组合根铸造的一次性入口凭证，经 OwnerChannelBackend → register_session →
+-  issue_proof → mint_boss_context → resolve_identity("boss") 得到 boss 身份。
+-  调度器不公开该通道（`_main_chat` 拒绝普通属性访问）。
+-- `agent_message`：角色由组合根传入的 `config.AGENT_ROLES` 快照决定，
+-  调度器不提供注册入口（`agent_channel(agent_id)` 只取已登记句柄），
+-  信封里的角色字段不被采信。
++- `main_chat`：来源由**主聊天入口在框架边界内注入**——组合根在
++  `__main__` 入口装配时铸造一枚内部来源令牌（provenance），并只把
++  `submit(action, params)` 提交端口交给主窗口适配器；信封携带该令牌，
++  `Dispatcher` 校验令牌同一性后才走 boss 身份链（OwnerChannelBackend →
++  register_session → issue_proof → mint_boss_context → resolve_identity）。
++  没有"老板通道对象"，也不存在可另行获取的句柄。
++- `agent_message`：角色由组合根传入的 `config.agent_roles()` 不可变快照决定，
++  信封必须由该 agent_id 自己的 `AgentChannel` 铸造；调度器没有注册入口。
+ 
+ `parent_message_id` 只做追踪，绝不参与授权。
+ """
+ from __future__ import annotations
+ 
+ import uuid
++from types import MappingProxyType
+ 
+ from . import audit_log, config
+ 
+@@ -36,10 +38,12 @@ def _err(code: str, message: str = "") -> dict:
+ class MessageEnvelope:
+     """框架铸造的消息信封（不可直构、不可变）。
+ 
+-    只承载来源与追踪信息；**不承载正文**，因此不存在"正文自称 boss"的入口。
++    只承载来源、来源令牌与追踪信息；**不承载正文**，因此不存在
++    "正文自称 boss"的入口；`_origin` 不对外提供 property。
+     """
+ 
+-    __slots__ = ("_source", "_agent_id", "_message_id", "_parent_message_id", "_channel")
++    __slots__ = ("_source", "_agent_id", "_message_id", "_parent_message_id",
++                 "_origin")
+ 
+     def __init__(self, *a, **kw):
+         raise PermissionError("message_envelope_direct_construction_forbidden")
+@@ -64,9 +68,10 @@ class MessageEnvelope:
+         return object.__getattribute__(self, "_parent_message_id")
+ 
+ 
+-def _mint_envelope(*, source: str, agent_id: str | None, parent_message_id: str | None,
+-                   channel: object) -> MessageEnvelope:
+-    """内部铸造入口（模块私有）：只有两个 Channel 句柄会调用。"""
++def _mint_envelope(*, source: str, agent_id: str | None,
++                   parent_message_id: str | None,
++                   origin: object) -> MessageEnvelope:
++    """内部铸造入口（模块私有）：只由主聊天提交端口与 AgentChannel 调用。"""
+     if source not in ("main_chat", "agent_message"):
+         raise ValueError(f"invalid_source:{source!r}")
+     env = object.__new__(MessageEnvelope)
+@@ -74,38 +79,10 @@ def _mint_envelope(*, source: str, agent_id: str | None, parent_message_id: str
+     object.__setattr__(env, "_agent_id", agent_id)
+     object.__setattr__(env, "_message_id", uuid.uuid4().hex)
+     object.__setattr__(env, "_parent_message_id", parent_message_id)
+-    object.__setattr__(env, "_channel", channel)
++    object.__setattr__(env, "_origin", origin)
+     return env
+ 
+ 
+-class MainChatChannel:
+-    """主对话入口句柄：组合根创建并交给主窗口适配层。
+-
+-    只暴露 `submit()`；入口凭证与身份链细节不外露。**不接受外部传入的
+-    source/role**——来源硬编码为 main_chat，身份由 OwnerChannelBackend 签发。
+-    """
+-
+-    __slots__ = ("_dispatcher", "_credential")
+-
+-    def __init__(self, *a, **kw):
+-        raise PermissionError("main_chat_channel_direct_construction_forbidden")
+-
+-    def __setattr__(self, *a):
+-        raise PermissionError("main_chat_channel_immutable")
+-
+-    def __getattribute__(self, name):
+-        if name == "_credential":
+-            raise PermissionError("main_chat_credential_not_exposed")
+-        return object.__getattribute__(self, name)
+-
+-    def submit(self, action: str, params: dict | None = None) -> dict:
+-        """提交一次老板动作。params 原样进工具校验，绝不影响来源与角色。"""
+-        dispatcher = object.__getattribute__(self, "_dispatcher")
+-        env = _mint_envelope(source="main_chat", agent_id=None,
+-                             parent_message_id=None, channel=self)
+-        return dispatcher.dispatch(env, action, params)
+-
+-
+ class AgentChannel:
+     """员工 Agent 句柄：只对 `config.AGENT_ROLES` 已登记的 agent_id 发放。
+ 
+@@ -130,21 +107,22 @@ class AgentChannel:
+         dispatcher = object.__getattribute__(self, "_dispatcher")
+         env = _mint_envelope(source="agent_message",
+                              agent_id=object.__getattribute__(self, "_agent_id"),
+-                             parent_message_id=parent_message_id, channel=self)
++                             parent_message_id=parent_message_id, origin=self)
+         return dispatcher.dispatch(env, action, params)
+ 
+ 
+ class Dispatcher:
+     """调度器：唯一业务入口 + 身份解析 + 注册表隔离。
+ 
+-    - `_registry` / `_backend` / `_owner_credential` 经普通属性访问一律拒绝，
+-      防止拿到调度器后绕过 dispatch 直接取工具闭包或入口凭证；
++    - `_registry` / `_backend` / `_owner_credential` / `_owner_provenance`
++      经普通属性访问一律拒绝，防止拿到调度器后绕过 dispatch 直接取工具闭包、
++      入口凭证或主聊天来源令牌；
+     - `schemas()` 只返回 schema 副本，供 Function Calling 使用，不含 handler。
+     """
+ 
+     __slots__ = ("_identity_api", "_registry", "_backend", "_owner_credential",
+                  "_agent_roles", "_channels", "_agent_lock", "_owner_session_id",
+-                 "_main_chat", "_closed")
++                 "_owner_provenance", "_closed")
+ 
+     def __init__(self, *a, **kw):
+         raise PermissionError("dispatcher_direct_construction_forbidden")
+@@ -153,7 +131,8 @@ class Dispatcher:
+         raise PermissionError("dispatcher_immutable")
+ 
+     def __getattribute__(self, name):
+-        if name in ("_registry", "_backend", "_owner_credential", "_main_chat"):
++        if name in ("_registry", "_backend", "_owner_credential",
++                    "_owner_provenance"):
+             raise PermissionError("dispatcher_internal_not_exposed")
+         return object.__getattribute__(self, name)
+ 
+@@ -223,10 +202,10 @@ class Dispatcher:
+         raise PermissionError(f"unknown_source:{source!r}")
+ 
+     def _resolve_main_chat(self, envelope):
+-        main_chat = object.__getattribute__(self, "_main_chat")
+-        channel = object.__getattribute__(envelope, "_channel")
+-        if main_chat is None or channel is not main_chat:
+-            raise PermissionError("main_chat_envelope_required")
++        provenance = object.__getattribute__(self, "_owner_provenance")
++        origin = object.__getattribute__(envelope, "_origin")
++        if provenance is None or origin is not provenance:
++            raise PermissionError("main_chat_provenance_required")
+         identity_api = object.__getattribute__(self, "_identity_api")
+         backend = object.__getattribute__(self, "_backend")
+         credential = object.__getattribute__(self, "_owner_credential")
+@@ -244,10 +223,11 @@ class Dispatcher:
+         return "boss", ctx
+ 
+     def _resolve_agent(self, envelope):
+-        if object.__getattribute__(envelope, "_channel").agent_id != \
+-                object.__getattribute__(envelope, "_agent_id"):
+-            raise PermissionError("agent_envelope_mismatch")
+         agent_id = object.__getattribute__(envelope, "_agent_id")
++        origin = object.__getattribute__(envelope, "_origin")
++        channels = object.__getattribute__(self, "_channels")
++        if channels.get(agent_id) is not origin:
++            raise PermissionError("agent_envelope_mismatch")
+         roles = object.__getattribute__(self, "_agent_roles")
+         role = roles.get(agent_id)
+         if role is None:
+@@ -262,9 +242,10 @@ def build_dispatcher(*, identity_api, registry: dict, backend, owner_credential,
+                      main_chat: bool = False) -> Dispatcher:
+     """组合根内部构造入口：装配身份链、入口凭证与注册表。
+ 
+-    `agent_roles` 是可信注册表的**快照**（组合根读取 `config.AGENT_ROLES`），
+-    之后调用方无法通过调度器改写。
+-    `main_chat=True` 时才铸造主对话句柄，由可信启动入口持有。
++    `agent_roles` 是**不可变角色快照**（`config.agent_roles()` 提供），
++    构造时复制；调用方无法通过调度器改写。
++    `main_chat=True` 时额外铸造一枚内部来源令牌，只有组合根能拿到并交给
++    主聊天提交端口；调度器不持有任何可外发句柄。
+     """
+     import threading
+     d = object.__new__(Dispatcher)
+@@ -276,15 +257,10 @@ def build_dispatcher(*, identity_api, registry: dict, backend, owner_credential,
+     for agent_id, role in roles_snapshot.items():
+         if role not in config.ROLES:
+             raise ValueError(f"unknown_role:{role!r}")
+-    object.__setattr__(d, "_agent_roles", roles_snapshot)
++    object.__setattr__(d, "_agent_roles", MappingProxyType(roles_snapshot))
+     object.__setattr__(d, "_channels", {})
+     object.__setattr__(d, "_agent_lock", threading.Lock())
+     object.__setattr__(d, "_owner_session_id", None)
+     object.__setattr__(d, "_closed", False)
+-    main = None
+-    if main_chat:
+-        main = object.__new__(MainChatChannel)
+-        object.__setattr__(main, "_dispatcher", d)
+-        object.__setattr__(main, "_credential", owner_credential)
+-    object.__setattr__(d, "_main_chat", main)
++    object.__setattr__(d, "_owner_provenance", object() if main_chat else None)
+     return d
+diff --git a/tests/conftest.py b/tests/conftest.py
+index e4da371..c6ef44d 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -8,7 +8,9 @@ autouse fixture 保证：
+ from __future__ import annotations
+ 
+ import hashlib
++import json
+ import math
++import os
+ import socket
+ import sys
+ from pathlib import Path
+@@ -19,6 +21,14 @@ ROOT = Path(__file__).resolve().parent.parent
+ if str(ROOT) not in sys.path:
+     sys.path.insert(0, str(ROOT))
+ 
++# M5-a B2：角色快照在 config 导入时从部署配置固化，测试必须在导入前注入。
++# 这里是测试专用的部署配置替身（生产不设置该变量 → 空快照）。
++if "OPC_AGENT_ROLES" not in os.environ:
++    os.environ["OPC_AGENT_ROLES"] = json.dumps(
++        {f"test-agent-{role}": role for role in (
++            "customer_service", "sales", "cfo", "legal", "product",
++            "research", "marketing", "hr", "personal", "coordinator")})
++
+ from opc_workbench import app, config, db, llm_client, cas, visibility  # noqa: E402
+ 
+ 
+@@ -85,10 +95,7 @@ def isolated_env(request, tmp_path, monkeypatch):
+     monkeypatch.setattr(config, "LOG_DIR", tmp_path / "logs")
+     monkeypatch.setattr(config, "BACKUP_DIR", tmp_path / "backups")
+     monkeypatch.setattr(config, "DASHSCOPE_API_KEY", "")  # 默认无 Key，防真客户端
+-    # M5-a B2：可信 Agent 注册表由框架预置（测试用固定 id 前缀）；
+-    # 生产默认空表，普通调用方无法自行注册角色。
+-    monkeypatch.setattr(config, "AGENT_ROLES",
+-                        {f"test-agent-{role}": role for role in config.ROLES})
++    # M5-a B2：角色快照已在导入期固化（见文件头部）；生产默认空快照。
+ 
+     fake = FakeLLM()
+     llm_client.set_llm(fake)
+@@ -341,3 +348,39 @@ def gated_embedder_cls():
+             return self.inner.embed(texts, deadline=deadline)
+ 
+     return GatedEmbedder
++
++
++class OwnerAdapter:
++    """主窗口适配器替身：只接收框架注入的提交端口，不接触任何身份对象。"""
++
++    def __init__(self):
++        self.submit = None
++
++    def bind(self, submit):
++        self.submit = submit
++
++
++def _call_as_entry_point(adapter):
++    """以 `__main__` 身份调用 app.main(adapter)，模拟真实进程入口。"""
++    g = {"__name__": "__main__", "adapter": adapter}
++    exec(compile("from opc_workbench import app\n"
++                 "result = app.main(adapter)\n", "<entry>", "exec"), g)
++    return g["result"]
++
++
++@pytest.fixture()
++def owner_entry(isolated_env):
++    """可信入口工厂：(application, submit_port) 成对返回，测试结束自动关停。"""
++    opened = []
++
++    def run():
++        adapter = OwnerAdapter()
++        application = _call_as_entry_point(adapter)
++        assert adapter.submit is not None, "主聊天提交端口未注入"
++        opened.append(application)
++        return application, adapter.submit
++
++    yield run
++    for application in opened:
++        application.close()
++
+diff --git a/tests/test_m32_security_boundary.py b/tests/test_m32_security_boundary.py
+index 5be69ac..a2c5195 100644
+--- a/tests/test_m32_security_boundary.py
++++ b/tests/test_m32_security_boundary.py
+@@ -283,7 +283,8 @@ def test_public_surface_sweep_yields_no_write_capability(isolated_env):
+         a.close()
+ 
+ 
+-def test_attack_ordinary_call_does_not_preempt_startup(isolated_env, db_conn):
++def test_attack_ordinary_call_does_not_preempt_startup(isolated_env, db_conn,
++                                                       owner_entry):
+     """攻击：普通业务模块抢先调用公开工厂。
+ 
+     断言一：拿不到原始生产 writer（任何公开属性）。
+@@ -298,9 +299,10 @@ def test_attack_ordinary_call_does_not_preempt_startup(isolated_env, db_conn):
+     with pytest.raises(PermissionError, match="disclosure_service_writer_not_exposed"):
+         grabbed.disclosure._writer
+ 
+-    # ② 真正启动不受影响：启动器由入口持有，装配出独立可用应用
+-    launcher = app.main()
+-    started = launcher.build()
++    # ② 普通模块调用入口被拒；真实入口（__main__）仍装配出独立可用应用
++    with pytest.raises(PermissionError, match="owner_entry_point_only"):
++        app.main()
++    started, _submit = owner_entry()
+     assert started is not grabbed
+     assert not hasattr(started, "writer")
+ 
+@@ -327,7 +329,7 @@ def test_attack_ordinary_call_does_not_preempt_startup(isolated_env, db_conn):
+     visibility.resolve_disclosure(started.disclosure, ap, "approved", actor="boss")
+     grant = visibility.consume_grant(started.disclosure, ap, to_role="sales")
+     assert grant["id"] == pid and grant["owner_role"] == "cfo"
+-    launcher.close()
++    started.close()
+     grabbed.close()
+ 
+ 
+diff --git a/tests/test_m5a_dispatch.py b/tests/test_m5a_dispatch.py
+index b532a45..dea2986 100644
+--- a/tests/test_m5a_dispatch.py
++++ b/tests/test_m5a_dispatch.py
+@@ -1,18 +1,23 @@
+-"""M5-a 组合根接线 + 统一调度入口验收（含 B1/B2 边界）。
++"""M5-a 组合根接线 + 统一调度入口验收（含 B1/B2 最终边界）。
+ 
+ 覆盖：
+-1. main_chat → import_doc → search 真实链路（通道只由可信启动入口持有）；
+-2. 公开 build_application() 拿不到 boss 通道；dict 冒充信封无效；
+-3. 正文自称 boss、转述、参数伪造身份均不提升权限；
+-4. Agent 角色由框架注册表决定，调用方无法注册/改角色；
+-5. watcher 无 boss 凭证，正常扫描不重复 embedding；
+-6. watcher 启停、应用关闭与 writer 关闭顺序；
+-7. 公开面取不到生产 writer，也绕不过 dispatch；原始注册表不在公开面。
++1. 主聊天提交端口 → import_doc → search 真实链路（端口只由 __main__ 入口注入）；
++2. 普通模块调用 main()/launcher/_compose 都拿不到 boss 来源；
++3. dict 冒充信封、直构信封、参数伪造身份均无效；
++4. 正文自称 boss、转述、跨 Agent 冒充均不提升权限；
++5. Agent 角色只来自部署配置快照，普通模块改不动注册表；
++6. watcher 无 boss 来源，正常扫描不重复 embedding；
++7. watcher 启停、应用关闭与 writer 关闭顺序；
++8. 公开面取不到生产 writer，也绕不过 dispatch；原始注册表不在公开面。
+ """
+ from __future__ import annotations
+ 
++import os
+ import sqlite3
++import subprocess
++import sys
+ import threading
++from pathlib import Path
+ 
+ import pytest
+ 
+@@ -22,22 +27,12 @@ from opc_workbench.dispatch import MessageEnvelope
+ 
+ @pytest.fixture()
+ def application(isolated_env, kdim):
+-    """公开工厂产出的应用：按定义**不含** boss 通道。"""
++    """公开工厂产出的应用：按定义**不含** boss 来源。"""
+     a = app.build_application()
+     yield a
+     a.close()
+ 
+ 
+-@pytest.fixture()
+-def owner(isolated_env, kdim):
+-    """可信启动入口（app.main）：返回 (launcher, application, main_chat)。"""
+-    launcher = app.main()
+-    try:
+-        yield launcher, launcher.build(), launcher.main_chat
+-    finally:
+-        launcher.close()
+-
+-
+ def _embed_calls(fake) -> int:
+     return sum(1 for c in fake.calls if c.get("kind") == "embed")
+ 
+@@ -52,48 +47,80 @@ def _doc_row(rel):
+         conn.close()
+ 
+ 
+-# --- 1. 可信通道真实链路 -----------------------------------------------------
++# --- 1. 可信入口真实链路 -----------------------------------------------------
+ 
+ 
+-def test_main_chat_import_then_search(owner, isolated_env, write_md):
+-    _launcher, application, main_chat = owner
++def test_main_chat_import_then_search(owner_entry, isolated_env, write_md):
++    _application, submit = owner_entry()
+     root = isolated_env["vault_dir"]
+     write_md(root, "sales/product.md", "主窗口导入的正文-ALPHA")
+ 
+-    out = main_chat.submit("knowledge.import_doc",
+-                           {"vault_path": "sales/product.md"})
++    out = submit("knowledge.import_doc", {"vault_path": "sales/product.md"})
+     assert out["status"] == "ready", out
+     assert out["owner_corrected"] is False
+ 
+-    hits = main_chat.submit("knowledge.search",
+-                            {"query": "主窗口导入的正文-ALPHA"})
++    hits = submit("knowledge.search", {"query": "主窗口导入的正文-ALPHA"})
+     assert len(hits["hits"]) == 1
+     assert hits["hits"][0]["vault_path"] == "sales/product.md"
+ 
+-    listing = main_chat.submit("knowledge.list_docs", {})
++    listing = submit("knowledge.list_docs", {})
+     assert "sales/product.md" in [d["vault_path"] for d in listing["docs"]]
+ 
+ 
+-# --- 2. B1：公开 API 拿不到 boss 通道 ----------------------------------------
++# --- 2. B1：普通模块拿不到 boss 来源 ----------------------------------------
+ 
+ 
+-def test_build_application_has_no_boss_channel(application):
++def test_build_application_has_no_boss_source(application):
+     assert not hasattr(application.dispatcher, "main_chat")
+     with pytest.raises(AttributeError):
+         application.dispatcher.main_chat
+     with pytest.raises(PermissionError, match="dispatcher_internal_not_exposed"):
+-        application.dispatcher._main_chat
++        application.dispatcher._owner_provenance
++    # 调度器里没有可外发的通道/令牌，也没有 owner 提交入口
++    assert not hasattr(application.dispatcher, "owner_submit")
+ 
+     launcher = app.ApplicationLauncher()
+     built = launcher.build()
+     try:
+-        with pytest.raises(PermissionError, match="owner_channel_not_launched"):
+-            launcher.main_chat
++        assert not hasattr(launcher, "main_chat")
++        assert not hasattr(launcher, "_build_owner")
+     finally:
+         launcher.close()
+         built.close()
+ 
+ 
++def test_ordinary_module_cannot_enter_owner_boundary():
++    """普通模块（测试模块）调用入口 = 被拒，不是"拿到但没用"。"""
++    with pytest.raises(PermissionError, match="owner_entry_point_only"):
++        app.main()
++    with pytest.raises(PermissionError, match="owner_entry_point_only"):
++        app._compose(with_owner_channel=True)
++
++
++class _Adapter:
++    def __init__(self):
++        self.submit = None
++
++    def bind(self, submit):
++        self.submit = submit
++
++
++def _enter_owner():
++    """再次以 __main__ 身份进入入口（用于会话上限验证）。"""
++    g = {"__name__": "__main__", "adapter": _Adapter()}
++    exec(compile("from opc_workbench import app\n"
++                 "result = app.main(adapter)\n", "<entry>", "exec"), g)
++    return g["result"]
++
++
++def test_owner_session_is_entry_scoped(owner_entry):
++    """同一进程只允许一个活动 owner 会话；关停后才可再次进入。"""
++    application, _submit = owner_entry()
++    with pytest.raises(PermissionError, match="owner_session_already_active"):
++        _enter_owner()
++    application.close()          # owner_entry 的清理再次 close 是幂等的
++
++
+ def test_dict_envelope_cannot_forge_boss(application, db_conn):
+     for fake in (
+             {"source": "main_chat", "actor_role": "boss"},
+@@ -105,7 +132,6 @@ def test_dict_envelope_cannot_forge_boss(application, db_conn):
+ 
+     with pytest.raises(PermissionError):
+         MessageEnvelope()
+-    # 拿不到通道就没有主窗口信封，dispatch 也不可能走到 boss 分支
+     assert not hasattr(application.dispatcher, "main_chat")
+ 
+ 
+@@ -133,38 +159,96 @@ def test_agent_content_cannot_claim_boss(application, isolated_env, write_md, db
+     assert spoof["error"]["code"] == "invalid_param"
+ 
+ 
+-# --- 4. B2：角色由可信注册表决定 --------------------------------------------
++def test_agent_cannot_impersonate_another_agent(application):
++    """信封来源必须是本 agent 自己的句柄；跨 Agent 冒用一律 identity_denied。"""
++    from opc_workbench import dispatch as dispatch_mod
++
++    sales = application.dispatcher.agent_channel("test-agent-sales")
++    minted = dispatch_mod._mint_envelope(
++        source="agent_message", agent_id="test-agent-cfo",
++        parent_message_id=None, origin=sales)
++    out = application.dispatcher.dispatch(minted, "task.create", {"title": "冒用"})
++    assert out["error"]["code"] == "identity_denied"
++    assert "agent_envelope_mismatch" in out["error"]["message"]
+ 
+ 
+-def test_agent_roles_come_from_framework_registry(application):
+-    # 框架预置的 id 能取到句柄，角色固定；调度器没有"自注册"方法
++# --- 4. B2：角色只来自部署配置快照 ------------------------------------------
++
++
++def test_agent_roles_come_from_configured_snapshot(application):
+     assert not hasattr(application.dispatcher, "register_agent")
+     channel = application.dispatcher.agent_channel("test-agent-sales")
+     assert channel.agent_id == "test-agent-sales"
+     assert application.dispatcher.agent_channel("test-agent-sales") is channel
+ 
+-    # 未注册 id / 角色名本身都不是可取得通道的入口
+     with pytest.raises(PermissionError, match="agent_not_provisioned"):
+         application.dispatcher.agent_channel("cfo")
+     with pytest.raises(PermissionError, match="agent_not_provisioned"):
+-        application.dispatcher.agent_channel("test-agent-unknown")
++        application.dispatcher.agent_channel("my-agent")
++
++    snapshot = config.agent_roles()
++    assert not hasattr(snapshot, "update")        # 不提供写入方法
++    with pytest.raises(TypeError):
++        snapshot["my-agent"] = "cfo"             # 快照本体不可改
+ 
+ 
+-def test_production_registry_is_empty_by_default(monkeypatch, isolated_env, kdim):
+-    """生产默认没有员工 Agent：普通调用方不可能因此拿到 cfo/sales 身份。"""
+-    monkeypatch.setattr(config, "AGENT_ROLES", {})
++def test_ordinary_module_cannot_register_roles(monkeypatch, isolated_env, kdim):
++    """改公开属性 / 换公开函数 / 改快照副本都不能进入装配结果。"""
++    original_snapshot = config.agent_roles
++    # ① 重新绑一个同名公开属性：组合根不读它
++    monkeypatch.setattr(config, "AGENT_ROLES",
++                        {"my-agent": "cfo"}, raising=False)
+     a = app.build_application()
+     try:
+-        assert not hasattr(a.dispatcher, "register_agent")
+         with pytest.raises(PermissionError, match="agent_not_provisioned"):
+-            a.dispatcher.agent_channel("cfo")
+-        with pytest.raises(PermissionError, match="agent_not_provisioned"):
+-            a.dispatcher.agent_channel("sales")
++            a.dispatcher.agent_channel("my-agent")
+     finally:
+         a.close()
+ 
+-
+-# --- 5. watcher 无 boss 凭证、不重复 embedding ------------------------------
++    # ② 替换公开快照函数：组合根持有的是导入期函数对象，不受影响
++    monkeypatch.setattr(config, "agent_roles", lambda: {"my-agent": "cfo"})
++    b = app.build_application()
++    try:
++        with pytest.raises(PermissionError, match="agent_not_provisioned"):
++            b.dispatcher.agent_channel("my-agent")
++    finally:
++        b.close()
++
++    # ③ 快照返回的是不可变对象，改不了本体，也就影响不到下一次装配
++    real_snapshot = original_snapshot()
++    assert "my-agent" not in real_snapshot
++
++
++def test_production_registry_is_empty_by_default(tmp_path):
++    """未配置 OPC_AGENT_ROLES 的新进程里，生产没有任何员工 Agent 通道。
++
++    用子进程加载干净配置，避免依赖本进程的测试注入。
++    """
++    env = {k: v for k, v in os.environ.items()
++           if k not in (config.AGENT_ROLES_ENV, "PYTHONPATH")}
++    env["PA_DB_PATH"] = str(tmp_path / "prod.db")
++    env["VAULT_PATH"] = str(tmp_path / "vault")
++    code = (
++        "from opc_workbench import app\n"
++        "a = app.build_application()\n"
++        "codes = []\n"
++        "for aid in ('cfo', 'sales'):\n"
++        "    try:\n"
++        "        a.dispatcher.agent_channel(aid)\n"
++        "        codes.append('granted')\n"
++        "    except PermissionError as exc:\n"
++        "        codes.append(str(exc))\n"
++        "a.close()\n"
++        "print('|'.join(codes))\n"
++    )
++    proc = subprocess.run([sys.executable, "-c", code],
++                          cwd=str(Path(__file__).resolve().parent.parent),
++                          env=env, capture_output=True, text=True, timeout=60)
++    assert proc.returncode == 0, proc.stderr
++    assert proc.stdout.strip() == "agent_not_provisioned|agent_not_provisioned"
++
++
++# --- 5. watcher 无 boss 来源、不重复 embedding ------------------------------
+ 
+ 
+ def test_watcher_scan_needs_no_boss_credential(application, isolated_env, write_md):
+@@ -175,8 +259,7 @@ def test_watcher_scan_needs_no_boss_credential(application, isolated_env, write_
+     rounds = application.scan_once()
+     assert [r["vault_path"] for r in rounds["results"]] == ["sales/watched.md"]
+     assert rounds["results"][0]["status"] == "ready"
+-    row = _doc_row("sales/watched.md")
+-    assert row["status"] == "ready"
++    assert _doc_row("sales/watched.md")["status"] == "ready"
+ 
+     embeds = _embed_calls(fake)
+     second = application.scan_once()
+@@ -213,7 +296,6 @@ def test_watcher_start_stop_and_close_order(isolated_env, kdim):
+ 
+ 
+ def test_knowledge_service_seals_writer(kwriter):
+-    """知识服务本体也不外泄 writer：普通属性访问被拒，且无 __dict__ 第二出口。"""
+     from opc_workbench.knowledge_service import KnowledgeService
+     svc = KnowledgeService(kwriter)
+     with pytest.raises(PermissionError,
+@@ -227,6 +309,8 @@ def test_public_surface_has_no_writer_or_registry(application):
+     assert "writer" not in app.Application.__slots__
+     with pytest.raises(PermissionError, match="dispatcher_internal_not_exposed"):
+         application.dispatcher._registry
++    with pytest.raises(PermissionError, match="dispatcher_internal_not_exposed"):
++        application.dispatcher._owner_provenance
+     with pytest.raises(PermissionError, match="application_watcher_not_exposed"):
+         application._watcher
+ 
+@@ -239,7 +323,6 @@ def test_public_surface_has_no_writer_or_registry(application):
+             continue
+         assert not isinstance(val, db.WriteCapability), f"{name} 泄露写能力"
+ 
+-    # 无入口凭证就无法取得 boss：字符串/None 一律 None
+     backend = app.OwnerChannelBackend()
+     assert backend.authenticate("main_chat") is None
+     assert backend.authenticate(None) is None
