@@ -227,3 +227,89 @@
 - 红证原始输出：`docs\M5a-B1B2第二轮红证原始输出.txt`（三变体的目标用例与探针输出）。
 - 全量测试：`docs\M5a-B1B2第二轮全量测试输出.txt`（`691 passed, 1 deselected`，34.73s）。
 
+
+## 9. 第三轮修复（`238fb4f`，基于 `0a7b717`）：唯一模块入口 + owner 会话生命周期
+
+第三轮复审裁决：B2 通过；B1 阻断——守卫把"调用栈出现 `__main__`"当可信证明，
+`python -c` 与 exec 伪造帧均可进入；另判两处生命周期阻断：普通应用 close 误释放
+owner 名额、`main(adapter=None)` 丢端口且 `bind` 异常不清理。裁决同时冻结启动契约：
+可信启动命令唯一为 `python -m opc_workbench.app`；适配器由启动流程内部创建，
+接口 `bind(submit)`，框架只交付受限提交函数。
+
+### 9.1 B1：守卫改验"进程真实主模块"，删除 `main(adapter)`
+
+- `_require_entry_point()` 不再走调用帧，改为四重校验 `sys.modules["__main__"]`：
+  ① 带有 `-m` 启动生成的模块 spec；② `spec.name == "opc_workbench.app"`；
+  ③ 主模块命名空间 **就是当前正在执行的这份模块代码的命名空间**（`is globals()`）；
+  ④ `__file__` 与本文件一致。任一不满足 → `owner_entry_point_only`。
+  - `python -c` / 普通脚本：主模块无 spec → 拒绝；
+  - exec 伪造 `__main__` 帧：不改 `sys.modules` → 拒绝；
+  - 普通导入模块调用：主模块是 pytest/脚本 → 拒绝；
+  - 真实 `-m` 进程里另行 `import opc_workbench.app` 的副本：命名空间不同 → 拒绝。
+- 删除公开 `main(adapter=None)`；新增私有 `_run_entry()`（无参数），只在本文件
+  `if __name__ == "__main__":` 块调用。适配器 `MainWindowAdapter`（新模块
+  `opc_workbench/main_window.py`）由 `_run_entry` **内部创建**，`bind(submit)`
+  一次绑定、不可换绑、未绑定不可用；外部传入适配器在签名上即不可能（TypeError）。
+- 测试入口不再用 exec 伪造：`conftest._run_module_entry()` 用标准库
+  `runpy.run_module("opc_workbench.app", run_name="__main__", alter_sys=True)`
+  ——这是 `-m` 的实现本体，以真实 spec + 临时主模块命名空间**重新执行入口源码**，
+  不能注入适配器、不能跳过入口代码；另有子进程用例直接跑真实命令
+  `python -m opc_workbench.app`（exit 0）与 `python -c` / 脚本（exit≠0，
+  stderr 含 `owner_entry_point_only`）。
+
+### 9.2 生命周期：名额归持有者，清理走 finally
+
+- 名额状态移入新模块 `opc_workbench/_owner_session.py`（claim/release/is_active）。
+  原因：`-m` 执行时 app 是 `__main__` 实例，与普通 import 是两个模块实例；
+  状态放 app 内会随入口重执行而重置，单例约束失效。该模块经 sys.modules 缓存，
+  全进程一份。
+- `Application` 新增 `_owns_owner_session` 槽：只有 `_compose(with_owner_channel=True)`
+  产物为 True；`build_application()` 产物为 False，close 不触碰名额。
+- `close()`：watcher.stop → cas.close → 释放名额，层层 finally；watcher/写连接
+  关闭异常也不会把名额遗留为活动状态；释放前清持有标记，幂等。
+- `_run_entry()`：装配成功后 `bind` / `start_background` 任一异常 →
+  `application.close()`（停 watcher、关写连接、释放名额）后再抛；不存在
+  无适配器却成功启动的路径。
+
+### 9.3 验收对账（三个阻断点）
+
+| 裁决要求 | 落点 | 结果 |
+| --- | --- | --- |
+| `python -c` 不能取得老板来源 | `test_python_c_and_script_cannot_enter`（子进程，exit≠0 + 错误码）；`test_ordinary_module_cannot_enter_owner_boundary`（含 `main` 已删除、`_run_entry` 无参） | 通过 |
+| exec 伪造 `__main__` 帧不能进入 | `test_forged_main_frame_cannot_enter`（`_run_entry` 与 `_compose(True)` 两路） | 通过 |
+| 真实入口可用 | `test_module_entry_command_starts`（子进程 `python -m opc_workbench.app` exit 0）；`test_main_chat_import_then_search`（runpy 真实执行入口 → import → search → list_docs） | 通过 |
+| 普通应用关闭不得释放名额 | `test_ordinary_close_does_not_release_owner_session`（老板会话活动中关普通应用 → 第二会话仍 `owner_session_already_active`；持有者关闭后才放行） | 通过 |
+| 绑定/启动失败必须清理 | `test_entry_bind_failure_cleans_up`、`test_entry_start_failure_cleans_up`（名额归还、无残留 watcher、可重新启动）；`test_close_releases_session_even_if_stop_fails`（stop 异常仍释放） | 通过 |
+| 适配器契约 bind(submit) | `test_main_window_adapter_contract`（未绑定拒绝、一次绑定、非可调用拒绝）；框架不交付 Dispatcher/Identity/令牌/注册表 | 通过 |
+| 既有回归 | 主聊天/Agent/watcher/m32 攻击面全部保留并通过 | 通过 |
+
+变体红证（撤掉当轮保护后目标用例变红 + 探针复现利用）：
+
+| 变体 | 撤掉的保护 | 目标用例 | 探针 |
+| --- | --- | --- | --- |
+| `red_b1_frame_guard` | 守卫退回调用栈 `__main__` 检查 | 伪造帧用例 `DID NOT RAISE`；`python -c` 用例 `assert 0 != 0`（进程成功进入） | exec 伪造帧进入入口后 `adapter.send(import_doc)` → `EXPLOIT_OK status=ready` |
+| `red_b2_unconditional_release` | close 退回无条件释放名额 | 顺序用例 `DID NOT RAISE ... owner_session_already_active` | 老板会话活动中关普通应用 → 第二个老板会话 `EXPLOIT_OK second_owner_session=started` |
+| `red_b3_no_entry_cleanup` | `_run_entry` 去掉失败清理 | `assert not is_active()` 失败 | bind 抛异常后 `EXPLOIT_OK session_leaked=True` |
+
+### 9.4 边界与残留披露
+
+- 同进程边界不变：不防反射/内存改写/直接替换 `sys.modules["__main__"]` 等运行时
+  对象篡改；只封项目提供的普通调用 API。
+- `runpy.run_module(..., run_name="__main__", alter_sys=True)` 能进入入口——它就是
+  `python -m` 的标准库实现，语义上等价于执行可信启动命令本身（无法注入适配器、
+  无法跳过入口代码），不视为绕过；如裁决认为进程内重执行入口也应收紧，需另行拍板。
+- 测试卫生：`isolated_env` teardown 兜底 `release()`，防用例中途失败泄漏名额跨用例；
+  生产路径无此兜底，名额只由持有者 close 释放。
+- `__main__` 块当前装配 + 绑定后即返回（进程退出，atexit 关停）；M6 在此接
+  Gradio 事件循环，适配器契约 `bind(submit)` 已冻结。
+- 未动项：M4、CAS、Identity、KnowledgeService、watcher 业务逻辑零改动
+  （watcher 仅被测试 monkeypatch 模拟故障）；未合 master、未打 tag。
+- CI 披露：仓库无 GitHub Actions workflow，全部测试结果为本机 venv 实测输出
+  （原始文件归档），非 CI 状态。
+
+### 9.5 本轮材料
+
+- 增量 diff：`docs\M5a-B1B2第三轮修复diff.patch`（`0a7b717..238fb4f`，6 文件 +313/−105，新增 `main_window.py`、`_owner_session.py`）。
+- 红证原始输出：`docs\M5a-B1B2第三轮红证原始输出.txt`。
+- 全量测试：`docs\M5a-B1B2第三轮全量测试输出.txt`（`699 passed, 1 deselected`，36.58s）。
+

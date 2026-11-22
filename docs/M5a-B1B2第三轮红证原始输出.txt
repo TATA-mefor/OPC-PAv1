@@ -1,0 +1,114 @@
+# red_b1_frame_guard: 守卫退回调用栈 __main__ 检查：伪造帧与 python -c 可进入
+# cmd: C:\Users\1\AppData\Local\Doubao\User Data\Default\.doubao\agent_mode\workspace\.sessions\38455536748631554\agents\m_0cweYiCX2vW\wt\m4ingest\.venv\Scripts\python.exe -m pytest tests/test_m5a_dispatch.py -k forged_main_frame or python_c_and_script -m not live -q --no-header -p no:cacheprovider
+
+FF                                                                       [100%]
+================================== FAILURES ===================================
+_____________________ test_forged_main_frame_cannot_enter _____________________
+
+    def test_forged_main_frame_cannot_enter():
+        """exec 伪造 `__main__` 调用帧不是可信入口：守卫验证进程主模块，不看帧。"""
+        for code in (
+                "from opc_workbench import app\nresult = app._run_entry()",
+                "from opc_workbench import app\n"
+                "result = app._compose(with_owner_channel=True)"):
+>           with pytest.raises(PermissionError, match="owner_entry_point_only"):
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           Failed: DID NOT RAISE <class 'PermissionError'>
+
+tests\test_m5a_dispatch.py:110: Failed
+____________________ test_python_c_and_script_cannot_enter ____________________
+
+tmp_path = WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-313/test_python_c_and_script_canno0')
+
+    def test_python_c_and_script_cannot_enter(tmp_path):
+        """`python -c` 与普通脚本进程都不是模块入口，取不到老板来源。"""
+        repo = Path(__file__).resolve().parent.parent
+        env = _clean_subprocess_env(tmp_path)
+        code = "from opc_workbench import app\napp._run_entry()\n"
+        proc = subprocess.run([sys.executable, "-c", code], cwd=str(repo),
+                              env=env, capture_output=True, text=True, timeout=60)
+>       assert proc.returncode != 0
+E       AssertionError: assert 0 != 0
+E        +  where 0 = CompletedProcess(args=['C:\\Users\\1\\AppData\\Local\\Doubao\\User Data\\Default\\.doubao\\agent_mode\\workspace\\.ses...\\Scripts\\python.exe', '-c', 'from opc_workbench import app\napp._run_entry()\n'], returncode=0, stdout='', stderr='').returncode
+
+tests\test_m5a_dispatch.py:133: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_m5a_dispatch.py::test_forged_main_frame_cannot_enter - Fail...
+FAILED tests/test_m5a_dispatch.py::test_python_c_and_script_cannot_enter - As...
+2 failed, 20 deselected in 2.67s
+
+# probe cmd: C:\Users\1\AppData\Local\Doubao\User Data\Default\.doubao\agent_mode\workspace\.sessions\38455536748631554\agents\m_0cweYiCX2vW\wt\m4ingest\.venv\Scripts\python.exe -m pytest tests/test_zz_red_probe.py -m not live -q -s --no-header -p no:cacheprovider
+
+EXPLOIT_OK status=ready
+.
+1 passed in 0.37s
+
+# red_b2_unconditional_release: close() 无条件释放名额：普通应用关闭放行第二个老板会话
+# cmd: C:\Users\1\AppData\Local\Doubao\User Data\Default\.doubao\agent_mode\workspace\.sessions\38455536748631554\agents\m_0cweYiCX2vW\wt\m4ingest\.venv\Scripts\python.exe -m pytest tests/test_m5a_dispatch.py -k ordinary_close_does_not_release -m not live -q --no-header -p no:cacheprovider
+
+F                                                                        [100%]
+================================== FAILURES ===================================
+_____________ test_ordinary_close_does_not_release_owner_session ______________
+
+owner_entry = <function owner_entry.<locals>.run at 0x00000144FE728CA0>
+module_entry = <function _run_module_entry at 0x00000144FE6649E0>
+
+    def test_ordinary_close_does_not_release_owner_session(owner_entry, module_entry):
+        """顺序验证：老板会话活动中，普通应用关闭不得释放名额。"""
+        application, _submit = owner_entry()
+        ordinary = app.build_application()
+        ordinary.close()
+>       with pytest.raises(PermissionError, match="owner_session_already_active"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'PermissionError'>
+
+tests\test_m5a_dispatch.py:167: Failed
+=========================== short test summary info ===========================
+FAILED tests/test_m5a_dispatch.py::test_ordinary_close_does_not_release_owner_session
+1 failed, 21 deselected in 1.47s
+
+# probe cmd: C:\Users\1\AppData\Local\Doubao\User Data\Default\.doubao\agent_mode\workspace\.sessions\38455536748631554\agents\m_0cweYiCX2vW\wt\m4ingest\.venv\Scripts\python.exe -m pytest tests/test_zz_red_probe.py -m not live -q -s --no-header -p no:cacheprovider
+
+EXPLOIT_OK second_owner_session=started
+.
+1 passed in 0.42s
+
+# red_b3_no_entry_cleanup: _run_entry 去掉失败清理：绑定失败泄漏活动会话
+# cmd: C:\Users\1\AppData\Local\Doubao\User Data\Default\.doubao\agent_mode\workspace\.sessions\38455536748631554\agents\m_0cweYiCX2vW\wt\m4ingest\.venv\Scripts\python.exe -m pytest tests/test_m5a_dispatch.py -k entry_bind_failure_cleans_up -m not live -q --no-header -p no:cacheprovider
+
+F                                                                        [100%]
+================================== FAILURES ===================================
+______________________ test_entry_bind_failure_cleans_up ______________________
+
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-317/test_entry_bind_failure_cleans0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-317/test_entry_bind_failure_cleans0/vault')}
+kdim = 8, module_entry = <function _run_module_entry at 0x000001529F1F89E0>
+owner_entry = <function owner_entry.<locals>.run at 0x000001529F2B8CA0>
+
+    def test_entry_bind_failure_cleans_up(isolated_env, kdim, module_entry,
+                                          owner_entry):
+        """适配器绑定失败：应用关闭、名额释放、无残留 watcher，可重新启动。"""
+        from opc_workbench import _owner_session, main_window
+    
+        def boom(self, submit):
+            raise RuntimeError("bind_failed")
+    
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(main_window.MainWindowAdapter, "bind", boom)
+            with pytest.raises(RuntimeError, match="bind_failed"):
+                module_entry()
+>       assert not _owner_session.is_active()
+E       AssertionError: assert not True
+E        +  where True = <function is_active at 0x0000015286E2CA90>()
+E        +    where <function is_active at 0x0000015286E2CA90> = <module 'opc_workbench._owner_session' from 'C:\\Users\\1\\AppData\\Local\\Doubao\\User Data\\Default\\.doubao\\agent_...\\38455544296437762\\agents\\m_0cweYBgGMDF\\verify_b1b2_v3\\red_b3_no_entry_cleanup\\opc_workbench\\_owner_session.py'>.is_active
+
+tests\test_m5a_dispatch.py:189: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_m5a_dispatch.py::test_entry_bind_failure_cleans_up - Assert...
+1 failed, 21 deselected in 1.49s
+
+# probe cmd: C:\Users\1\AppData\Local\Doubao\User Data\Default\.doubao\agent_mode\workspace\.sessions\38455536748631554\agents\m_0cweYiCX2vW\wt\m4ingest\.venv\Scripts\python.exe -m pytest tests/test_zz_red_probe.py -m not live -q -s --no-header -p no:cacheprovider
+
+EXPLOIT_OK session_leaked=True
+.
+1 passed in 0.34s
+

@@ -1,0 +1,620 @@
+diff --git a/opc_workbench/_owner_session.py b/opc_workbench/_owner_session.py
+new file mode 100644
+index 0000000..833ea4c
+--- /dev/null
++++ b/opc_workbench/_owner_session.py
+@@ -0,0 +1,37 @@
++"""进程级 owner 会话名额（M5-a B1 生命周期）。
++
++单独成模块的原因：`opc_workbench.app` 以 `python -m` 执行时是 `__main__`
++实例，与普通 `import opc_workbench.app` 是**两个模块实例**；名额状态若放在
++app 模块内，入口重执行会得到一份新状态，单例约束即失效。本模块经正常导入
++缓存（sys.modules），全进程只有一份状态。
++
++名额只由真正持有 owner 会话的 Application 在 close() 时释放；
++普通 build_application() 产物不占有、也不释放名额。
++"""
++from __future__ import annotations
++
++import threading
++
++_LOCK = threading.Lock()
++_ACTIVE = False
++
++
++def claim() -> None:
++    """占用名额：已有活动 owner 会话时拒绝（每进程仅一个）。"""
++    global _ACTIVE
++    with _LOCK:
++        if _ACTIVE:
++            raise PermissionError("owner_session_already_active")
++        _ACTIVE = True
++
++
++def release() -> None:
++    """释放名额（幂等）。只应由持有者调用。"""
++    global _ACTIVE
++    with _LOCK:
++        _ACTIVE = False
++
++
++def is_active() -> bool:
++    with _LOCK:
++        return _ACTIVE
+diff --git a/opc_workbench/app.py b/opc_workbench/app.py
+index 03d66dd..575e758 100644
+--- a/opc_workbench/app.py
++++ b/opc_workbench/app.py
+@@ -18,14 +18,16 @@
+ - 业务调用只能经 `Application.dispatcher.dispatch(envelope, ...)` 或两个
+   Channel 句柄；原始工具注册表不对外暴露。
+ - boss 身份只由主聊天入口（OwnerChannelBackend → register_session →
+-  issue_proof → mint_boss_context）产出；来源令牌由组合根在 `__main__` 入口
+-  装配时铸造，只交给主窗口适配器持有的提交端口——没有可获取的通道对象，
+-  也不接受任何调用方传入 source="main_chat"。
++  issue_proof → mint_boss_context）产出；来源令牌只在
++  `python -m opc_workbench.app` 以模块入口执行时由启动流程铸造，交给
++  **框架内部创建**的主窗口适配器（bind(submit)）——没有可获取的通道对象，
++  不接受调用方传入 source="main_chat"，也不接受外部传入适配器。
+ - `confirm_action` 继续 fail closed（delete_doc 的 UI 确认留到 M5-b）。
+ 
+-生命周期：build_application() 只构造不缓存；进程级单例与关停由
+-ApplicationLauncher 实例持有；boss 来源只在 `__main__` 入口（main）铸造
+-一次，并直接交给主窗口适配器。
++生命周期：build_application() 只构造不缓存、不占有 owner 会话名额；
++进程级单例与关停由 ApplicationLauncher 实例持有；owner 会话名额在
++`_owner_session` 模块（全进程一份），只由真正持有名额的 Application
++在 close() 中释放。
+ """
+ from __future__ import annotations
+ 
+@@ -37,53 +39,35 @@ import sys
+ import threading
+ 
+ from . import cas, config, db, identity, llm_client, visibility
++from . import _owner_session
+ from .config import agent_roles as _agent_roles_snapshot
+ from .dispatch import _mint_envelope, build_dispatcher
+ from .knowledge_service import KnowledgeService
++from .main_window import MainWindowAdapter
+ from .vault_watcher import VaultWatcher
+ 
+ 
+ # ---------------------------------------------------------------------------
+-# 可信启动边界（M5-a B1）
+-# 主聊天来源不是"可获取的通道对象"，而是框架在 `__main__` 入口装配时铸造的
+-# 内部令牌 + 提交端口。下面两个守卫保证：普通模块既调不到带 boss 来源的
+-# 装配，也不能在进程内并存第二个 owner 会话。
++# 可信启动边界（M5-a B1，用户裁决 2026-11-23）
++# 唯一可信启动命令：`python -m opc_workbench.app`。
++# 验证的不是"调用栈里出现 __main__"（帧可被 exec 伪造），而是进程真实的
++# 主模块：sys.modules["__main__"] 必须带有 `-m` 启动生成的模块 spec
++# （name == "opc_workbench.app"），且其命名空间就是**当前正在执行的这份
++# 模块代码**的命名空间。python -c、普通脚本、被导入模块、exec 伪造帧
++# 一律不满足；即便在真实 `-m` 进程里另行 import 本模块，那份副本的
++# 命名空间也不是主模块命名空间，同样拒绝。
+ # ---------------------------------------------------------------------------
+-_ENTRY_POINT_MODULE = "__main__"
+ _APP_FILE = os.path.abspath(__file__)
+-_OWNER_SESSION_LOCK = threading.Lock()
+-_OWNER_SESSION_STATE = {"active": False}
+ 
+ 
+ def _require_entry_point() -> None:
+-    """调用链上必须出现真正的进程入口帧，否则拒绝。
+-
+-    两种合法形态：
+-    - `python -m opc_workbench.app`：本模块自身以 `__main__` 身份执行；
+-    - 入口脚本/适配层以 `__main__` 身份调用 `main()`。
+-    普通被导入模块（`__name__` 为包名或测试模块名）一律拒绝。
+-    """
+-    frame = sys._getframe(1)
+-    while frame is not None:
+-        name = frame.f_globals.get("__name__")
+-        if name == _ENTRY_POINT_MODULE:
+-            return
+-        if os.path.abspath(frame.f_code.co_filename) != _APP_FILE:
+-            break
+-        frame = frame.f_back
+-    raise PermissionError("owner_entry_point_only")
+-
+-
+-def _claim_owner_session() -> None:
+-    with _OWNER_SESSION_LOCK:
+-        if _OWNER_SESSION_STATE["active"]:
+-            raise PermissionError("owner_session_already_active")
+-        _OWNER_SESSION_STATE["active"] = True
+-
+-
+-def _release_owner_session() -> None:
+-    with _OWNER_SESSION_LOCK:
+-        _OWNER_SESSION_STATE["active"] = False
++    entry = sys.modules.get("__main__")
++    spec = getattr(entry, "__spec__", None)
++    if (spec is None
++            or getattr(spec, "name", None) != "opc_workbench.app"
++            or getattr(entry, "__dict__", None) is not globals()
++            or os.path.abspath(getattr(entry, "__file__", "")) != _APP_FILE):
++        raise PermissionError("owner_entry_point_only")
+ 
+ 
+ 
+@@ -182,16 +166,17 @@ class Application:
+     """
+ 
+     __slots__ = ("identity_api", "cas_service", "disclosure", "dispatcher",
+-                 "_watcher", "_closed")
++                 "_watcher", "_closed", "_owns_owner_session")
+ 
+     def __init__(self, *, identity_api, cas_service, disclosure, dispatcher,
+-                 watcher):
++                 watcher, owns_owner_session=False):
+         object.__setattr__(self, "identity_api", identity_api)
+         object.__setattr__(self, "cas_service", cas_service)
+         object.__setattr__(self, "disclosure", disclosure)
+         object.__setattr__(self, "dispatcher", dispatcher)
+         object.__setattr__(self, "_watcher", watcher)
+         object.__setattr__(self, "_closed", False)
++        object.__setattr__(self, "_owns_owner_session", bool(owns_owner_session))
+ 
+     def __setattr__(self, *a):
+         raise PermissionError("application_immutable")
+@@ -204,7 +189,7 @@ class Application:
+     # -- 生命周期 -----------------------------------------------------------
+ 
+     def start_background(self) -> None:
+-        """启动后台 vault 扫描（幂等）。只在 main() 调用。"""
++        """启动后台 vault 扫描（幂等）。只在入口启动流程调用。"""
+         if object.__getattribute__(self, "_closed"):
+             raise PermissionError("application_closed")
+         object.__getattribute__(self, "_watcher").start()
+@@ -216,25 +201,37 @@ class Application:
+         return object.__getattribute__(self, "_watcher").scan_once()
+ 
+     def close(self) -> None:
+-        """有界关停（幂等）：先停 watcher（join），再关内部写连接。"""
++        """有界关停（幂等）：先停 watcher（join），再关内部写连接。
++
++        owner 会话名额只由**实际持有名额**的应用释放（build_application()
++        产物不占有名额，关闭不影响活动 owner 会话）；释放放在 finally，
++        watcher/写连接关闭异常也不会把名额遗留为活动状态。
++        """
+         if object.__getattribute__(self, "_closed"):
+             return
+         object.__setattr__(self, "_closed", True)
+-        object.__getattribute__(self, "_watcher").stop()
+-        self.cas_service.close()
+-        _release_owner_session()
++        try:
++            try:
++                object.__getattribute__(self, "_watcher").stop()
++            finally:
++                self.cas_service.close()
++        finally:
++            if object.__getattribute__(self, "_owns_owner_session"):
++                object.__setattr__(self, "_owns_owner_session", False)
++                _owner_session.release()
+ 
+ 
+ def _compose(*, with_owner_channel: bool):
+-    """内部装配：返回 (Application, MainChatChannel | None)。
++    """内部装配：返回 (Application, owner_submit | None)。
+ 
+-    带 boss 通道的装配是**入口点专属**：调用链上最近的非本模块帧必须是
+-    `__main__`（真实进程入口），且同一进程只允许一个活动 owner 会话。
+-    因此普通模块直接 import 调用本函数也拿不到通道。
++    带 boss 来源的装配是**模块入口专属**：进程必须以
++    `python -m opc_workbench.app` 启动且当前执行的就是入口模块本体，
++    且同一进程只允许一个活动 owner 会话。普通模块直接 import 调用、
++    exec 伪造 `__main__` 帧、`python -c` 一律被拒。
+     """
+     if with_owner_channel:
+         _require_entry_point()
+-        _claim_owner_session()
++        _owner_session.claim()
+     _conn = None
+     try:
+         db.init_db()                                   # 迁移先行（零播种）
+@@ -273,7 +270,8 @@ def _compose(*, with_owner_channel: bool):
+         watcher = VaultWatcher(knowledge_service)
+         application = Application(
+             identity_api=identity_api, cas_service=cas_service,
+-            disclosure=disclosure, dispatcher=dispatcher, watcher=watcher)
++            disclosure=disclosure, dispatcher=dispatcher, watcher=watcher,
++            owns_owner_session=with_owner_channel)
+         owner_submit = None
+         if with_owner_channel:
+             provenance = object.__getattribute__(dispatcher, "_owner_provenance")
+@@ -290,7 +288,7 @@ def _compose(*, with_owner_channel: bool):
+         if _conn is not None:
+             _conn.close()
+         if with_owner_channel:
+-            _release_owner_session()
++            _owner_session.release()
+         raise
+ 
+ 
+@@ -306,8 +304,9 @@ def build_application() -> Application:
+ class ApplicationLauncher:
+     """进程级生命周期持有者：单例装配 + 关停。
+ 
+-    `build()` 只装配有界应用（**不含**主对话通道）；boss 通道只由
+-    `main()` 在入口点铸造并交给适配器，不挂在启动器上。
++    `build()` 只装配有界应用（**不含**主对话来源，也不占有 owner 会话
++    名额）；boss 来源只由模块入口启动流程铸造并交给内部创建的适配器，
++    不挂在启动器上。
+     """
+ 
+     __slots__ = ("_application", "_lock")
+@@ -340,21 +339,26 @@ class ApplicationLauncher:
+             current.close()
+ 
+ 
+-def main(adapter=None) -> Application:
+-    """进程入口（唯一可信启动点）：只有 `__main__` 帧可调用。
++def _run_entry():
++    """模块入口启动流程（私有，无参数）：只在本文件 `__main__` 块调用。
+ 
+-    装配一次后，把**主聊天提交端口**（普通函数，来源由框架注入）交给
+-    `adapter.bind(submit)`（主窗口适配器，M6 接 Gradio）；不返回、不挂载
+-    任何"老板通道对象"。返回有界 Application 供显式收尾（不含 boss 能力）。
++    适配器由本流程**内部创建**（M6 换 Gradio 实现，契约不变 bind(submit)），
++    不接受外部传入；绑定或后台启动失败时关闭应用（释放 owner 名额、
++    停 watcher、关写连接）后再抛，绝不遗留活动会话或悬挂资源。
+     """
+-    _require_entry_point()
+     application, owner_submit = _compose(with_owner_channel=True)
+-    application.start_background()
+-    if adapter is not None:
++    try:
++        adapter = MainWindowAdapter()
+         adapter.bind(owner_submit)
++        application.start_background()
++    except BaseException:
++        application.close()
++        raise
+     atexit.register(application.close)
+-    return application
++    return application, adapter
+ 
+ 
+ if __name__ == "__main__":
+-    main()
++    # 唯一可信启动：python -m opc_workbench.app
++    # M6 在此接入主窗口事件循环；当前批次装配 + 绑定后即收尾（atexit 关停）。
++    _entry_application, _entry_adapter = _run_entry()
+diff --git a/opc_workbench/main_window.py b/opc_workbench/main_window.py
+new file mode 100644
+index 0000000..89244eb
+--- /dev/null
++++ b/opc_workbench/main_window.py
+@@ -0,0 +1,39 @@
++"""主窗口适配器（M5-a 契约，M6 接 Gradio）。
++
++启动契约（用户裁决 2026-11-23）：
++- 适配器由工作台启动流程**内部创建**；外部脚本不能把适配器塞给启动函数。
++- 框架只经 `bind(submit)` 交付受限提交函数；不交付 Dispatcher、Identity、
++  来源令牌或工具注册表。
++- `send(action, params)` 是主聊天窗口的提交面；未绑定时不可用，绑定后
++  不可换绑（防止运行期替换提交端口）。
++
++本类自身不铸造任何身份：直接构造得到的是未绑定空壳，`send` 拒绝；
++`bind` 需要框架铸造的提交端口，普通代码无从取得。
++"""
++from __future__ import annotations
++
++
++class MainWindowAdapter:
++    """主聊天窗口适配器：只持有框架注入的提交端口。"""
++
++    __slots__ = ("_submit",)
++
++    def __init__(self):
++        object.__setattr__(self, "_submit", None)
++
++    def __setattr__(self, *a):
++        raise PermissionError("main_window_adapter_immutable")
++
++    def bind(self, submit) -> None:
++        """框架专用：注入提交端口（只允许一次）。"""
++        if not callable(submit):
++            raise TypeError("submit_port_must_be_callable")
++        if object.__getattribute__(self, "_submit") is not None:
++            raise PermissionError("main_window_already_bound")
++        object.__setattr__(self, "_submit", submit)
++
++    def send(self, action: str, params: dict | None = None) -> dict:
++        submit = object.__getattribute__(self, "_submit")
++        if submit is None:
++            raise PermissionError("main_window_not_bound")
++        return submit(action, params)
+diff --git a/tests/conftest.py b/tests/conftest.py
+index c6ef44d..2e80a10 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -147,6 +147,10 @@ def isolated_env(request, tmp_path, monkeypatch):
+ 
+     db.close_thread_conns()
+     llm_client.set_llm(None)
++    # 测试卫生：用例中途失败时防止 owner 会话名额跨用例泄漏
++    # （正常路径由持有名额的 Application.close() 释放）。
++    from opc_workbench import _owner_session
++    _owner_session.release()
+ 
+ 
+ @pytest.fixture()
+@@ -350,22 +354,28 @@ def gated_embedder_cls():
+     return GatedEmbedder
+ 
+ 
+-class OwnerAdapter:
+-    """主窗口适配器替身：只接收框架注入的提交端口，不接触任何身份对象。"""
++def _run_module_entry():
++    """以标准库 runpy 真实执行可信入口（等价 `python -m opc_workbench.app`）。
+ 
+-    def __init__(self):
+-        self.submit = None
+-
+-    def bind(self, submit):
+-        self.submit = submit
++    runpy 就是 `-m` 的实现：以真实模块 spec + 临时 `__main__` 命名空间
++    **重新执行入口模块源码**，不能注入适配器、不能跳过入口代码；与
++    exec 伪造调用帧（只改 `__name__`，不执行入口模块）有本质区别。
++    返回 (application, adapter)，adapter 由入口流程内部创建。
++    """
++    import runpy
++    import warnings
++    with warnings.catch_warnings():
++        # 模块已被正常导入过时的预期提示（双实例正是入口语义）
++        warnings.simplefilter("ignore", RuntimeWarning)
++        ns = runpy.run_module("opc_workbench.app", run_name="__main__",
++                              alter_sys=True)
++    return ns["_entry_application"], ns["_entry_adapter"]
+ 
+ 
+-def _call_as_entry_point(adapter):
+-    """以 `__main__` 身份调用 app.main(adapter)，模拟真实进程入口。"""
+-    g = {"__name__": "__main__", "adapter": adapter}
+-    exec(compile("from opc_workbench import app\n"
+-                 "result = app.main(adapter)\n", "<entry>", "exec"), g)
+-    return g["result"]
++@pytest.fixture()
++def module_entry():
++    """真实入口执行器：返回 (application, adapter)。"""
++    return _run_module_entry
+ 
+ 
+ @pytest.fixture()
+@@ -374,11 +384,9 @@ def owner_entry(isolated_env):
+     opened = []
+ 
+     def run():
+-        adapter = OwnerAdapter()
+-        application = _call_as_entry_point(adapter)
+-        assert adapter.submit is not None, "主聊天提交端口未注入"
++        application, adapter = _run_module_entry()
+         opened.append(application)
+-        return application, adapter.submit
++        return application, adapter.send
+ 
+     yield run
+     for application in opened:
+diff --git a/tests/test_m32_security_boundary.py b/tests/test_m32_security_boundary.py
+index a2c5195..37390a8 100644
+--- a/tests/test_m32_security_boundary.py
++++ b/tests/test_m32_security_boundary.py
+@@ -288,7 +288,7 @@ def test_attack_ordinary_call_does_not_preempt_startup(isolated_env, db_conn,
+     """攻击：普通业务模块抢先调用公开工厂。
+ 
+     断言一：拿不到原始生产 writer（任何公开属性）。
+-    断言二：不影响真正启动——随后 app.main() 的启动器仍装配出可用应用。
++    断言二：不影响真正启动——随后模块入口仍装配出可用应用。
+     断言三：修复后真实调用链（工具注册 / CAS / 披露）端到端仍正常。
+     """
+     # ① 普通模块抢先调用（修复前此处即可取得生产 writer）
+@@ -299,9 +299,9 @@ def test_attack_ordinary_call_does_not_preempt_startup(isolated_env, db_conn,
+     with pytest.raises(PermissionError, match="disclosure_service_writer_not_exposed"):
+         grabbed.disclosure._writer
+ 
+-    # ② 普通模块调用入口被拒；真实入口（__main__）仍装配出独立可用应用
++    # ② 普通模块调用入口被拒；真实模块入口仍装配出独立可用应用
+     with pytest.raises(PermissionError, match="owner_entry_point_only"):
+-        app.main()
++        app._run_entry()
+     started, _submit = owner_entry()
+     assert started is not grabbed
+     assert not hasattr(started, "writer")
+diff --git a/tests/test_m5a_dispatch.py b/tests/test_m5a_dispatch.py
+index dea2986..4cbcd60 100644
+--- a/tests/test_m5a_dispatch.py
++++ b/tests/test_m5a_dispatch.py
+@@ -1,13 +1,14 @@
+ """M5-a 组合根接线 + 统一调度入口验收（含 B1/B2 最终边界）。
+ 
+ 覆盖：
+-1. 主聊天提交端口 → import_doc → search 真实链路（端口只由 __main__ 入口注入）；
+-2. 普通模块调用 main()/launcher/_compose 都拿不到 boss 来源；
++1. 主聊天提交端口 → import_doc → search 真实链路（端口只由模块入口注入）；
++2. 唯一可信启动 = `python -m opc_workbench.app`：普通导入调用、`python -c`、
++   普通脚本、exec 伪造 `__main__` 帧均取不到 boss 来源；main() 已删除；
+ 3. dict 冒充信封、直构信封、参数伪造身份均无效；
+ 4. 正文自称 boss、转述、跨 Agent 冒充均不提升权限；
+ 5. Agent 角色只来自部署配置快照，普通模块改不动注册表；
+ 6. watcher 无 boss 来源，正常扫描不重复 embedding；
+-7. watcher 启停、应用关闭与 writer 关闭顺序；
++7. owner 会话名额：普通应用关闭不释放；绑定/启动/关停异常走可靠清理；
+ 8. 公开面取不到生产 writer，也绕不过 dispatch；原始注册表不在公开面。
+ """
+ from __future__ import annotations
+@@ -90,37 +91,156 @@ def test_build_application_has_no_boss_source(application):
+ 
+ 
+ def test_ordinary_module_cannot_enter_owner_boundary():
+-    """普通模块（测试模块）调用入口 = 被拒，不是"拿到但没用"。"""
++    """普通模块（测试模块）调用入口 = 被拒；面向调用方的 main() 已删除。"""
++    assert not hasattr(app, "main")
+     with pytest.raises(PermissionError, match="owner_entry_point_only"):
+-        app.main()
++        app._run_entry()
+     with pytest.raises(PermissionError, match="owner_entry_point_only"):
+         app._compose(with_owner_channel=True)
++    with pytest.raises(TypeError):
++        app._run_entry(object())     # 入口不接受外部传入适配器
+ 
+ 
+-class _Adapter:
+-    def __init__(self):
+-        self.submit = None
++def test_forged_main_frame_cannot_enter():
++    """exec 伪造 `__main__` 调用帧不是可信入口：守卫验证进程主模块，不看帧。"""
++    for code in (
++            "from opc_workbench import app\nresult = app._run_entry()",
++            "from opc_workbench import app\n"
++            "result = app._compose(with_owner_channel=True)"):
++        with pytest.raises(PermissionError, match="owner_entry_point_only"):
++            exec(compile(code, "<forged>", "exec"), {"__name__": "__main__"})
+ 
+-    def bind(self, submit):
+-        self.submit = submit
+ 
++def _clean_subprocess_env(tmp_path):
++    repo = Path(__file__).resolve().parent.parent
++    env = {k: v for k, v in os.environ.items()
++           if k not in (config.AGENT_ROLES_ENV, "PYTHONPATH")}
++    env["PYTHONPATH"] = str(repo)   # 脚本进程 sys.path[0] 是脚本目录，需显式指路
++    env["PA_DB_PATH"] = str(tmp_path / "entry.db")
++    env["VAULT_PATH"] = str(tmp_path / "vault")
++    env["DASHSCOPE_API_KEY"] = ""
++    (tmp_path / "vault").mkdir(exist_ok=True)
++    return env
+ 
+-def _enter_owner():
+-    """再次以 __main__ 身份进入入口（用于会话上限验证）。"""
+-    g = {"__name__": "__main__", "adapter": _Adapter()}
+-    exec(compile("from opc_workbench import app\n"
+-                 "result = app.main(adapter)\n", "<entry>", "exec"), g)
+-    return g["result"]
++
++def test_python_c_and_script_cannot_enter(tmp_path):
++    """`python -c` 与普通脚本进程都不是模块入口，取不到老板来源。"""
++    repo = Path(__file__).resolve().parent.parent
++    env = _clean_subprocess_env(tmp_path)
++    code = "from opc_workbench import app\napp._run_entry()\n"
++    proc = subprocess.run([sys.executable, "-c", code], cwd=str(repo),
++                          env=env, capture_output=True, text=True, timeout=60)
++    assert proc.returncode != 0
++    assert "owner_entry_point_only" in proc.stderr
++
++    script = tmp_path / "launch.py"
++    script.write_text(code, encoding="utf-8")
++    proc2 = subprocess.run([sys.executable, str(script)], cwd=str(repo),
++                           env=env, capture_output=True, text=True, timeout=60)
++    assert proc2.returncode != 0
++    assert "owner_entry_point_only" in proc2.stderr
++
++
++def test_module_entry_command_starts(tmp_path):
++    """唯一可信启动命令真实可用：`python -m opc_workbench.app` 正常退出。"""
++    repo = Path(__file__).resolve().parent.parent
++    env = _clean_subprocess_env(tmp_path)
++    proc = subprocess.run([sys.executable, "-m", "opc_workbench.app"],
++                          cwd=str(repo), env=env, capture_output=True,
++                          text=True, timeout=60)
++    assert proc.returncode == 0, proc.stderr
+ 
+ 
+-def test_owner_session_is_entry_scoped(owner_entry):
++def test_owner_session_is_entry_scoped(owner_entry, module_entry):
+     """同一进程只允许一个活动 owner 会话；关停后才可再次进入。"""
+     application, _submit = owner_entry()
+     with pytest.raises(PermissionError, match="owner_session_already_active"):
+-        _enter_owner()
++        module_entry()
+     application.close()          # owner_entry 的清理再次 close 是幂等的
+ 
+ 
++def test_ordinary_close_does_not_release_owner_session(owner_entry, module_entry):
++    """顺序验证：老板会话活动中，普通应用关闭不得释放名额。"""
++    application, _submit = owner_entry()
++    ordinary = app.build_application()
++    ordinary.close()
++    with pytest.raises(PermissionError, match="owner_session_already_active"):
++        module_entry()           # 第二个老板会话仍进不来
++    application.close()          # 只有持有者关闭后才放行
++    second, _adapter = module_entry()
++    try:
++        assert second is not application
++    finally:
++        second.close()
++
++
++def test_entry_bind_failure_cleans_up(isolated_env, kdim, module_entry,
++                                      owner_entry):
++    """适配器绑定失败：应用关闭、名额释放、无残留 watcher，可重新启动。"""
++    from opc_workbench import _owner_session, main_window
++
++    def boom(self, submit):
++        raise RuntimeError("bind_failed")
++
++    with pytest.MonkeyPatch.context() as mp:
++        mp.setattr(main_window.MainWindowAdapter, "bind", boom)
++        with pytest.raises(RuntimeError, match="bind_failed"):
++            module_entry()
++    assert not _owner_session.is_active()
++    assert not any(t.name == "vault-watcher" for t in threading.enumerate())
++    owner_entry()                # 名额已归还，正常启动成功
++
++
++def test_entry_start_failure_cleans_up(isolated_env, kdim, module_entry,
++                                       owner_entry):
++    """后台启动失败：同样走清理路径，不遗留活动会话。"""
++    from opc_workbench import _owner_session, vault_watcher
++
++    def boom(self):
++        raise RuntimeError("start_failed")
++
++    with pytest.MonkeyPatch.context() as mp:
++        mp.setattr(vault_watcher.VaultWatcher, "start", boom)
++        with pytest.raises(RuntimeError, match="start_failed"):
++            module_entry()
++    assert not _owner_session.is_active()
++    owner_entry()
++
++
++def test_close_releases_session_even_if_stop_fails(owner_entry):
++    """watcher 停止异常也不能把名额遗留为活动状态（释放在 finally）。"""
++    from opc_workbench import _owner_session, vault_watcher
++
++    application, _submit = owner_entry()
++    seen = []
++
++    def boom(self):
++        seen.append(self)
++        raise RuntimeError("stop_failed")
++
++    with pytest.MonkeyPatch.context() as mp:
++        mp.setattr(vault_watcher.VaultWatcher, "stop", boom)
++        with pytest.raises(RuntimeError, match="stop_failed"):
++            application.close()
++    assert not _owner_session.is_active()
++    seen[0].stop()               # 测试卫生：收掉被异常跳过的 watcher 线程
++
++
++def test_main_window_adapter_contract():
++    """适配器契约：bind(submit) 一次绑定；未绑定不可用；不接受非可调用。"""
++    from opc_workbench.main_window import MainWindowAdapter
++
++    adapter = MainWindowAdapter()
++    with pytest.raises(PermissionError, match="main_window_not_bound"):
++        adapter.send("knowledge.list_docs")
++    adapter.bind(lambda action, params=None: {"ok": action})
++    assert adapter.send("x") == {"ok": "x"}
++    with pytest.raises(PermissionError, match="main_window_already_bound"):
++        adapter.bind(lambda *a, **kw: None)
++    with pytest.raises(TypeError):
++        MainWindowAdapter().bind(None)
++
++
+ def test_dict_envelope_cannot_forge_boss(application, db_conn):
+     for fake in (
+             {"source": "main_chat", "actor_role": "boss"},
