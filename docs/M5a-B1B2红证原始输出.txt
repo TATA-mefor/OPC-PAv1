@@ -1,0 +1,55 @@
+=== B1 ===
+# red_b1_public_main_chat: 恢复 Dispatcher 公开 main_chat 属性，公开工厂也铸造通道
+# cmd: C:\Users\1\AppData\Local\Doubao\User Data\Default\.doubao\agent_mode\workspace\.sessions\38455536748631554\agents\m_0cweYiCX2vW\wt\m4ingest\.venv\Scripts\python.exe -m pytest tests/test_m5a_dispatch.py -k no_boss_channel -m not live -q --no-header -p no:cacheprovider
+
+F                                                                        [100%]
+================================== FAILURES ===================================
+_________________ test_build_application_has_no_boss_channel __________________
+
+application = <opc_workbench.app.Application object at 0x00000186FEB3E700>
+
+    def test_build_application_has_no_boss_channel(application):
+>       assert not hasattr(application.dispatcher, "main_chat")
+E       AssertionError: assert not True
+E        +  where True = hasattr(<opc_workbench.dispatch.Dispatcher object at 0x00000186FEA93BC0>, 'main_chat')
+E        +    where <opc_workbench.dispatch.Dispatcher object at 0x00000186FEA93BC0> = <opc_workbench.app.Application object at 0x00000186FEB3E700>.dispatcher
+
+tests\test_m5a_dispatch.py:81: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_m5a_dispatch.py::test_build_application_has_no_boss_channel
+1 failed, 9 deselected in 1.31s
+
+# probe cmd: C:\Users\1\AppData\Local\Doubao\User Data\Default\.doubao\agent_mode\workspace\.sessions\38455536748631554\agents\m_0cweYiCX2vW\wt\m4ingest\.venv\Scripts\python.exe -m pytest tests/test_zz_red_probe.py -m not live -q -s --no-header -p no:cacheprovider
+
+EXPLOIT_OK status=ready owner_role=sales
+.
+1 passed in 0.35s
+
+=== B2 ===
+# red_b2_public_register_agent: 恢复公开 register_agent(agent_id, role)
+# cmd: C:\Users\1\AppData\Local\Doubao\User Data\Default\.doubao\agent_mode\workspace\.sessions\38455536748631554\agents\m_0cweYiCX2vW\wt\m4ingest\.venv\Scripts\python.exe -m pytest tests/test_m5a_dispatch.py -k framework_registry -m not live -q --no-header -p no:cacheprovider
+
+F                                                                        [100%]
+================================== FAILURES ===================================
+________________ test_agent_roles_come_from_framework_registry ________________
+
+application = <opc_workbench.app.Application object at 0x0000025BEA1334C0>
+
+    def test_agent_roles_come_from_framework_registry(application):
+        # 框架预置的 id 能取到句柄，角色固定；调度器没有"自注册"方法
+>       assert not hasattr(application.dispatcher, "register_agent")
+E       AssertionError: assert not True
+E        +  where True = hasattr(<opc_workbench.dispatch.Dispatcher object at 0x0000025BE90CFC30>, 'register_agent')
+E        +    where <opc_workbench.dispatch.Dispatcher object at 0x0000025BE90CFC30> = <opc_workbench.app.Application object at 0x0000025BEA1334C0>.dispatcher
+
+tests\test_m5a_dispatch.py:141: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_m5a_dispatch.py::test_agent_roles_come_from_framework_registry
+1 failed, 9 deselected in 1.34s
+
+# probe cmd: C:\Users\1\AppData\Local\Doubao\User Data\Default\.doubao\agent_mode\workspace\.sessions\38455536748631554\agents\m_0cweYiCX2vW\wt\m4ingest\.venv\Scripts\python.exe -m pytest tests/test_zz_red_probe.py -m not live -q -s --no-header -p no:cacheprovider
+
+EXPLOIT_OK version=1 owner_role=cfo
+.
+1 passed in 0.34s
+
