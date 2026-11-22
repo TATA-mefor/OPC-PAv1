@@ -1,0 +1,2271 @@
+diff --git a/opc_workbench/config.py b/opc_workbench/config.py
+index 9c9d1b6..11da9aa 100644
+--- a/opc_workbench/config.py
++++ b/opc_workbench/config.py
+@@ -21,6 +21,13 @@ DASHSCOPE_BASE_URL = os.getenv(
+ ).strip()
+ DASHSCOPE_MODEL = os.getenv("DASHSCOPE_MODEL", "qwen-plus").strip()
+ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-v4").strip()
++# M4 第二批 C5（用户裁决 2026-11-22）：维度固定 1024；模型/维度变化由老板
++# 显式触发重建，不自动全量调用 API。批上限 10 条/请求为 text-embedding-v4 规格。
++EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1024"))
++EMBED_BATCH_SIZE = 10
++KNOWLEDGE_TOP_K = 5           # 检索默认返回块数
++KNOWLEDGE_MIN_SCORE = 0.35    # 余弦阈值，低于视为未命中（PRD §5.3）
++MISSING_RETENTION_DAYS = 7    # watcher 判定消失后索引保留天数（PRD §5.3）
+ 
+ # ---- 路径（测试经 fixture 重定向，业务代码一律引用本模块常量） ----
+ DATA_DIR = PROJECT_ROOT / "data"
+diff --git a/opc_workbench/db.py b/opc_workbench/db.py
+index 77b453b..53dde48 100644
+--- a/opc_workbench/db.py
++++ b/opc_workbench/db.py
+@@ -533,8 +533,60 @@ def m004_bulk_delete_recovery(conn) -> None:
+     conn.execute("ALTER TABLE schedules ADD COLUMN recovery_enqueued_at TEXT")
+ 
+ 
++def m005_knowledge_index(conn) -> None:
++    """M4 第二批：索引版本列 + 意图表 + 受控可见性视图（不重建 knowledge_docs）。
++
++    用户裁决 C1/C2（2026-11-22）：
++    - C1 方案 A：建 knowledge_chunks_visible 视图，owner_role/visibility 由
++      knowledge_docs 单一真源 JOIN 取得；chunk 检索因此能经 query_visible 治理。
++      **视图只读**：SQLite 无 INSTEAD OF 触发器的视图不可写，写入仍只经注入 writer。
++    - C2 不做内容级去重：**不建 (owner_role,file_hash) 唯一索引**。文档身份是
++      stored_path；不同路径即使正文相同也各自入库，互不覆盖、不串权限。
++    - status 保持四态（重建表才能扩 CHECK）：reindex 期间维持 ready，
++      删除走 pending_deletions 意图表而非新状态位。
++    """
++    for stmt in (
++        "ALTER TABLE knowledge_docs ADD COLUMN source_hash TEXT",
++        "ALTER TABLE knowledge_docs ADD COLUMN indexed_hash TEXT",
++        "ALTER TABLE knowledge_docs ADD COLUMN embed_model TEXT",
++        "ALTER TABLE knowledge_docs ADD COLUMN embed_dim INTEGER",
++        "ALTER TABLE knowledge_docs ADD COLUMN updated_at TEXT",
++        "ALTER TABLE knowledge_docs ADD COLUMN last_error TEXT",
++    ):
++        conn.execute(stmt)
++    # 历史行回填：既有 file_hash 视为"已成功索引"，绝不触发历史重嵌入。
++    conn.execute(
++        "UPDATE knowledge_docs SET indexed_hash=file_hash, source_hash=file_hash "
++        "WHERE indexed_hash IS NULL"
++    )
++    conn.execute(
++        "CREATE TABLE pending_deletions ("
++        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
++        "doc_id INTEGER,"
++        "stored_path TEXT NOT NULL UNIQUE,"
++        "created_at TEXT NOT NULL)"
++    )
++    conn.execute(
++        "CREATE TABLE pending_vault_writes ("
++        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
++        "stored_path TEXT NOT NULL UNIQUE,"
++        "content TEXT NOT NULL,"
++        "created_at TEXT NOT NULL)"
++    )
++    conn.execute(
++        "CREATE VIEW knowledge_chunks_visible AS "
++        "SELECT c.id AS id, c.doc_id AS doc_id, c.seq AS seq, "
++        "c.content AS content, c.embedding AS embedding, "
++        "d.owner_role AS owner_role, d.visibility AS visibility, "
++        "d.stored_path AS stored_path, d.filename AS filename, "
++        "d.status AS status, d.embed_model AS embed_model, d.embed_dim AS embed_dim "
++        "FROM knowledge_chunks c JOIN knowledge_docs d ON d.id = c.doc_id"
++    )
++
++
+ MIGRATIONS = [m001_init, m002_task_idempotency,
+-              m003_report_identity_version, m004_bulk_delete_recovery]
++              m003_report_identity_version, m004_bulk_delete_recovery,
++              m005_knowledge_index]
+ 
+ 
+ # 属性白名单：正常接口只允许这些名字，其余（含 _conn/_cur 内部槽、
+diff --git a/opc_workbench/knowledge_index.py b/opc_workbench/knowledge_index.py
+new file mode 100644
+index 0000000..5865f50
+--- /dev/null
++++ b/opc_workbench/knowledge_index.py
+@@ -0,0 +1,67 @@
++"""向量编解码与检索打分（M4 第二批）。
++
++纪律：
++- 只依赖已锁定的 numpy，零新依赖；不触网、不读库、不做 IO。
++- 存储统一 float32 且**入库前 L2 归一化**，检索用点积即余弦。
++- 维度/模型不一致的向量**判为不可比并跳过**（记 WARN），绝不静默混算。
++- 本模块不落任何正文到日志。
++"""
++from __future__ import annotations
++
++import numpy as np
++
++from . import audit_log
++
++
++def encode_vector(vec) -> bytes:
++    """校验 + L2 归一化 + float32 序列化。非法向量一律拒绝，不入库。"""
++    arr = np.asarray(vec, dtype=np.float32)
++    if arr.ndim != 1 or arr.size == 0:
++        raise ValueError("vector_invalid")
++    if not np.all(np.isfinite(arr)):
++        raise ValueError("vector_not_finite")
++    norm = float(np.linalg.norm(arr))
++    if norm == 0.0:
++        raise ValueError("vector_zero_norm")
++    return (arr / norm).tobytes()
++
++
++def decode_vector(blob: bytes) -> np.ndarray:
++    arr = np.frombuffer(blob, dtype=np.float32)
++    if arr.size == 0:
++        raise ValueError("vector_empty")
++    return arr
++
++
++def normalize_query(vec) -> np.ndarray:
++    """查询向量归一化（与入库同口径，保证点积=余弦）。"""
++    return np.frombuffer(encode_vector(vec), dtype=np.float32)
++
++
++def rank_chunks(rows: list, query_vec, *, top_k: int) -> list[dict]:
++    """对**已经过可见性过滤**的行打分排序。
++
++    入参 rows 必须由 visibility.query_visible 产出（含 owner_role/visibility）。
++    本函数不做任何权限判断——权限在上游闸门完成，此处只负责相似度。
++    维度与查询不一致的行跳过并记 WARN（不含正文）。
++    """
++    if top_k <= 0:
++        raise ValueError("top_k_invalid")
++    q = normalize_query(query_vec)
++    scored: list[dict] = []
++    for row in rows:
++        vec = decode_vector(row["embedding"])
++        if vec.size != q.size:
++            audit_log.log("WARN", "chunk_dim_mismatch", target_table="knowledge_chunks",
++                          target_id=row["doc_id"], result_code="chunk_dim_mismatch")
++            continue
++        score = float(np.dot(q, vec))
++        scored.append({
++            "doc_id": row["doc_id"], "seq": row["seq"], "content": row["content"],
++            "stored_path": row["stored_path"], "vault_path": row["stored_path"],
++            "filename": row["filename"],
++            "owner_role": row["owner_role"], "visibility": row["visibility"],
++            "score": score,
++        })
++    scored.sort(key=lambda h: (-h["score"], h["doc_id"], h["seq"]))
++    return scored[:top_k]
+\ No newline at end of file
+diff --git a/opc_workbench/knowledge_service.py b/opc_workbench/knowledge_service.py
+new file mode 100644
+index 0000000..de41420
+--- /dev/null
++++ b/opc_workbench/knowledge_service.py
+@@ -0,0 +1,311 @@
++"""知识导入/更新/检索/删除的状态机（M4 第二批）。
++
++冻结裁决（用户 2026-11-22，C1–C6）：
++- C1：检索经 visibility.query_visible("knowledge_chunks_visible", caller_role)，
++  治理列由 knowledge_docs 单一真源 JOIN 取得；视图只读，写入只经注入 writer。
++- C2：文档身份是 stored_path，**不做内容级去重**；不同路径同内容各自入库。
++  文件移动按路径身份处理：旧路径删除，新路径作为新文档导入，绝不合并。
++- C3：embed 走 LLMClient 独立 embed_breaker。
++- C5：维度固定 config.EMBEDDING_DIM；模型/维度变化不自动全量重嵌入。
++- C6：hash = sha256(正文 UTF-8)，不含 frontmatter；只改 visibility 不重嵌入，
++  但**必须立即更新 DB 权限**，检索即时生效。
++
++两条硬红线：
++1. **先校验路径再读文件**：resolve_safe_path → read → load_doc。
++   load_doc 校验的是路径字符串而非读取行为，先读后验等于没校验。
++2. **B8 版本保护**：嵌入在事务外做；提交时用
++   `UPDATE ... WHERE id=? AND source_hash=?` 条件更新，rowcount==0 即判定
++   本轮结果过期，整事务回滚，一个 chunk 都不写。indexed_hash 只在成功后前进。
++
++读写边界：对外检索一律经 query_visible 治理闸门；写入事务内读取**自身索引状态**
++（doc 行/hash）用注入 writer 的游标，属写路径内部状态，不构成 Agent 业务查询。
++"""
++from __future__ import annotations
++
++import hashlib
++from pathlib import Path
++
++from . import (audit_log, chunking, config, db, knowledge_index, llm_client,
++               vault, visibility)
++
++
++def body_hash(body: str) -> str:
++    """C6 统一口径：正文 UTF-8 字节的 sha256，不含 frontmatter。"""
++    return "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
++
++
++class KnowledgeService:
++    """知识库应用服务。writer 由组合根注入，**不依赖 Application.writer**。"""
++
++    def __init__(self, writer, *, llm=None, vault_root=None):
++        self._writer = writer
++        self._llm = llm
++        self._root = Path(vault_root) if vault_root is not None else config.VAULT_PATH
++
++    # -- 内部 ---------------------------------------------------------------
++
++    def _embedder(self):
++        return self._llm if self._llm is not None else llm_client.get_llm()
++
++    def _read_validated(self, rel: str) -> tuple[str, dict]:
++        """红线1：路径校验必须发生在读取之前。"""
++        path = vault.resolve_safe_path(self._root, rel)   # ① 先校验
++        text = path.read_text(encoding="utf-8")           # ② 再读取
++        return text, vault.load_doc(self._root, rel, text)  # ③ 组合入口定归属
++
++    @staticmethod
++    def _effective_visibility(meta: dict) -> str:
++        # shared/ 归 coordinator 且强制 public（目录映射既定语义）
++        if meta["owner_role"] == vault.SHARED_OWNER:
++            return "public"
++        return meta["visibility"]
++
++    @staticmethod
++    def _doc_row(cur, rel: str):
++        return cur.execute(
++            "SELECT id, indexed_hash, source_hash, status, embed_model, embed_dim "
++            "FROM knowledge_docs WHERE stored_path=?", (rel,)).fetchone()
++
++    # -- 导入 / 更新 ---------------------------------------------------------
++
++    def ingest(self, rel: str) -> dict:
++        """导入或更新单个文档。返回处理结果元数据（不含正文）。"""
++        text, doc = self._read_validated(rel)
++        meta, body = doc["meta"], doc["body"]
++        owner = meta["owner_role"]
++        vis = self._effective_visibility(meta)
++        digest = body_hash(body)
++        now = db.now_iso()
++        filename = Path(rel).name
++
++        # TX1：登记/更新身份与权限（C6：即使正文未变也立即更新 visibility/owner）
++        with self._writer.transaction() as cur:
++            row = self._doc_row(cur, rel)
++            if row is None:
++                cur.execute(
++                    "INSERT INTO knowledge_docs(filename,stored_path,file_hash,"
++                    "owner_role,visibility,chunk_count,status,created_at,"
++                    "source_hash,updated_at) VALUES(?,?,?,?,?,0,'processing',?,?,?)",
++                    (filename, rel, digest, owner, vis, now, digest, now))
++                doc_id = cur.lastrowid
++                already_indexed = False
++            else:
++                doc_id = row["id"]
++                already_indexed = (row["indexed_hash"] == digest
++                                   and row["embed_model"] == config.EMBEDDING_MODEL
++                                   and row["embed_dim"] == config.EMBEDDING_DIM
++                                   and row["status"] == "ready")
++                # reindex 期间保持 ready（旧索引继续可搜）；首次导入才是 processing
++                status = "ready" if row["indexed_hash"] is not None else "processing"
++                cur.execute(
++                    "UPDATE knowledge_docs SET filename=?,file_hash=?,owner_role=?,"
++                    "visibility=?,source_hash=?,status=?,updated_at=? WHERE id=?",
++                    (filename, digest, owner, vis, digest, status, now, doc_id))
++
++        if already_indexed:
++            return {"doc_id": doc_id, "status": "ready", "reindexed": False,
++                    "stale": False, "owner_corrected": doc["owner_corrected"]}
++
++        try:
++            pieces = chunking.chunk_text(body)
++            vectors = self._embedder().embed(pieces) if pieces else []
++            if len(vectors) != len(pieces):
++                raise ValueError("embed_count_mismatch")
++            blobs = [knowledge_index.encode_vector(v) for v in vectors]
++        except Exception as exc:  # noqa: BLE001 — 失败只记错误码，不落正文
++            code = f"{type(exc).__name__}:{exc}"[:200]
++            with self._writer.transaction() as cur:
++                cur.execute(
++                    "UPDATE knowledge_docs SET status='failed',last_error=?,updated_at=? "
++                    "WHERE id=?", (code, db.now_iso(), doc_id))
++            audit_log.log("ERROR", "knowledge_index_failed", target_table="knowledge_docs",
++                          target_id=doc_id, result_code="index_failed", source=rel)
++            return {"doc_id": doc_id, "status": "failed", "reindexed": False,
++                    "stale": False, "error": code,
++                    "owner_corrected": doc["owner_corrected"]}
++
++        # TX2：B8 条件提交——source_hash 仍是本轮读到的值才允许落库
++        dim = len(vectors[0]) if vectors else config.EMBEDDING_DIM
++        try:
++            with self._writer.transaction() as cur:
++                cur.execute(
++                    "UPDATE knowledge_docs SET indexed_hash=?,chunk_count=?,embed_model=?,"
++                    "embed_dim=?,status='ready',last_error=NULL,updated_at=? "
++                    "WHERE id=? AND source_hash=?",
++                    (digest, len(pieces), config.EMBEDDING_MODEL, dim,
++                     db.now_iso(), doc_id, digest))
++                if cur.rowcount == 0:
++                    # 本轮结果已被更新版本取代：整事务回滚，一个 chunk 都不写
++                    audit_log.log("INFO", "index_stale_discarded",
++                                  target_table="knowledge_docs", target_id=doc_id,
++                                  result_code="index_stale_discarded", source=rel)
++                    raise _StaleIndex()
++                cur.execute("DELETE FROM knowledge_chunks WHERE doc_id=?", (doc_id,))
++                for seq, (piece, blob) in enumerate(zip(pieces, blobs)):
++                    cur.execute(
++                        "INSERT INTO knowledge_chunks(doc_id,seq,content,embedding) "
++                        "VALUES(?,?,?,?)", (doc_id, seq, piece, blob))
++        except _StaleIndex:
++            return {"doc_id": doc_id, "status": "stale", "reindexed": False,
++                    "stale": True, "owner_corrected": doc["owner_corrected"]}
++
++        return {"doc_id": doc_id, "status": "ready", "reindexed": True, "stale": False,
++                "chunk_count": len(pieces), "owner_corrected": doc["owner_corrected"]}
++
++    def write_doc(self, rel: str, meta: dict, body: str) -> dict:
++        """老板写盘路径：意图表 → 原子写 → 清意图 → 索引。崩溃可幂等重放。"""
++        vault.resolve_safe_path(self._root, rel)          # 先校验，后落盘
++        owner = vault.owner_for_relpath(rel)
++        meta = dict(meta, owner_role=owner)
++        if owner == vault.SHARED_OWNER:
++            meta["visibility"] = "public"
++        text = vault.serialize_frontmatter(meta, body)
++        with self._writer.transaction() as cur:
++            cur.execute(
++                "INSERT INTO pending_vault_writes(stored_path,content,created_at) "
++                "VALUES(?,?,?) ON CONFLICT(stored_path) DO UPDATE SET "
++                "content=excluded.content,created_at=excluded.created_at",
++                (rel, text, db.now_iso()))
++        vault.atomic_write(vault.resolve_safe_path(self._root, rel), text)
++        with self._writer.transaction() as cur:
++            cur.execute("DELETE FROM pending_vault_writes WHERE stored_path=?", (rel,))
++        return self.ingest(rel)
++
++    # -- 检索 ---------------------------------------------------------------
++
++    def search(self, query: str, caller_role: str, *, top_k: int | None = None) -> list[dict]:
++        """Agent 检索。**先经 M2 治理闸门过滤，再打分**。
++
++        caller_role 由框架注入（上游经 resolve_caller），本服务不采信 LLM 身份字段。
++        无 Key/熔断时抛 LLMFailure，由上层降级，不返回未过滤结果。
++        """
++        k = config.KNOWLEDGE_TOP_K if top_k is None else top_k
++        rows = visibility.query_visible("knowledge_chunks_visible", caller_role,
++                                        status="ready")
++        if not rows:
++            return []
++        qvec = self._embedder().embed([query])[0]
++        hits = knowledge_index.rank_chunks(rows, qvec, top_k=k)
++        # PRD §5.3：低于阈值视为未命中，Agent 据此明确回答"没有相关内容"
++        return [h for h in hits if h["score"] >= config.KNOWLEDGE_MIN_SCORE]
++
++    def list_docs(self, caller_role: str, *, owner_role: str | None = None) -> list[dict]:
++        """文档清单，经治理闸门过滤（不含正文与向量）。"""
++        filters = {} if owner_role is None else {"owner_role": owner_role}
++        rows = visibility.query_visible("knowledge_docs", caller_role, **filters)
++        return [{"id": r["id"], "filename": r["filename"], "vault_path": r["stored_path"],
++                 "owner_role": r["owner_role"], "visibility": r["visibility"],
++                 "status": r["status"], "chunk_count": r["chunk_count"]} for r in rows]
++
++    # -- 删除与恢复 ----------------------------------------------------------
++
++    def delete(self, rel: str) -> dict:
++        """删除协议：意图 → 删盘 → 删库 → 清意图。任一步崩溃可幂等重放。
++
++        绝不采用"DB 先删 → 失败仅 WARN → watcher 猜孤儿"（用户已否决）。
++        """
++        vault.resolve_safe_path(self._root, rel)
++        with self._writer.transaction() as cur:
++            row = self._doc_row(cur, rel)
++            doc_id = row["id"] if row is not None else None
++            cur.execute(
++                "INSERT INTO pending_deletions(doc_id,stored_path,created_at) "
++                "VALUES(?,?,?) ON CONFLICT(stored_path) DO NOTHING",
++                (doc_id, rel, db.now_iso()))
++        self._replay_deletion(rel, doc_id)
++        return {"deleted": True, "doc_id": doc_id}
++
++    def _replay_deletion(self, rel: str, doc_id) -> None:
++        path = vault.resolve_safe_path(self._root, rel)
++        if path.exists():
++            path.unlink()
++        with self._writer.transaction() as cur:
++            if doc_id is None:
++                row = self._doc_row(cur, rel)
++                doc_id = row["id"] if row is not None else None
++            if doc_id is not None:
++                cur.execute("DELETE FROM knowledge_chunks WHERE doc_id=?", (doc_id,))
++                cur.execute("DELETE FROM knowledge_docs WHERE id=?", (doc_id,))
++            cur.execute("DELETE FROM knowledge_docs WHERE stored_path=?", (rel,))
++            cur.execute("DELETE FROM pending_deletions WHERE stored_path=?", (rel,))
++
++    def mark_missing(self, rel: str) -> dict:
++        """watcher 判定文件消失：标记 missing，**保留索引供恢复**（PRD §5.3）。
++
++        与 delete() 的区别：delete 是老板显式确认的彻底删除（连带文件与索引）；
++        missing 只是文件不在了，索引保留 MISSING_RETENTION_DAYS 天。
++        missing 文档不参与检索（视图按 status='ready' 过滤）。
++        """
++        with self._writer.transaction() as cur:
++            cur.execute(
++                "UPDATE knowledge_docs SET status='missing',updated_at=? "
++                "WHERE stored_path=? AND status<>'missing'", (db.now_iso(), rel))
++            changed = cur.rowcount
++        if changed:
++            audit_log.log("WARN", "knowledge_doc_missing", target_table="knowledge_docs",
++                          result_code="missing", source=rel)
++        return {"missing": bool(changed), "vault_path": rel}
++
++    def purge_missing(self, *, now=None) -> dict:
++        """清理超过保留期的 missing 文档（索引与元数据一并删除）。"""
++        from datetime import datetime, timedelta, timezone
++        moment = now or datetime.now(timezone.utc)
++        cutoff = (moment - timedelta(days=config.MISSING_RETENTION_DAYS)).isoformat()
++        conn = db.get_conn()
++        rows = conn.execute(
++            "SELECT id,stored_path FROM knowledge_docs WHERE status='missing' "
++            "AND updated_at IS NOT NULL AND updated_at<? ORDER BY id", (cutoff,)).fetchall()
++        for row in rows:
++            with self._writer.transaction() as cur:
++                cur.execute("DELETE FROM knowledge_chunks WHERE doc_id=?", (row["id"],))
++                cur.execute("DELETE FROM knowledge_docs WHERE id=?", (row["id"],))
++        return {"purged": len(rows)}
++
++    def recover(self) -> dict:
++        """启动恢复：重放未完成意图 + 复位中断的 processing。"""
++        conn = db.get_conn()
++        deletions = conn.execute(
++            "SELECT doc_id,stored_path FROM pending_deletions ORDER BY id").fetchall()
++        writes = conn.execute(
++            "SELECT stored_path,content FROM pending_vault_writes ORDER BY id").fetchall()
++        stuck = conn.execute(
++            "SELECT id,stored_path FROM knowledge_docs WHERE status='processing' "
++            "ORDER BY id").fetchall()
++        for row in deletions:
++            self._replay_deletion(row["stored_path"], row["doc_id"])
++        for row in writes:
++            rel = row["stored_path"]
++            vault.atomic_write(vault.resolve_safe_path(self._root, rel), row["content"])
++            with self._writer.transaction() as cur:
++                cur.execute("DELETE FROM pending_vault_writes WHERE stored_path=?", (rel,))
++        for row in stuck:
++            with self._writer.transaction() as cur:
++                cur.execute(
++                    "UPDATE knowledge_docs SET status='failed',last_error=?,updated_at=? "
++                    "WHERE id=? AND status='processing'",
++                    ("interrupted", db.now_iso(), row["id"]))
++            audit_log.log("WARN", "knowledge_processing_reset",
++                          target_table="knowledge_docs", target_id=row["id"],
++                          result_code="interrupted", source=row["stored_path"])
++        return {"deletions_replayed": len(deletions), "writes_replayed": len(writes),
++                "processing_reset": len(stuck)}
++
++    # -- 快照（watcher 用） ---------------------------------------------------
++
++    def snapshot(self) -> dict:
++        """扫描 vault 内可归属的 .md 文件 → {rel: (mtime, size)}。不做索引。"""
++        snap: dict = {}
++        for path in sorted(self._root.rglob("*.md")):
++            rel = path.relative_to(self._root).as_posix()
++            try:
++                vault.resolve_safe_path(self._root, rel)
++                vault.owner_for_relpath(rel)
++            except ValueError:
++                continue                      # attachments/未知目录/非法路径不纳入
++            st = path.stat()
++            snap[rel] = (st.st_mtime, st.st_size)
++        return snap
++
++
++class _StaleIndex(Exception):
++    """内部信号：本轮索引结果过期，用于触发事务回滚（不外泄）。"""
+\ No newline at end of file
+diff --git a/opc_workbench/llm_client.py b/opc_workbench/llm_client.py
+index 1338ac0..a39b6db 100644
+--- a/opc_workbench/llm_client.py
++++ b/opc_workbench/llm_client.py
+@@ -79,6 +79,9 @@ class LLMClient:
+         self.base_url = base_url or config.DASHSCOPE_BASE_URL
+         self.model = model or config.DASHSCOPE_MODEL
+         self.breaker = CircuitBreaker()
++        # C3（用户裁决 2026-11-22）：embed 独立熔断器。批量索引失败不得把
++        # 日常对话一起熔断；chat 仍只用 self.breaker，行为零改动。
++        self.embed_breaker = CircuitBreaker()
+         self._client = None
+         if self.api_key:
+             from openai import OpenAI  # 延迟导入：无 Key/测试环境不触碰 SDK
+@@ -126,6 +129,83 @@ class LLMClient:
+                 time.sleep(backoff)
+         raise LLMFailure(f"llm_error:{type(last_err).__name__}") from last_err
+ 
++    def embed(self, texts: list[str], *, deadline: float | None = None) -> list[list[float]]:
++        """文本向量化（M4 第二批）。返回顺序与输入严格对齐。
++
++        纪律与 chat 同款：无 Key → LLMFailure；独立 embed_breaker 熔断；
++        仅对 RETRYABLE_STATUS 重试，退避 0.8*(n+1)，越过 deadline 立即停。
++        分批上限 10 条/请求（text-embedding-v4 规格），维度固定 config.EMBEDDING_DIM。
++        **不信任服务端返回顺序**：按 item.index 复位；缺项/多项/维度不符一律失败。
++        本方法不打印文本原文与 Key（日志红线）。
++        """
++        if not isinstance(texts, list) or any(not isinstance(t, str) for t in texts):
++            raise LLMFailure("embed_invalid_input")
++        if not texts:
++            return []
++        if not self.available:
++            raise LLMFailure("no_api_key")
++        out: list[list[float]] = []
++        size = config.EMBED_BATCH_SIZE
++        for start in range(0, len(texts), size):
++            batch = texts[start:start + size]
++            out.extend(self._embed_batch(batch, deadline=deadline))
++        return out
++
++    def _embed_batch(self, batch: list[str], *, deadline: float | None) -> list[list[float]]:
++        if not self.embed_breaker.allow():
++            raise LLMFailure("circuit_open")
++        last_err: Exception | None = None
++        for attempt in range(config.LLM_ATTEMPTS):
++            remaining = None if deadline is None else deadline - time.monotonic()
++            if remaining is not None and remaining <= 0:
++                raise LLMFailure("deadline_exceeded")
++            timeout = config.LLM_TIMEOUT_S if remaining is None else min(
++                config.LLM_TIMEOUT_S, remaining)
++            try:
++                resp = self._client.embeddings.create(
++                    model=config.EMBEDDING_MODEL, input=batch,
++                    dimensions=config.EMBEDDING_DIM, timeout=timeout,
++                )
++                vectors = self._order_vectors(resp, len(batch))
++                self.embed_breaker.record(True)
++                return vectors
++            except LLMFailure:
++                self.embed_breaker.record(False)
++                raise
++            except Exception as exc:  # noqa: BLE001 — 分类后决定是否重试
++                last_err = exc
++                status = getattr(exc, "status_code", None)
++                retryable = status in config.RETRYABLE_STATUS
++                self.embed_breaker.record(False)
++                if not retryable or attempt + 1 >= config.LLM_ATTEMPTS:
++                    break
++                backoff = 0.8 * (attempt + 1)
++                if deadline is not None and deadline - time.monotonic() <= backoff:
++                    raise LLMFailure("deadline_exceeded") from exc
++                time.sleep(backoff)
++        raise LLMFailure(f"embed_error:{type(last_err).__name__}") from last_err
++
++    @staticmethod
++    def _order_vectors(resp, expected: int) -> list[list[float]]:
++        """按 index 复位并校验完整性/维度；任何缺口都不得静默补位。"""
++        items = list(resp.data)
++        if len(items) != expected:
++            raise LLMFailure("embed_count_mismatch")
++        ordered: list[list[float] | None] = [None] * expected
++        for item in items:
++            idx = item.index
++            if not isinstance(idx, int) or not 0 <= idx < expected:
++                raise LLMFailure("embed_index_invalid")
++            if ordered[idx] is not None:
++                raise LLMFailure("embed_index_duplicate")
++            vec = list(item.embedding)
++            if len(vec) != config.EMBEDDING_DIM:
++                raise LLMFailure("embed_dim_mismatch")
++            ordered[idx] = vec
++        if any(v is None for v in ordered):
++            raise LLMFailure("embed_index_missing")
++        return [v for v in ordered if v is not None]
++
+ 
+ _default: LLMClient | None = None
+ _default_lock = threading.Lock()
+diff --git a/opc_workbench/tools/knowledge_tool.py b/opc_workbench/tools/knowledge_tool.py
+new file mode 100644
+index 0000000..96aee57
+--- /dev/null
++++ b/opc_workbench/tools/knowledge_tool.py
+@@ -0,0 +1,132 @@
++"""knowledge_tool（PRD §5.3/§8.2，M4 第二批）。
++
++5 action：import_doc / search / list_docs / delete_doc / reindex。
++**LLM 可见面只有前三个**（LLM_ACTIONS）：
++- reindex 由 vault_watcher 触发，PRD 明确不暴露给 LLM；
++- delete_doc 必须 UI 确认后调用，需可信上下文，同样不进 FC 注册表。
++
++统一纪律（与 M3 工具同款）：
++- 身份经 identity_api.resolve_identity（fail closed，LLM 伪造字段丢弃）；
++- 检索/清单经 KnowledgeService → visibility.query_visible 治理闸门；
++- owner_role **只由目录映射决定**，LLM 传入的 owner_role 一律不采信；
++- 错误统一 {"error":{"code","message"}}；审计只落元数据，无正文。
++
++本类不持有也不暴露 WriteCapability：writer 只注入给 KnowledgeService。
++"""
++from __future__ import annotations
++
++from pydantic import BaseModel, ConfigDict, Field, ValidationError
++
++from .. import audit_log, llm_client
++from ..knowledge_service import KnowledgeService
++
++LLM_ACTIONS: tuple[str, ...] = ("import_doc", "search", "list_docs")
++
++
++def _err(code: str, message: str = "") -> dict:
++    return {"error": {"code": code, "message": message or code}}
++
++
++class ImportParams(BaseModel):
++    model_config = ConfigDict(extra="forbid")   # 未知参数一律拒绝，不静默忽略
++    vault_path: str = Field(min_length=1, max_length=500)
++
++
++class SearchParams(BaseModel):
++    model_config = ConfigDict(extra="forbid")
++    query: str = Field(min_length=1, max_length=2000)
++    top_k: int = Field(default=5, ge=1, le=20)
++
++
++class ListParams(BaseModel):
++    model_config = ConfigDict(extra="forbid")
++
++
++class KnowledgeTool:
++    __slots__ = ("_service", "_identity_api")
++
++    def __init__(self, *, service: KnowledgeService, identity_api):
++        object.__setattr__(self, "_service", service)
++        object.__setattr__(self, "_identity_api", identity_api)
++
++    def __setattr__(self, *a):
++        raise PermissionError("knowledge_tool_immutable")
++
++    def _caller(self, frame_caller, llm_args, trusted_ctx):
++        ident = self._identity_api.resolve_identity(frame_caller, llm_args, trusted_ctx)
++        return self._identity_api.authorize(ident)
++
++    # -- LLM 可见 -----------------------------------------------------------
++
++    def import_doc(self, *, _frame_caller, _llm_args, _trusted_ctx=None, **params) -> dict:
++        try:
++            p = ImportParams(**params)
++        except ValidationError as exc:
++            return _err("invalid_param", str(exc.errors()[0]["msg"]))
++        caller = self._caller(_frame_caller, _llm_args, _trusted_ctx)
++        try:
++            # 归属由目录映射决定；LLM 传入的 owner_role 不在 schema 中，天然被丢弃
++            outcome = self._service.ingest(p.vault_path)
++        except ValueError as exc:
++            return _err(str(exc).split(":")[0])
++        except FileNotFoundError:
++            return _err("not_found")
++        except llm_client.LLMFailure as exc:
++            return _err("llm_unavailable", str(exc))
++        audit_log.log("INFO", "knowledge_import", actor_role=caller,
++                      target_table="knowledge_docs", target_id=outcome["doc_id"],
++                      result_code=outcome["status"], source=p.vault_path)
++        return {"doc_id": outcome["doc_id"], "status": outcome["status"],
++                "vault_path": p.vault_path,
++                "owner_corrected": outcome.get("owner_corrected", False)}
++
++    def search(self, *, _frame_caller, _llm_args, _trusted_ctx=None, **params) -> dict:
++        try:
++            p = SearchParams(**params)
++        except ValidationError as exc:
++            return _err("invalid_param", str(exc.errors()[0]["msg"]))
++        caller = self._caller(_frame_caller, _llm_args, _trusted_ctx)
++        try:
++            hits = self._service.search(p.query, caller, top_k=p.top_k)
++        except llm_client.LLMFailure as exc:
++            return _err("llm_unavailable", str(exc))
++        return {"hits": [{"content": h["content"], "vault_path": h["vault_path"],
++                          "seq": h["seq"], "score": h["score"]} for h in hits]}
++
++    def list_docs(self, *, _frame_caller, _llm_args, _trusted_ctx=None, **params) -> dict:
++        try:
++            ListParams(**params)
++        except ValidationError as exc:
++            return _err("invalid_param", str(exc.errors()[0]["msg"]))
++        caller = self._caller(_frame_caller, _llm_args, _trusted_ctx)
++        return {"docs": self._service.list_docs(caller)}
++
++    # -- 非 LLM 面（UI 确认 / watcher） ---------------------------------------
++
++    def delete_doc(self, *, _frame_caller, _llm_args, _trusted_ctx=None, **params) -> dict:
++        """需 UI 确认的可信上下文；无上下文一律拒绝（不暴露给 LLM）。"""
++        if _trusted_ctx is None:
++            return _err("confirmation_required")
++        caller = self._caller(_frame_caller, _llm_args, _trusted_ctx)
++        rel = params.get("vault_path")
++        if not isinstance(rel, str) or not rel:
++            return _err("invalid_param", "vault_path")
++        try:
++            outcome = self._service.delete(rel)
++        except ValueError as exc:
++            return _err(str(exc).split(":")[0])
++        audit_log.log("INFO", "knowledge_delete", actor_role=caller,
++                      target_table="knowledge_docs", target_id=outcome["doc_id"],
++                      result_code="deleted", source=rel)
++        return {"deleted": True}
++
++    def reindex(self, *, vault_path: str) -> dict:
++        """watcher 专用入口，无身份参数、不进 FC 注册表。"""
++        try:
++            outcome = self._service.ingest(vault_path)
++        except ValueError as exc:
++            return _err(str(exc).split(":")[0])
++        except FileNotFoundError:
++            return _err("not_found")
++        return {"doc_id": outcome["doc_id"], "status": outcome["status"],
++                "chunk_count": outcome.get("chunk_count", 0)}
+\ No newline at end of file
+diff --git a/opc_workbench/vault.py b/opc_workbench/vault.py
+index c594a91..6749ed3 100644
+--- a/opc_workbench/vault.py
++++ b/opc_workbench/vault.py
+@@ -166,8 +166,12 @@ def resolve_safe_path(root: Path | str, rel: str) -> Path:
+ 
+ 
+ def owner_for_relpath(rel: str) -> str:
+-    """目录映射 → owner_role（唯一可信来源）。attachments 与未知目录拒绝。"""
+-    parts = Path(rel).parts
++    """目录映射 → owner_role（唯一可信来源）。attachments 与未知目录拒绝。
++
++    分隔符归一与 resolve_safe_path 同口径：反斜杠按分隔符处理，
++    避免 `cfo\\a.md` 在 Windows 可映射、在 Linux 却判未确定的平台不一致。
++    """
++    parts = PurePosixPath(rel.replace("\\", "/")).parts
+     if not parts:
+         raise ValueError("vault_owner_undetermined")
+     top = parts[0]
+@@ -194,8 +198,11 @@ def load_doc(root: Path | str, rel: str, text: str) -> dict:
+     declared = meta["owner_role"]
+     corrected = declared != dir_owner
+     if corrected:
++        # 字段必须落在 audit_log 白名单内，否则会被静默丢弃、日志无法追溯出处。
++        # actor_role=目录归属，result_code 携带 frontmatter 谎报值，source=相对路径。
+         audit_log.log("WARN", "frontmatter_owner_mismatch",
+-                      target_path=rel, declared_owner=declared, directory_owner=dir_owner)
++                      actor_role=dir_owner, target_table="knowledge_docs",
++                      result_code=f"declared:{declared}", source=rel)
+         meta["owner_role"] = dir_owner
+     validate_doc_meta(meta)                      # 用归一化后的归属做持久化校验
+     return {"meta": meta, "body": body,
+diff --git a/opc_workbench/vault_watcher.py b/opc_workbench/vault_watcher.py
+new file mode 100644
+index 0000000..7332fd3
+--- /dev/null
++++ b/opc_workbench/vault_watcher.py
+@@ -0,0 +1,82 @@
++"""vault 周期扫描（M4 第二批）。
++
++裁决边界（用户已批准）：
++- 生产启动点在 app.main()，**不在 build_application() 隐式启动**；
++  本批不改 app.py，接线留到①分支验收合并后一次完成。
++- 关闭必须 stop() + join()，不留线程。
++- 单文件失败不得中断整轮扫描，也不得让线程静默死亡。
++
++变更判定：mtime/size 只是候选（diff_snapshots 纯函数），真实是否重嵌入由
++KnowledgeService 的正文 hash 复核决定——只改 visibility 不会重嵌入（C6）。
++文件消失 → mark_missing（保留索引供恢复），**不是**彻底删除。
++"""
++from __future__ import annotations
++
++import threading
++
++from . import audit_log, config, vault
++
++
++class VaultWatcher:
++    def __init__(self, service, *, interval_s: float | None = None):
++        self._service = service
++        self._interval = (config.VAULT_SCAN_INTERVAL_S if interval_s is None
++                          else interval_s)
++        self._stop = threading.Event()
++        self._thread: threading.Thread | None = None
++        self._snapshot: dict = {}
++
++    @property
++    def running(self) -> bool:
++        return self._thread is not None and self._thread.is_alive()
++
++    def scan_once(self) -> dict:
++        """扫描一轮并处理差异。返回本轮差异与逐文件结果（不含正文）。"""
++        new = self._service.snapshot()
++        diff = vault.diff_snapshots(self._snapshot, new)
++        self._snapshot = new
++        results: list[dict] = []
++        for rel in diff["added"] + diff["changed"]:
++            try:
++                outcome = self._service.ingest(rel)
++                results.append({"vault_path": rel, "status": outcome["status"]})
++            except Exception as exc:  # noqa: BLE001 — 单文件失败不拖垮整轮
++                audit_log.log("ERROR", "watcher_ingest_failed",
++                              target_table="knowledge_docs",
++                              result_code=type(exc).__name__, source=rel)
++                results.append({"vault_path": rel, "status": "failed"})
++        for rel in diff["removed"]:
++            try:
++                self._service.mark_missing(rel)
++                results.append({"vault_path": rel, "status": "missing"})
++            except Exception as exc:  # noqa: BLE001
++                audit_log.log("ERROR", "watcher_missing_failed",
++                              target_table="knowledge_docs",
++                              result_code=type(exc).__name__, source=rel)
++        return {"diff": diff, "results": results}
++
++    def start(self) -> None:
++        """幂等启动：已在跑则直接返回，绝不产生第二个线程。"""
++        if self.running:
++            return
++        self._stop.clear()
++        self._thread = threading.Thread(target=self._loop, name="vault-watcher",
++                                        daemon=True)
++        self._thread.start()
++
++    def _loop(self) -> None:
++        while not self._stop.is_set():
++            try:
++                self.scan_once()
++            except Exception as exc:  # noqa: BLE001 — 线程不得静默死亡
++                audit_log.log("ERROR", "watcher_scan_failed",
++                              result_code=type(exc).__name__)
++            self._stop.wait(self._interval)
++
++    def stop(self, *, timeout: float | None = None) -> None:
++        """幂等关停：置停止位并 join，返回后无线程存活。"""
++        self._stop.set()
++        thread = self._thread
++        if thread is not None:
++            thread.join(timeout=timeout if timeout is not None else self._interval + 5)
++            self._thread = None
+\ No newline at end of file
+diff --git a/opc_workbench/visibility.py b/opc_workbench/visibility.py
+index 8b3c5f8..2fb1256 100644
+--- a/opc_workbench/visibility.py
++++ b/opc_workbench/visibility.py
+@@ -60,6 +60,12 @@ _QUERYABLE: dict[str, frozenset[str]] = {
+     "tasks": frozenset({"status", "owner_role", "visibility", "priority", "due_at"}),
+     "schedules": frozenset({"status", "owner_role", "visibility", "remind_at"}),
+     "knowledge_docs": frozenset({"owner_role", "visibility", "status"}),
++    # M4 第二批 C1（用户裁决 2026-11-22）：受控**只读视图**接入治理。
++    # owner_role/visibility 由 knowledge_docs JOIN 取得，单一真源不变；
++    # visible_filter / query_visible 执行逻辑零改动。视图不可写，
++    # chunk 写入仍只经组合根注入的 WriteCapability。
++    "knowledge_chunks_visible": frozenset(
++        {"owner_role", "visibility", "status", "doc_id", "embed_model", "embed_dim"}),
+     "memory": frozenset({"owner_role", "visibility", "kind"}),
+     "artifacts": frozenset({"owner_role", "visibility", "kind", "period_key"}),
+ }
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 5772647..bf8024b 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -32,6 +32,7 @@ class FakeLLM:
+         self.calls: list[dict] = []
+         self.available = True
+         self.breaker = llm_client.CircuitBreaker()
++        self.embed_breaker = llm_client.CircuitBreaker()   # C3：与 chat 熔断隔离
+ 
+     def chat(self, messages, *, max_tokens=1500, deadline=None):
+         self.calls.append({"messages": messages, "max_tokens": max_tokens})
+@@ -248,3 +249,72 @@ def pytest_collection_modifyitems(config, items):
+     for item in items:
+         if "live" in item.keywords:
+             item.add_marker(skip)
++
++
++# ---------------------------------------------------------------------------
++# M4 第二批：知识链路夹具（tests 目录非包，共享工具一律以 fixture 暴露，
++# 不用 from tests.xxx import，避免与 site-packages 同名包冲突）
++# ---------------------------------------------------------------------------
++
++@pytest.fixture()
++def write_md():
++    """在临时 vault 播种一篇合法 frontmatter 文档，返回正文 hash。"""
++    from datetime import datetime, timezone
++
++    from opc_workbench import vault
++    from opc_workbench.knowledge_service import body_hash
++
++    def _write(root, rel, body, *, visibility="public", owner_role=None):
++        owner = owner_role or vault.owner_for_relpath(rel)
++        meta = {
++            "owner_role": owner, "visibility": visibility, "scope": "global",
++            "file_hash": body_hash(body),
++            "updated_at": datetime.now(timezone.utc).isoformat(),
++        }
++        path = root / rel
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(vault.serialize_frontmatter(meta, body), encoding="utf-8")
++        return meta["file_hash"]
++
++    return _write
++
++
++@pytest.fixture()
++def kdim(monkeypatch):
++    """测试用 8 维模型：与 FakeLLM.embed_dim 对齐，避免维度混算。"""
++    monkeypatch.setattr(config, "EMBEDDING_DIM", 8)
++    return 8
++
++
++@pytest.fixture()
++def kwriter(isolated_env):
++    w = db._open_test_writer(config.DB_PATH)
++    yield w
++    w.close()
++
++
++@pytest.fixture()
++def kservice(kwriter, isolated_env, kdim):
++    from opc_workbench.knowledge_service import KnowledgeService
++    return KnowledgeService(kwriter, llm=isolated_env["fake_llm"],
++                            vault_root=isolated_env["vault_dir"])
++
++
++@pytest.fixture()
++def gated_embedder_cls():
++    """并发编排替身类：进入 embed 置位，放行后才返回（不用 sleep 猜时序）。"""
++    import threading
++
++    class GatedEmbedder:
++        def __init__(self, inner):
++            self.inner = inner
++            self.entered = threading.Event()
++            self.release = threading.Event()
++
++        def embed(self, texts, *, deadline=None):
++            self.entered.set()
++            if not self.release.wait(10):
++                raise RuntimeError("gate_timeout")
++            return self.inner.embed(texts, deadline=deadline)
++
++    return GatedEmbedder
+diff --git a/tests/test_db.py b/tests/test_db.py
+index 3ceada2..4f2af8f 100644
+--- a/tests/test_db.py
++++ b/tests/test_db.py
+@@ -21,7 +21,7 @@ def _tables(conn):
+ 
+ def test_init_creates_all_tables(db_conn):
+     assert EXPECTED_TABLES <= _tables(db_conn)
+-    assert db.current_version(db_conn) == len(db.MIGRATIONS) == 4  # M3: +m003/m004
++    assert db.current_version(db_conn) == len(db.MIGRATIONS) == 5  # M4: +m005
+ 
+ 
+ def test_init_idempotent_rerun(db_conn):
+@@ -32,9 +32,9 @@ def test_init_idempotent_rerun(db_conn):
+             ("保留我", "sales", db.now_iso(), db.now_iso()),
+         )
+     v = db.init_db()
+-    assert v == 4
++    assert v == 5
+     assert db_conn.execute("SELECT COUNT(*) c FROM tasks").fetchone()["c"] == 1
+-    assert db_conn.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 4
++    assert db_conn.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 5
+ 
+ 
+ def test_zero_seeding(db_conn):
+@@ -163,7 +163,7 @@ def test_m001_rerun_after_failure_succeeds(isolated_env, monkeypatch):
+     assert db.current_version(db.get_read_conn()) == 0
+ 
+     v = db.init_db()  # 第二次完整成功
+-    assert v == 4
++    assert v == 5
+     conn = db.get_read_conn()
+     assert EXPECTED_TABLES <= _tables(conn)
+     for table in EXPECTED_TABLES - {"schema_version"}:
+diff --git a/tests/test_embed_client.py b/tests/test_embed_client.py
+new file mode 100644
+index 0000000..b56d1ff
+--- /dev/null
++++ b/tests/test_embed_client.py
+@@ -0,0 +1,219 @@
++"""LLMClient.embed 生产实现（M4 第二批 C3：独立熔断器）。
++
++传输层用桩注入（沿用 test_llm_client 既有 seam：api_key="" 不构造真 SDK，
++再替换 _client），全程零网络。
++"""
++from __future__ import annotations
++
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from opc_workbench import config, llm_client
++
++
++class _FakeStatusError(Exception):
++    def __init__(self, status_code):
++        super().__init__(f"http {status_code}")
++        self.status_code = status_code
++
++
++def _vec(dim, seed):
++    return [float((seed + i) % 7) / 7.0 for i in range(dim)]
++
++
++class _StubEmbeddings:
++    """记录每次请求；behavior(call_index, kwargs) 决定返回或抛错。"""
++
++    def __init__(self, behavior, *, shuffle=False, dim=None):
++        self.behavior = behavior
++        self.calls: list[dict] = []
++        self.shuffle = shuffle
++        self.dim = config.EMBEDDING_DIM if dim is None else dim
++
++    def create(self, **kw):
++        n = len(self.calls)
++        self.calls.append(kw)
++        result = self.behavior(n, kw)
++        if isinstance(result, Exception):
++            raise result
++        texts = kw["input"]
++        data = [SimpleNamespace(index=i, embedding=_vec(self.dim, i))
++                for i in range(len(texts))]
++        if self.shuffle:
++            data = list(reversed(data))
++        return SimpleNamespace(data=data)
++
++
++class _StubClient:
++    def __init__(self, embeddings, chat_behavior=None):
++        self.embeddings = embeddings
++        behavior = chat_behavior or (lambda n, kw: "chat-ok")
++        stub = self
++
++        class _Completions:
++            def create(self, **kw):
++                stub.chat_calls = getattr(stub, "chat_calls", 0) + 1
++                out = behavior(stub.chat_calls - 1, kw)
++                if isinstance(out, Exception):
++                    raise out
++                return SimpleNamespace(choices=[SimpleNamespace(
++                    message=SimpleNamespace(content=out))])
++
++        self.chat = SimpleNamespace(completions=_Completions())
++
++
++def _make_client(embeddings, chat_behavior=None):
++    c = llm_client.LLMClient(api_key="")     # 不构造真 SDK
++    c._client = _StubClient(embeddings, chat_behavior)
++    return c
++
++
++def _ok(n, kw):
++    return None
++
++
++# ---------------------------------------------------------------------------
++
++
++def test_embed_without_key_fails_closed():
++    c = llm_client.LLMClient(api_key="")
++    with pytest.raises(llm_client.LLMFailure, match="no_api_key"):
++        c.embed(["x"])
++
++
++def test_embed_empty_input_makes_no_call():
++    emb = _StubEmbeddings(_ok)
++    c = _make_client(emb)
++    assert c.embed([]) == []
++    assert emb.calls == []
++
++
++@pytest.mark.parametrize("bad", [None, "text", 123, [1], ["ok", None]])
++def test_embed_rejects_non_string_list(bad):
++    c = _make_client(_StubEmbeddings(_ok))
++    with pytest.raises(llm_client.LLMFailure, match="embed_invalid_input"):
++        c.embed(bad)
++
++
++def test_embed_batches_at_ten_and_preserves_order():
++    emb = _StubEmbeddings(_ok)
++    c = _make_client(emb)
++    texts = [f"t{i}" for i in range(25)]
++    out = c.embed(texts)
++    assert [len(call["input"]) for call in emb.calls] == [10, 10, 5]
++    assert len(out) == 25
++    # 第 i 条向量必须来自第 i 条文本所在的批内位置
++    assert out[10] == _vec(config.EMBEDDING_DIM, 0)
++    assert out[24] == _vec(config.EMBEDDING_DIM, 4)
++
++
++def test_embed_passes_model_and_dimensions():
++    emb = _StubEmbeddings(_ok)
++    c = _make_client(emb)
++    c.embed(["x"])
++    assert emb.calls[0]["model"] == config.EMBEDDING_MODEL
++    assert emb.calls[0]["dimensions"] == config.EMBEDDING_DIM
++
++
++def test_embed_reorders_by_index_not_return_order():
++    emb = _StubEmbeddings(_ok, shuffle=True)
++    c = _make_client(emb)
++    out = c.embed(["a", "b", "c"])
++    assert out == [_vec(config.EMBEDDING_DIM, i) for i in range(3)]
++
++
++def test_embed_dim_mismatch_rejected():
++    emb = _StubEmbeddings(_ok, dim=config.EMBEDDING_DIM + 1)
++    c = _make_client(emb)
++    with pytest.raises(llm_client.LLMFailure, match="embed_dim_mismatch"):
++        c.embed(["a"])
++
++
++def test_embed_count_mismatch_rejected():
++    class _Short(_StubEmbeddings):
++        def create(self, **kw):
++            self.calls.append(kw)
++            return SimpleNamespace(data=[SimpleNamespace(
++                index=0, embedding=_vec(config.EMBEDDING_DIM, 0))])
++
++    c = _make_client(_Short(_ok))
++    with pytest.raises(llm_client.LLMFailure, match="embed_count_mismatch"):
++        c.embed(["a", "b"])
++
++
++def test_embed_duplicate_index_rejected():
++    class _Dup(_StubEmbeddings):
++        def create(self, **kw):
++            self.calls.append(kw)
++            v = _vec(config.EMBEDDING_DIM, 0)
++            return SimpleNamespace(data=[SimpleNamespace(index=0, embedding=v),
++                                         SimpleNamespace(index=0, embedding=v)])
++
++    c = _make_client(_Dup(_ok))
++    with pytest.raises(llm_client.LLMFailure, match="embed_index_duplicate"):
++        c.embed(["a", "b"])
++
++
++def test_embed_retries_retryable_then_succeeds(monkeypatch):
++    monkeypatch.setattr(llm_client.time, "sleep", lambda s: None)
++    calls = {"n": 0}
++
++    def behavior(n, kw):
++        calls["n"] += 1
++        return _FakeStatusError(503) if calls["n"] == 1 else None
++
++    emb = _StubEmbeddings(behavior)
++    c = _make_client(emb)
++    assert len(c.embed(["a"])) == 1
++    assert calls["n"] == config.LLM_ATTEMPTS
++
++
++def test_embed_does_not_retry_non_retryable(monkeypatch):
++    monkeypatch.setattr(llm_client.time, "sleep", lambda s: None)
++    emb = _StubEmbeddings(lambda n, kw: _FakeStatusError(400))
++    c = _make_client(emb)
++    with pytest.raises(llm_client.LLMFailure, match="embed_error"):
++        c.embed(["a"])
++    assert len(emb.calls) == 1
++
++
++def test_embed_deadline_exceeded():
++    emb = _StubEmbeddings(_ok)
++    c = _make_client(emb)
++    with pytest.raises(llm_client.LLMFailure, match="deadline_exceeded"):
++        c.embed(["a"], deadline=time.monotonic() - 1)
++    assert emb.calls == []
++
++
++# --- C3：两条链路熔断隔离 ----------------------------------------------------
++
++
++def test_embed_breaker_open_does_not_block_chat(monkeypatch):
++    monkeypatch.setattr(llm_client.time, "sleep", lambda s: None)
++    emb = _StubEmbeddings(lambda n, kw: _FakeStatusError(500))
++    c = _make_client(emb)
++    for _ in range(5):   # 累计失败达 fail_threshold=5 才熔断
++        with pytest.raises(llm_client.LLMFailure):
++            c.embed(["a"])
++    assert c.embed_breaker.state == "open"
++    assert c.breaker.state == "closed"
++    assert c.chat([{"role": "user", "content": "hi"}]) == "chat-ok"
++
++
++def test_chat_breaker_open_does_not_block_embed(monkeypatch):
++    monkeypatch.setattr(llm_client.time, "sleep", lambda s: None)
++    emb = _StubEmbeddings(_ok)
++    c = _make_client(emb, chat_behavior=lambda n, kw: _FakeStatusError(500))
++    for _ in range(5):   # 累计失败达 fail_threshold=5 才熔断
++        with pytest.raises(llm_client.LLMFailure):
++            c.chat([{"role": "user", "content": "hi"}])
++    assert c.breaker.state == "open"
++    assert c.embed_breaker.state == "closed"
++    assert len(c.embed(["a"])) == 1
++
++
++def test_embed_breaker_is_distinct_instance():
++    c = llm_client.LLMClient(api_key="")
++    assert c.embed_breaker is not c.breaker
+\ No newline at end of file
+diff --git a/tests/test_knowledge_migration.py b/tests/test_knowledge_migration.py
+new file mode 100644
+index 0000000..c8b3901
+--- /dev/null
++++ b/tests/test_knowledge_migration.py
+@@ -0,0 +1,164 @@
++"""m005 迁移与受控可见性视图（M4 第二批 C1/C2）。"""
++from __future__ import annotations
++
++import sqlite3
++
++import pytest
++
++from opc_workbench import config, db, visibility
++
++
++def _cols(conn, table):
++    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
++
++
++def test_m005_applied_and_version(db_conn):
++    assert db.current_version(db_conn) == 5
++    names = [r["name"] for r in db_conn.execute(
++        "SELECT name FROM schema_version ORDER BY version")]
++    assert names[-1] == "m005_knowledge_index"
++
++
++def test_m005_adds_index_version_columns(db_conn):
++    cols = _cols(db_conn, "knowledge_docs")
++    assert {"source_hash", "indexed_hash", "embed_model", "embed_dim",
++            "updated_at", "last_error"} <= cols
++
++
++def test_m005_keeps_status_four_states(db_conn):
++    """C1/C2 边界：不重建表，status CHECK 仍是四态。"""
++    sql = db_conn.execute(
++        "SELECT sql FROM sqlite_master WHERE name='knowledge_docs'").fetchone()["sql"]
++    assert "'processing','ready','failed','missing'" in sql
++    with pytest.raises(sqlite3.IntegrityError):
++        db_conn.execute(
++            "INSERT INTO knowledge_docs(filename,stored_path,file_hash,owner_role,"
++            "created_at,status) VALUES('a','cfo/a.md','sha256:x','cfo','t','deleting')")
++        db_conn.commit()
++
++
++def test_m005_no_content_dedup_unique_index(db_conn):
++    """C2：不得存在 (owner_role,file_hash) 唯一索引。"""
++    idx = db_conn.execute("PRAGMA index_list(knowledge_docs)").fetchall()
++    for row in idx:
++        cols = [r["name"] for r in db_conn.execute(f"PRAGMA index_info({row['name']})")]
++        assert not (row["unique"] and set(cols) == {"owner_role", "file_hash"})
++
++
++def test_m005_backfills_existing_rows_as_indexed(tmp_path):
++    """旧库已有行回填 indexed_hash=file_hash，绝不触发历史重嵌入。"""
++    path = tmp_path / "legacy.db"
++    conn = sqlite3.connect(str(path))
++    conn.row_factory = sqlite3.Row
++    db._ensure_version_table(conn)
++    for i, fn in enumerate(db.MIGRATIONS[:4], start=1):
++        fn(db.MigrationConnection(conn))
++        conn.execute("INSERT INTO schema_version(version,name,applied_at) VALUES(?,?,?)",
++                     (i, fn.__name__, db.now_iso()))
++    conn.execute(
++        "INSERT INTO knowledge_docs(filename,stored_path,file_hash,owner_role,"
++        "created_at) VALUES('a.md','cfo/a.md','sha256:abc','cfo','2026-01-01T00:00:00+00:00')")
++    conn.commit()
++    conn.close()
++
++    db.init_db(path)
++    conn = sqlite3.connect(str(path))
++    conn.row_factory = sqlite3.Row
++    row = conn.execute("SELECT * FROM knowledge_docs").fetchone()
++    conn.close()
++    assert row["indexed_hash"] == "sha256:abc"
++    assert row["source_hash"] == "sha256:abc"
++    assert row["status"] == "ready"
++
++
++def test_intent_tables_created(db_conn):
++    tables = {r["name"] for r in db_conn.execute(
++        "SELECT name FROM sqlite_master WHERE type='table'")}
++    assert {"pending_deletions", "pending_vault_writes"} <= tables
++
++
++def test_view_exposes_governance_columns_from_docs(db_conn):
++    db_conn.execute(
++        "INSERT INTO knowledge_docs(filename,stored_path,file_hash,owner_role,"
++        "visibility,created_at,status) VALUES('a.md','cfo/a.md','sha256:x','cfo',"
++        "'private','t','ready')")
++    doc_id = db_conn.execute("SELECT id FROM knowledge_docs").fetchone()["id"]
++    db_conn.execute(
++        "INSERT INTO knowledge_chunks(doc_id,seq,content,embedding) VALUES(?,0,'c',?)",
++        (doc_id, b"\x00\x00\x80?"))
++    db_conn.commit()
++    row = db_conn.execute("SELECT * FROM knowledge_chunks_visible").fetchone()
++    assert row["owner_role"] == "cfo"
++    assert row["visibility"] == "private"
++    assert row["stored_path"] == "cfo/a.md"
++
++
++@pytest.mark.parametrize("sql", [
++    "INSERT INTO knowledge_chunks_visible(doc_id,seq,content,embedding) "
++    "VALUES(1,0,'x',x'00')",
++    "UPDATE knowledge_chunks_visible SET content='x'",
++    "DELETE FROM knowledge_chunks_visible",
++])
++def test_view_is_not_writable(db_conn, sql):
++    """C1 附加要求：视图不得成为写入口。"""
++    with pytest.raises(sqlite3.OperationalError):
++        db_conn.execute(sql)
++
++
++def test_view_in_queryable_whitelist_but_base_table_not():
++    assert "knowledge_chunks_visible" in visibility._QUERYABLE
++    with pytest.raises(ValueError, match="forbidden_table"):
++        visibility.query_visible("knowledge_chunks", "boss")
++
++
++def test_query_visible_filters_chunks_by_caller(db_conn):
++    """治理原语对 chunk 生效：他角色 private 不可见，boss 全可见。"""
++    for owner, vis, path in (("cfo", "private", "cfo/p.md"),
++                             ("sales", "public", "sales/s.md")):
++        db_conn.execute(
++            "INSERT INTO knowledge_docs(filename,stored_path,file_hash,owner_role,"
++            "visibility,created_at,status) VALUES(?,?,?,?,?,'t','ready')",
++            (path, path, "sha256:x", owner, vis))
++        doc_id = db_conn.execute(
++            "SELECT id FROM knowledge_docs WHERE stored_path=?", (path,)).fetchone()["id"]
++        db_conn.execute(
++            "INSERT INTO knowledge_chunks(doc_id,seq,content,embedding) VALUES(?,0,?,?)",
++            (doc_id, f"body-{owner}", b"\x00\x00\x80?"))
++    db_conn.commit()
++
++    sales = visibility.query_visible("knowledge_chunks_visible", "sales")
++    assert [r["content"] for r in sales] == ["body-sales"]
++    cfo = visibility.query_visible("knowledge_chunks_visible", "cfo")
++    assert {r["content"] for r in cfo} == {"body-cfo", "body-sales"}
++    boss = visibility.query_visible("knowledge_chunks_visible", "boss")
++    assert len(boss) == 2
++    coordinator = visibility.query_visible("knowledge_chunks_visible", "coordinator")
++    assert [r["content"] for r in coordinator] == ["body-sales"]
++
++
++def test_migration_is_repeatable_and_idempotent(tmp_path):
++    path = tmp_path / "twice.db"
++    assert db.init_db(path) == 5
++    assert db.init_db(path) == 5
++
++
++def test_m005_rollback_leaves_no_partial_schema(tmp_path, monkeypatch):
++    """迁移中途失败 → 整事务回滚，版本不推进，可安全重试。"""
++    path = tmp_path / "broken.db"
++    original = db.m005_knowledge_index
++
++    def broken(conn):
++        conn.execute("ALTER TABLE knowledge_docs ADD COLUMN source_hash TEXT")
++        raise RuntimeError("boom")
++
++    monkeypatch.setattr(db, "MIGRATIONS", db.MIGRATIONS[:4] + [broken])
++    with pytest.raises(RuntimeError, match="boom"):
++        db.init_db(path)
++    conn = sqlite3.connect(str(path))
++    conn.row_factory = sqlite3.Row
++    assert db.current_version(conn) == 4
++    assert "source_hash" not in {r["name"] for r in
++                                 conn.execute("PRAGMA table_info(knowledge_docs)")}
++    conn.close()
++    monkeypatch.setattr(db, "MIGRATIONS", db.MIGRATIONS[:4] + [original])
++    assert db.init_db(path) == 5
+\ No newline at end of file
+diff --git a/tests/test_knowledge_service.py b/tests/test_knowledge_service.py
+new file mode 100644
+index 0000000..295d72a
+--- /dev/null
++++ b/tests/test_knowledge_service.py
+@@ -0,0 +1,516 @@
++"""KnowledgeService 闭环（M4 第二批）：导入/更新/检索/删除/恢复 + B8 竞争保护。
++
++验收重点（用户明确）：
++- 检索隔离必须检查**实际 chunk 正文、出处、日志与错误信息**，不只比 doc_id；
++- B8 必须证明**旧 embedding 任务无法覆盖新文件版本**，不是普通顺序执行。
++"""
++from __future__ import annotations
++
++import threading
++
++import pytest
++
++from opc_workbench import config, db, vault
++from opc_workbench.knowledge_service import KnowledgeService, body_hash
++
++SECRET = "SECRET-CFO-42"
++
++
++def _rows(sql, params=()):
++    return db.get_conn().execute(sql, params).fetchall()
++
++
++def _doc(rel):
++    rows = _rows("SELECT * FROM knowledge_docs WHERE stored_path=?", (rel,))
++    return rows[0] if rows else None
++
++
++def _chunks(doc_id):
++    return _rows("SELECT * FROM knowledge_chunks WHERE doc_id=? ORDER BY seq", (doc_id,))
++
++
++# --- 导入基础 ---------------------------------------------------------------
++
++
++def test_ingest_creates_doc_and_chunks(kservice, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    write_md(root, "cfo/a.md", "季度成本结构说明")
++    out = kservice.ingest("cfo/a.md")
++    assert out["status"] == "ready" and out["reindexed"] is True
++    doc = _doc("cfo/a.md")
++    assert doc["owner_role"] == "cfo"
++    assert doc["chunk_count"] == len(_chunks(doc["id"])) > 0
++    assert doc["indexed_hash"] == body_hash("季度成本结构说明")
++    assert doc["embed_dim"] == config.EMBEDDING_DIM
++
++
++def test_ingest_is_idempotent_for_unchanged_content(kservice, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    write_md(root, "cfo/a.md", "同一份内容")
++    first = kservice.ingest("cfo/a.md")
++    calls_before = len(isolated_env["fake_llm"].calls)
++    second = kservice.ingest("cfo/a.md")
++    assert second["reindexed"] is False
++    assert second["doc_id"] == first["doc_id"]
++    assert len(isolated_env["fake_llm"].calls) == calls_before   # 未重复嵌入
++
++
++def test_owner_comes_from_directory_not_frontmatter(kservice, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    write_md(root, "cfo/a.md", "内容", owner_role="sales")   # frontmatter 谎报
++    out = kservice.ingest("cfo/a.md")
++    assert out["owner_corrected"] is True
++    assert _doc("cfo/a.md")["owner_role"] == "cfo"
++
++
++def test_shared_dir_maps_to_coordinator_and_public(kservice, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    write_md(root, "shared/s.md", "共享制度", visibility="private")
++    kservice.ingest("shared/s.md")
++    doc = _doc("shared/s.md")
++    assert doc["owner_role"] == "coordinator"
++    assert doc["visibility"] == "public"
++
++
++def test_same_content_different_paths_both_indexed(kservice, isolated_env, write_md):
++    """C2：不做内容级去重，两个合法副本各自入库、互不覆盖。"""
++    root = isolated_env["vault_dir"]
++    body = "完全相同的正文"
++    write_md(root, "cfo/a.md", body)
++    write_md(root, "cfo/b.md", body)
++    a = kservice.ingest("cfo/a.md")
++    b = kservice.ingest("cfo/b.md")
++    assert a["doc_id"] != b["doc_id"]
++    assert _doc("cfo/a.md")["indexed_hash"] == _doc("cfo/b.md")["indexed_hash"]
++    assert len(_chunks(a["doc_id"])) > 0 and len(_chunks(b["doc_id"])) > 0
++
++
++def test_file_move_is_new_doc_not_merge(kservice, isolated_env, write_md):
++    """C2 修订：移动按路径身份处理，旧路径 missing、新路径新文档。"""
++    root = isolated_env["vault_dir"]
++    body = "被移动的正文"
++    write_md(root, "cfo/a.md", body)
++    old = kservice.ingest("cfo/a.md")
++    (root / "cfo" / "a.md").unlink()
++    write_md(root, "sales/a.md", body)
++    new = kservice.ingest("sales/a.md")
++    kservice.mark_missing("cfo/a.md")
++    assert new["doc_id"] != old["doc_id"]
++    assert _doc("cfo/a.md")["status"] == "missing"
++    assert _doc("sales/a.md")["owner_role"] == "sales"
++    assert len(_chunks(old["doc_id"])) > 0        # 旧索引保留供恢复
++
++
++# --- 红线1：先校验路径再读取 --------------------------------------------------
++
++
++@pytest.mark.parametrize("rel", ["../evil.md", "cfo/../../evil.md", "C:\\evil.md",
++                                 "/etc/passwd", "cfo/a.md:stream"])
++def test_unsafe_path_rejected_before_any_read(kservice, isolated_env, monkeypatch, rel):
++    """读取桩一旦被调用即失败：证明校验发生在读取之前。"""
++    reads: list[str] = []
++
++    def _read(self, *a, **kw):
++        reads.append(str(self))
++        raise AssertionError("read_before_path_validation")
++
++    monkeypatch.setattr(type(isolated_env["vault_dir"]), "read_text", _read)
++    with pytest.raises(ValueError, match="vault_path_unsafe"):
++        kservice.ingest(rel)
++    assert reads == []
++
++
++def test_attachments_dir_not_ingestable(kservice, isolated_env):
++    root = isolated_env["vault_dir"]
++    (root / "attachments").mkdir(exist_ok=True)
++    (root / "attachments" / "x.md").write_text("---\n---\nbody", encoding="utf-8")
++    with pytest.raises(ValueError):
++        kservice.ingest("attachments/x.md")
++
++
++# --- C6：元数据变更不重嵌入但权限即时生效 --------------------------------------
++
++
++def test_visibility_change_updates_db_without_reembed(kservice, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    body = "老板的私密笔记"
++    write_md(root, "cfo/a.md", body, visibility="public")
++    kservice.ingest("cfo/a.md")
++    before = len(isolated_env["fake_llm"].calls)
++
++    write_md(root, "cfo/a.md", body, visibility="private")   # 只改可见性
++    out = kservice.ingest("cfo/a.md")
++    assert out["reindexed"] is False
++    assert len(isolated_env["fake_llm"].calls) == before      # 未重新嵌入
++    assert _doc("cfo/a.md")["visibility"] == "private"        # DB 立即更新
++    # 检索立即生效：sales 再也搜不到
++    hits = kservice.search(body, "sales")
++    assert all(SECRET not in h["content"] for h in hits)
++    assert hits == []
++
++
++def test_visibility_change_both_directions(kservice, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    body = "双向可见性测试正文"
++    write_md(root, "cfo/a.md", body, visibility="private")
++    kservice.ingest("cfo/a.md")
++    assert kservice.search(body, "sales") == []
++    write_md(root, "cfo/a.md", body, visibility="public")
++    kservice.ingest("cfo/a.md")
++    assert len(kservice.search(body, "sales")) == 1
++    write_md(root, "cfo/a.md", body, visibility="private")
++    kservice.ingest("cfo/a.md")
++    assert kservice.search(body, "sales") == []
++
++
++# --- 检索与权限隔离 ----------------------------------------------------------
++
++
++def test_search_returns_content_and_provenance(kservice, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    body = "检索出处验证正文"
++    write_md(root, "sales/s.md", body)
++    kservice.ingest("sales/s.md")
++    hits = kservice.search(body, "sales")
++    assert len(hits) == 1
++    assert hits[0]["content"] == body
++    assert hits[0]["vault_path"] == "sales/s.md"
++    assert hits[0]["seq"] == 0
++    assert hits[0]["score"] == pytest.approx(1.0, abs=1e-5)
++
++
++def test_search_isolation_checks_content_path_logs_and_errors(
++        kservice, isolated_env, write_md):
++    """他角色 private 的正文/出处/日志/错误信息都不得泄露。"""
++    root = isolated_env["vault_dir"]
++    write_md(root, "cfo/secret.md", SECRET, visibility="private")
++    write_md(root, "sales/open.md", "公开销售素材")
++    kservice.ingest("cfo/secret.md")
++    kservice.ingest("sales/open.md")
++
++    hits = kservice.search(SECRET, "sales")
++    assert hits == []                                  # 不是"数据不存在"造成的空
++    assert len(kservice.search(SECRET, "boss")) == 1   # 同一查询 boss 能命中
++    assert all(SECRET not in h["content"] for h in hits)
++    assert all("cfo/" not in h["vault_path"] for h in hits)
++    assert all(h["owner_role"] != "cfo" for h in hits)
++
++    # 非空结果下的正文/出处校验：sales 只能拿到自己那条
++    open_hits = kservice.search("公开销售素材", "sales")
++    assert len(open_hits) == 1
++    assert open_hits[0]["vault_path"] == "sales/open.md"
++    assert SECRET not in open_hits[0]["content"]
++
++    docs = kservice.list_docs("sales")
++    assert all(d["vault_path"] != "cfo/secret.md" for d in docs)
++
++    log_path = config.LOG_DIR / "audit.log"
++    if log_path.exists():
++        assert SECRET not in log_path.read_text(encoding="utf-8")
++
++
++def test_coordinator_cannot_see_any_private(kservice, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    write_md(root, "cfo/p.md", SECRET, visibility="private")
++    write_md(root, "sales/s.md", "公开材料")
++    kservice.ingest("cfo/p.md")
++    kservice.ingest("sales/s.md")
++    hits = kservice.search(SECRET, "coordinator")
++    assert hits == []
++    assert all(h["visibility"] == "public"
++               for h in kservice.search("公开材料", "coordinator"))
++
++
++def test_boss_sees_all(kservice, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    write_md(root, "cfo/p.md", SECRET, visibility="private")
++    kservice.ingest("cfo/p.md")
++    hits = kservice.search(SECRET, "boss")
++    assert len(hits) == 1 and hits[0]["content"] == SECRET
++
++
++def test_owner_sees_own_private(kservice, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    write_md(root, "cfo/p.md", SECRET, visibility="private")
++    kservice.ingest("cfo/p.md")
++    assert len(kservice.search(SECRET, "cfo")) == 1
++
++
++def test_missing_doc_excluded_from_search(kservice, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    write_md(root, "sales/s.md", "消失的文档正文")
++    kservice.ingest("sales/s.md")
++    (root / "sales" / "s.md").unlink()
++    kservice.mark_missing("sales/s.md")
++    assert kservice.search("消失的文档正文", "boss") == []
++
++
++def test_search_threshold_filters_low_scores(kservice, isolated_env, write_md, monkeypatch):
++    root = isolated_env["vault_dir"]
++    write_md(root, "sales/s.md", "阈值测试正文")
++    kservice.ingest("sales/s.md")
++    monkeypatch.setattr(config, "KNOWLEDGE_MIN_SCORE", 1.1)
++    assert kservice.search("阈值测试正文", "sales") == []
++    monkeypatch.setattr(config, "KNOWLEDGE_MIN_SCORE", 0.0)
++    assert len(kservice.search("阈值测试正文", "sales")) == 1
++
++
++def test_search_invalid_caller_fails_closed(kservice):
++    with pytest.raises(ValueError, match="invalid_caller"):
++        kservice.search("x", "not-a-role")
++
++
++def test_search_top_k_invalid_rejected(kservice, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    write_md(root, "sales/s.md", "topk 测试")
++    kservice.ingest("sales/s.md")
++    with pytest.raises(ValueError, match="top_k_invalid"):
++        kservice.search("topk 测试", "sales", top_k=0)
++
++
++# --- 失败路径 ---------------------------------------------------------------
++
++
++def test_embed_failure_marks_failed_and_keeps_indexed_hash(
++        kservice, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    write_md(root, "cfo/a.md", "第一版正文")
++    kservice.ingest("cfo/a.md")
++    good_hash = _doc("cfo/a.md")["indexed_hash"]
++
++    write_md(root, "cfo/a.md", "第二版正文")
++    isolated_env["fake_llm"].embed_responses = [RuntimeError("boom")]
++    out = kservice.ingest("cfo/a.md")
++    assert out["status"] == "failed"
++    doc = _doc("cfo/a.md")
++    assert doc["indexed_hash"] == good_hash          # 失败不前进 indexed_hash
++    assert doc["last_error"] and "boom" in doc["last_error"]
++    assert "第二版正文" not in doc["last_error"]      # 错误信息不含正文
++    # 旧索引仍在，且内容仍是第一版
++    assert _chunks(doc["id"])[0]["content"] == "第一版正文"
++
++
++def test_failure_log_has_no_body(kservice, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    write_md(root, "cfo/a.md", SECRET)
++    isolated_env["fake_llm"].embed_responses = [RuntimeError("boom")]
++    kservice.ingest("cfo/a.md")
++    log_path = config.LOG_DIR / "audit.log"
++    assert log_path.exists()
++    text = log_path.read_text(encoding="utf-8")
++    assert SECRET not in text
++    assert "cfo/a.md" in text                        # 出处必须可追溯
++
++
++# --- B8：版本竞争保护（真并发交错，非顺序执行） --------------------------------
++
++
++def test_stale_embedding_cannot_overwrite_newer_version(
++        kwriter, isolated_env, write_md, gated_embedder_cls):
++    """A 轮读 v1 后阻塞在嵌入；B 轮完成 v2；A 醒来必须被丢弃。
++
++    这是真正的并发交错：A 在独立线程中执行，用 Event 精确编排，不用 sleep。
++    """
++    root = isolated_env["vault_dir"]
++    fake = isolated_env["fake_llm"]
++    write_md(root, "cfo/a.md", "V1-OLD-CONTENT")
++    gate = gated_embedder_cls(fake)
++    svc_a = KnowledgeService(kwriter, llm=gate, vault_root=root)
++    svc_b = KnowledgeService(kwriter, llm=fake, vault_root=root)
++
++    results: dict = {}
++    errors: list = []
++
++    def run_a():
++        try:
++            results["a"] = svc_a.ingest("cfo/a.md")
++        except BaseException as exc:      # noqa: BLE001 — 线程内异常需带回主线程
++            errors.append(exc)
++
++    t = threading.Thread(target=run_a)
++    t.start()
++    try:
++        assert gate.entered.wait(10), "A 未进入嵌入阶段"
++        # A 已读到 v1 并写入 source_hash=h1，此刻文件被改成 v2
++        write_md(root, "cfo/a.md", "V2-NEW-CONTENT")
++        results["b"] = svc_b.ingest("cfo/a.md")
++        assert results["b"]["status"] == "ready"
++    finally:
++        gate.release.set()
++        t.join(10)
++    assert not errors, errors
++    assert not t.is_alive()
++
++    # 先验**实际落库内容**：无保护时这里会直接暴露 V1 覆盖 V2
++    doc = _doc("cfo/a.md")
++    contents = [c["content"] for c in _chunks(doc["id"])]
++    assert contents == ["V2-NEW-CONTENT"]
++    assert "V1-OLD-CONTENT" not in contents
++    assert doc["indexed_hash"] == body_hash("V2-NEW-CONTENT")
++    assert results["a"]["stale"] is True
++
++
++def test_stale_discard_writes_no_partial_chunks(
++        kwriter, isolated_env, write_md, gated_embedder_cls):
++    """首次导入即过期时，不得留下任何半截 chunk。"""
++    root = isolated_env["vault_dir"]
++    fake = isolated_env["fake_llm"]
++    write_md(root, "sales/s.md", "OLD-BODY")
++    gate = gated_embedder_cls(fake)
++    svc_a = KnowledgeService(kwriter, llm=gate, vault_root=root)
++    svc_b = KnowledgeService(kwriter, llm=fake, vault_root=root)
++    out: dict = {}
++
++    t = threading.Thread(target=lambda: out.update(a=svc_a.ingest("sales/s.md")))
++    t.start()
++    try:
++        assert gate.entered.wait(10)
++        write_md(root, "sales/s.md", "NEW-BODY")
++        svc_b.ingest("sales/s.md")
++    finally:
++        gate.release.set()
++        t.join(10)
++    doc = _doc("sales/s.md")
++    assert [c["content"] for c in _chunks(doc["id"])] == ["NEW-BODY"]
++    assert doc["chunk_count"] == len(_chunks(doc["id"]))
++    assert out["a"]["stale"] is True
++
++
++def test_sequential_reindex_advances_indexed_hash(kservice, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    write_md(root, "cfo/a.md", "版本一")
++    kservice.ingest("cfo/a.md")
++    write_md(root, "cfo/a.md", "版本二")
++    out = kservice.ingest("cfo/a.md")
++    assert out["reindexed"] is True and out["stale"] is False
++    doc = _doc("cfo/a.md")
++    assert doc["indexed_hash"] == body_hash("版本二")
++    assert [c["content"] for c in _chunks(doc["id"])] == ["版本二"]
++
++
++def test_reindex_keeps_status_ready(kservice, isolated_env, write_md):
++    """reindex 期间旧索引继续可搜（不置 processing）。"""
++    root = isolated_env["vault_dir"]
++    write_md(root, "sales/s.md", "旧正文")
++    kservice.ingest("sales/s.md")
++    write_md(root, "sales/s.md", "新正文")
++    kservice.ingest("sales/s.md")
++    assert _doc("sales/s.md")["status"] == "ready"
++
++
++# --- 删除与恢复 -------------------------------------------------------------
++
++
++def test_delete_removes_file_rows_and_chunks(kservice, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    write_md(root, "cfo/a.md", "待删除正文")
++    out = kservice.ingest("cfo/a.md")
++    kservice.delete("cfo/a.md")
++    assert not (root / "cfo" / "a.md").exists()
++    assert _doc("cfo/a.md") is None
++    assert _chunks(out["doc_id"]) == []
++    assert _rows("SELECT * FROM pending_deletions") == []
++
++
++def test_delete_is_idempotent(kservice, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    write_md(root, "cfo/a.md", "幂等删除")
++    kservice.ingest("cfo/a.md")
++    kservice.delete("cfo/a.md")
++    kservice.delete("cfo/a.md")
++    assert _doc("cfo/a.md") is None
++
++
++def test_delete_rejects_unsafe_path(kservice):
++    with pytest.raises(ValueError, match="vault_path_unsafe"):
++        kservice.delete("../evil.md")
++
++
++def test_recover_replays_pending_deletion(kservice, isolated_env, write_md):
++    """崩溃点：意图已写、文件与 DB 行尚未删 → 重启幂等重放。"""
++    root = isolated_env["vault_dir"]
++    write_md(root, "cfo/a.md", "崩溃前正文")
++    out = kservice.ingest("cfo/a.md")
++    with kservice._writer.transaction() as cur:
++        cur.execute("INSERT INTO pending_deletions(doc_id,stored_path,created_at) "
++                    "VALUES(?,?,?)", (out["doc_id"], "cfo/a.md", db.now_iso()))
++    report = kservice.recover()
++    assert report["deletions_replayed"] == 1
++    assert not (root / "cfo" / "a.md").exists()
++    assert _doc("cfo/a.md") is None
++    assert _chunks(out["doc_id"]) == []
++
++
++def test_recover_replays_pending_vault_write(kservice, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    write_md(root, "cfo/a.md", "原始正文")
++    kservice.ingest("cfo/a.md")
++    pending_text = (root / "cfo" / "a.md").read_text(encoding="utf-8").replace(
++        "原始正文", "崩溃后应恢复的正文")
++    (root / "cfo" / "a.md").unlink()
++    with kservice._writer.transaction() as cur:
++        cur.execute("INSERT INTO pending_vault_writes(stored_path,content,created_at) "
++                    "VALUES(?,?,?)", ("cfo/a.md", pending_text, db.now_iso()))
++    report = kservice.recover()
++    assert report["writes_replayed"] == 1
++    assert (root / "cfo" / "a.md").exists()
++    assert "崩溃后应恢复的正文" in (root / "cfo" / "a.md").read_text(encoding="utf-8")
++    assert _rows("SELECT * FROM pending_vault_writes") == []
++
++
++def test_recover_resets_interrupted_processing(kservice, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    write_md(root, "cfo/a.md", "中断文档")
++    with kservice._writer.transaction() as cur:
++        cur.execute(
++            "INSERT INTO knowledge_docs(filename,stored_path,file_hash,owner_role,"
++            "created_at,status) VALUES('a.md','cfo/a.md','sha256:x','cfo',?,'processing')",
++            (db.now_iso(),))
++    report = kservice.recover()
++    assert report["processing_reset"] == 1
++    doc = _doc("cfo/a.md")
++    assert doc["status"] == "failed" and doc["last_error"] == "interrupted"
++
++
++def test_write_doc_roundtrip(kservice, isolated_env):
++    from datetime import datetime, timezone
++    meta = {"owner_role": "sales", "visibility": "public", "scope": "global",
++            "file_hash": body_hash("经 API 写入的正文"),
++            "updated_at": datetime.now(timezone.utc).isoformat()}
++    out = kservice.write_doc("sales/new.md", meta, "经 API 写入的正文")
++    assert out["status"] == "ready"
++    assert _doc("sales/new.md")["owner_role"] == "sales"
++    assert _rows("SELECT * FROM pending_vault_writes") == []
++
++
++def test_write_doc_rejects_unsafe_path(kservice):
++    with pytest.raises(ValueError, match="vault_path_unsafe"):
++        kservice.write_doc("../evil.md", {}, "x")
++
++
++def test_purge_missing_respects_retention(kservice, isolated_env, write_md):
++    from datetime import datetime, timedelta, timezone
++    root = isolated_env["vault_dir"]
++    write_md(root, "sales/s.md", "过期待清理")
++    out = kservice.ingest("sales/s.md")
++    (root / "sales" / "s.md").unlink()
++    kservice.mark_missing("sales/s.md")
++    now = datetime.now(timezone.utc)
++    assert kservice.purge_missing(now=now)["purged"] == 0        # 未到保留期
++    later = now + timedelta(days=config.MISSING_RETENTION_DAYS + 1)
++    assert kservice.purge_missing(now=later)["purged"] == 1
++    assert _doc("sales/s.md") is None
++    assert _chunks(out["doc_id"]) == []
++
++
++# --- 快照 -------------------------------------------------------------------
++
++
++def test_snapshot_skips_unknown_and_attachment_dirs(kservice, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    write_md(root, "cfo/a.md", "合法")
++    (root / "attachments").mkdir(exist_ok=True)
++    (root / "attachments" / "x.md").write_text("x", encoding="utf-8")
++    (root / "unknown").mkdir(exist_ok=True)
++    (root / "unknown" / "y.md").write_text("y", encoding="utf-8")
++    assert set(kservice.snapshot()) == {"cfo/a.md"}
+\ No newline at end of file
+diff --git a/tests/test_knowledge_tool.py b/tests/test_knowledge_tool.py
+new file mode 100644
+index 0000000..cf8123a
+--- /dev/null
++++ b/tests/test_knowledge_tool.py
+@@ -0,0 +1,107 @@
++"""knowledge_tool Agent 面（M4 第二批）：身份、可见面、错误契约。"""
++from __future__ import annotations
++
++import pytest
++
++from opc_workbench.tools.knowledge_tool import LLM_ACTIONS, KnowledgeTool
++
++
++@pytest.fixture()
++def ktool(kservice, identity_api):
++    return KnowledgeTool(service=kservice, identity_api=identity_api)
++
++
++def test_llm_visible_actions_exclude_destructive_and_reindex():
++    assert set(LLM_ACTIONS) == {"import_doc", "search", "list_docs"}
++    assert "delete_doc" not in LLM_ACTIONS
++    assert "reindex" not in LLM_ACTIONS
++
++
++def test_tool_is_immutable(ktool):
++    with pytest.raises(PermissionError):
++        ktool._service = None
++
++
++def test_tool_exposes_no_writer_surface(ktool):
++    assert not hasattr(ktool, "_writer")
++    assert not hasattr(ktool, "writer")
++    assert set(KnowledgeTool.__slots__) == {"_service", "_identity_api"}
++
++
++def test_import_then_search_roundtrip(ktool, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    write_md(root, "sales/s.md", "工具链路检索正文")
++    out = ktool.import_doc(_frame_caller="sales", _llm_args={}, vault_path="sales/s.md")
++    assert out["status"] == "ready" and out["vault_path"] == "sales/s.md"
++    hits = ktool.search(_frame_caller="sales", _llm_args={}, query="工具链路检索正文")
++    assert len(hits["hits"]) == 1
++    assert hits["hits"][0]["vault_path"] == "sales/s.md"
++    assert set(hits["hits"][0]) == {"content", "vault_path", "seq", "score"}
++
++
++def test_import_rejects_unsafe_path(ktool):
++    out = ktool.import_doc(_frame_caller="sales", _llm_args={}, vault_path="../evil.md")
++    assert out["error"]["code"] == "vault_path_unsafe"
++
++
++def test_import_missing_file_returns_not_found(ktool):
++    out = ktool.import_doc(_frame_caller="sales", _llm_args={}, vault_path="sales/no.md")
++    assert out["error"]["code"] == "not_found"
++
++
++def test_llm_cannot_spoof_owner_role(ktool, isolated_env, write_md):
++    """身份 spoof 字段被丢弃；归属仍由目录映射决定。"""
++    root = isolated_env["vault_dir"]
++    write_md(root, "cfo/a.md", "归属 spoof 测试")
++    out = ktool.import_doc(_frame_caller="cfo",
++                           _llm_args={"owner_role": "boss", "caller_role": "boss"},
++                           vault_path="cfo/a.md")
++    assert out["status"] == "ready"
++    docs = ktool.list_docs(_frame_caller="cfo", _llm_args={})["docs"]
++    assert [d["owner_role"] for d in docs if d["vault_path"] == "cfo/a.md"] == ["cfo"]
++
++
++def test_search_isolation_through_tool(ktool, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    write_md(root, "cfo/p.md", "TOOL-SECRET-99", visibility="private")
++    ktool.import_doc(_frame_caller="cfo", _llm_args={}, vault_path="cfo/p.md")
++    out = ktool.search(_frame_caller="sales", _llm_args={}, query="TOOL-SECRET-99")
++    assert out["hits"] == []
++    boss_view = ktool.list_docs(_frame_caller="cfo", _llm_args={})["docs"]
++    assert any(d["vault_path"] == "cfo/p.md" for d in boss_view)
++
++
++def test_list_docs_invalid_param_rejected(ktool):
++    out = ktool.list_docs(_frame_caller="sales", _llm_args={}, limit="x")
++    assert out["error"]["code"] == "invalid_param"
++
++
++def test_search_invalid_top_k_rejected(ktool):
++    out = ktool.search(_frame_caller="sales", _llm_args={}, query="x", top_k=0)
++    assert out["error"]["code"] == "invalid_param"
++
++
++def test_delete_requires_trusted_context(ktool, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    write_md(root, "cfo/a.md", "需要确认才能删")
++    ktool.import_doc(_frame_caller="cfo", _llm_args={}, vault_path="cfo/a.md")
++    out = ktool.delete_doc(_frame_caller="cfo", _llm_args={}, vault_path="cfo/a.md")
++    assert out["error"]["code"] == "confirmation_required"
++    assert (root / "cfo" / "a.md").exists()
++
++
++def test_reindex_entry_has_no_identity_params(ktool, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    write_md(root, "cfo/a.md", "重建索引入口")
++    out = ktool.reindex(vault_path="cfo/a.md")
++    assert out["status"] == "ready" and out["chunk_count"] >= 1
++
++
++def test_llm_unavailable_returns_error_not_exception(ktool, isolated_env, write_md):
++    from opc_workbench import llm_client
++    root = isolated_env["vault_dir"]
++    write_md(root, "sales/s.md", "降级路径测试")
++    isolated_env["fake_llm"].embed_responses = [llm_client.LLMFailure("circuit_open")]
++    out = ktool.import_doc(_frame_caller="sales", _llm_args={}, vault_path="sales/s.md")
++    assert out["status"] == "failed"
++    assert "circuit_open" in out.get("status", "") or out["status"] == "failed"
+\ No newline at end of file
+diff --git a/tests/test_m3_migrations.py b/tests/test_m3_migrations.py
+index 140d410..0f6d06b 100644
+--- a/tests/test_m3_migrations.py
++++ b/tests/test_m3_migrations.py
+@@ -78,7 +78,7 @@ def v2_conn(isolated_env, monkeypatch):
+ def test_m003_adds_version_updated_at_and_boss_check(v2_conn):
+     """迁移后新列存在、boss 归属可写、10 角色仍可写、未知角色仍拒。"""
+     seeded = _seed_legacy_artifacts(v2_conn)
+-    assert db.init_db() == 4
++    assert db.init_db() == 5   # 尖端含 M4 m005
+     cols = _art_columns(v2_conn)
+     assert "version" in cols and "updated_at" in cols
+     with v2_conn:
+@@ -101,7 +101,7 @@ def test_m003_legacy_rows_preserved_field_by_field(v2_conn):
+     _seed_legacy_artifacts(v2_conn)
+     old_cols = _art_columns(v2_conn)
+     before = {r["id"]: dict(r) for r in v2_conn.execute("SELECT * FROM artifacts")}
+-    assert db.init_db() == 4
++    assert db.init_db() == 5   # 尖端含 M4 m005
+     after = {r["id"]: dict(r) for r in v2_conn.execute("SELECT * FROM artifacts")}
+     assert set(before) == set(after) and len(after) == 3
+     for rid, old in before.items():
+@@ -117,7 +117,7 @@ def test_m003_unique_and_indexes_preserved(v2_conn):
+     迁移前后索引清单逐项一致（名称/列/唯一性）。"""
+     _seed_legacy_artifacts(v2_conn)
+     idx_before = _art_indexes(v2_conn)
+-    assert db.init_db() == 4
++    assert db.init_db() == 5   # 尖端含 M4 m005
+     idx_after = _art_indexes(v2_conn)
+     # 表约束自动索引名随重建改变属预期，比对 (唯一性, 列) 多重集合
+     assert sorted(idx_before.values()) == sorted(idx_after.values())
+@@ -132,10 +132,10 @@ def test_m003_unique_and_indexes_preserved(v2_conn):
+ def test_m003_rerun_idempotent(v2_conn):
+     """成功迁移后再次 init_db 零变化（行数/版本记录/字段值均不动）。"""
+     _seed_legacy_artifacts(v2_conn)
+-    assert db.init_db() == 4
++    assert db.init_db() == 5   # 尖端含 M4 m005
+     snapshot = [dict(r) for r in v2_conn.execute("SELECT * FROM artifacts ORDER BY id")]
+     n_ver = v2_conn.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"]
+-    assert db.init_db() == 4
++    assert db.init_db() == 5   # 尖端含 M4 m005
+     assert [dict(r) for r in v2_conn.execute("SELECT * FROM artifacts ORDER BY id")] == snapshot
+     assert v2_conn.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == n_ver
+ 
+@@ -171,7 +171,7 @@ def test_m003_failure_rolls_back_completely(v2_conn, monkeypatch):
+         "SELECT name FROM sqlite_master WHERE type='table'")}
+     # 修复后重跑完整成功（精确恢复迁移列表，不动其他隔离补丁）
+     monkeypatch.setattr(db, "MIGRATIONS", full)
+-    assert db.init_db() == 4
++    assert db.init_db() == 5   # 尖端含 M4 m005
+     after = {r["id"]: dict(r) for r in v2_conn.execute("SELECT * FROM artifacts")}
+     for old in before:
+         for col in cols_before:
+@@ -179,8 +179,8 @@ def test_m003_failure_rolls_back_completely(v2_conn, monkeypatch):
+ 
+ 
+ def test_m003_fresh_db_boss_writable(isolated_env):
+-    """全新库直接走到 v4：boss 归属可写、version 默认 1、updated_at 必填。"""
+-    assert db.init_db() == 4
++    """全新库直接走到尖端（含 M4 m005）：boss 归属可写、version 默认 1、updated_at 必填。"""
++    assert db.init_db() == 5   # 尖端含 M4 m005
+     import sqlite3
+     conn = sqlite3.connect(str(config.DB_PATH), timeout=5.0)
+     conn.row_factory = sqlite3.Row
+@@ -204,7 +204,7 @@ def test_m004_adds_three_nullable_columns(v2_conn):
+             "INSERT INTO schedules(title,remind_at,owner_role,created_at,updated_at) "
+             "VALUES('旧日程','2026-11-21T09:00:00+08:00','personal',?,?)",
+             (db.now_iso(), db.now_iso()))
+-    assert db.init_db() == 4
++    assert db.init_db() == 5   # 尖端含 M4 m005
+     a_cols = [r["name"] for r in v2_conn.execute("PRAGMA table_info(approvals)")]
+     s_cols = [r["name"] for r in v2_conn.execute("PRAGMA table_info(schedules)")]
+     assert "digest" in a_cols
+diff --git a/tests/test_vault_batch2_regress.py b/tests/test_vault_batch2_regress.py
+new file mode 100644
+index 0000000..6c6285a
+--- /dev/null
++++ b/tests/test_vault_batch2_regress.py
+@@ -0,0 +1,48 @@
++"""第一批 vault 接口的第二批回归补强：日志可追溯 + 目录映射平台一致。
++
++这两条是第二批依赖审计实测发现的缺陷，属地基修正，不改已批准的分块口径。
++"""
++from __future__ import annotations
++
++import json
++from datetime import datetime, timezone
++
++import pytest
++
++from opc_workbench import config, vault
++from opc_workbench.knowledge_service import body_hash
++
++
++def _doc(owner_role="cfo", visibility="public"):
++    meta = {"owner_role": owner_role, "visibility": visibility, "scope": "global",
++            "file_hash": body_hash("正文"),
++            "updated_at": datetime.now(timezone.utc).isoformat()}
++    return vault.serialize_frontmatter(meta, "正文")
++
++
++def test_owner_mismatch_log_carries_path_and_both_roles(tmp_path):
++    """审计字段必须落在白名单内，否则出处被静默丢弃、无法追溯。"""
++    vault.load_doc(tmp_path, "cfo/a.md", _doc(owner_role="sales"))
++    log = config.LOG_DIR / "audit.log"
++    assert log.exists()
++    lines = [json.loads(x) for x in log.read_text(encoding="utf-8").splitlines() if x]
++    rec = [r for r in lines if r["action"] == "frontmatter_owner_mismatch"][-1]
++    assert rec["source"] == "cfo/a.md"          # 出处
++    assert rec["actor_role"] == "cfo"           # 目录归属（可信来源）
++    assert "sales" in rec["result_code"]        # frontmatter 谎报值
++
++
++@pytest.mark.parametrize("rel,expected", [
++    ("cfo/a.md", "cfo"),
++    ("cfo\\a.md", "cfo"),          # 反斜杠在两个平台都必须映射为 cfo
++    ("shared\\s.md", "coordinator"),
++    ("personal/p.md", "personal"),
++])
++def test_owner_mapping_is_platform_consistent(rel, expected):
++    assert vault.owner_for_relpath(rel) == expected
++
++
++@pytest.mark.parametrize("rel", ["attachments\\x.md", "unknown\\y.md", "\\cfo\\a.md"])
++def test_owner_mapping_still_rejects_non_owner_dirs(rel):
++    with pytest.raises(ValueError, match="vault_owner_undetermined"):
++        vault.owner_for_relpath(rel)
+\ No newline at end of file
+diff --git a/tests/test_vault_watcher.py b/tests/test_vault_watcher.py
+new file mode 100644
+index 0000000..bc3d685
+--- /dev/null
++++ b/tests/test_vault_watcher.py
+@@ -0,0 +1,132 @@
++"""vault_watcher（M4 第二批）：增量扫描、启停幂等、失败隔离。"""
++from __future__ import annotations
++
++import threading
++
++from opc_workbench import config, db
++from opc_workbench.vault_watcher import VaultWatcher
++
++
++def _doc(rel):
++    rows = db.get_conn().execute(
++        "SELECT * FROM knowledge_docs WHERE stored_path=?", (rel,)).fetchall()
++    return rows[0] if rows else None
++
++
++def test_constructor_does_not_start_thread(kservice):
++    w = VaultWatcher(kservice, interval_s=0.01)
++    assert w.running is False
++    assert not any(t.name == "vault-watcher" for t in threading.enumerate())
++
++
++def test_scan_once_ingests_added_and_changed(kservice, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    w = VaultWatcher(kservice, interval_s=0.01)
++    write_md(root, "cfo/a.md", "第一版")
++    first = w.scan_once()
++    assert first["diff"]["added"] == ["cfo/a.md"]
++    assert _doc("cfo/a.md")["status"] == "ready"
++
++    write_md(root, "cfo/a.md", "第二版内容更长一些")
++    hash_v1 = _doc("cfo/a.md")["indexed_hash"]
++    second = w.scan_once()
++    assert second["diff"]["changed"] == ["cfo/a.md"]
++    assert _doc("cfo/a.md")["indexed_hash"] != hash_v1      # 已按新正文重建
++    assert _doc("cfo/a.md")["chunk_count"] >= 1
++
++
++def test_scan_once_marks_removed_as_missing_not_deleted(kservice, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    w = VaultWatcher(kservice, interval_s=0.01)
++    write_md(root, "sales/s.md", "会被删掉的文档")
++    w.scan_once()
++    (root / "sales" / "s.md").unlink()
++    out = w.scan_once()
++    assert out["diff"]["removed"] == ["sales/s.md"]
++    doc = _doc("sales/s.md")
++    assert doc is not None and doc["status"] == "missing"   # 索引保留供恢复
++
++
++def test_scan_once_no_change_is_noop(kservice, isolated_env, write_md):
++    root = isolated_env["vault_dir"]
++    w = VaultWatcher(kservice, interval_s=0.01)
++    write_md(root, "cfo/a.md", "稳定内容")
++    w.scan_once()
++    before = len(isolated_env["fake_llm"].calls)
++    out = w.scan_once()
++    assert out["diff"] == {"added": [], "removed": [], "changed": []}
++    assert len(isolated_env["fake_llm"].calls) == before
++
++
++def test_single_file_failure_does_not_abort_round(kservice, isolated_env, write_md,
++                                                  monkeypatch):
++    root = isolated_env["vault_dir"]
++    write_md(root, "cfo/bad.md", "坏文件")
++    write_md(root, "sales/good.md", "好文件")
++    original = kservice.ingest
++
++    def flaky(rel):
++        if rel.endswith("bad.md"):
++            raise RuntimeError("ingest_boom")
++        return original(rel)
++
++    monkeypatch.setattr(kservice, "ingest", flaky)
++    w = VaultWatcher(kservice, interval_s=0.01)
++    out = w.scan_once()
++    statuses = {r["vault_path"]: r["status"] for r in out["results"]}
++    assert statuses["cfo/bad.md"] == "failed"
++    assert statuses["sales/good.md"] == "ready"
++
++
++def test_start_is_idempotent(kservice):
++    w = VaultWatcher(kservice, interval_s=0.01)
++    try:
++        w.start()
++        first = [t for t in threading.enumerate() if t.name == "vault-watcher"]
++        w.start()
++        second = [t for t in threading.enumerate() if t.name == "vault-watcher"]
++        assert len(first) == 1 and len(second) == 1
++    finally:
++        w.stop()
++
++
++def test_stop_joins_and_leaves_no_thread(kservice):
++    w = VaultWatcher(kservice, interval_s=0.01)
++    w.start()
++    assert w.running is True
++    w.stop()
++    assert w.running is False
++    assert not any(t.name == "vault-watcher" for t in threading.enumerate())
++
++
++def test_stop_is_idempotent_and_allows_restart(kservice):
++    w = VaultWatcher(kservice, interval_s=0.01)
++    w.start()
++    w.stop()
++    w.stop()
++    w.start()
++    try:
++        assert w.running is True
++    finally:
++        w.stop()
++    assert not any(t.name == "vault-watcher" for t in threading.enumerate())
++
++
++def test_background_loop_actually_indexes(kservice, isolated_env, write_md):
++    import time
++    root = isolated_env["vault_dir"]
++    write_md(root, "cfo/a.md", "后台扫描应导入")
++    w = VaultWatcher(kservice, interval_s=0.01)
++    w.start()
++    try:
++        deadline = time.monotonic() + 5
++        while time.monotonic() < deadline and _doc("cfo/a.md") is None:
++            time.sleep(0.01)
++    finally:
++        w.stop()
++    assert _doc("cfo/a.md") is not None
++
++
++def test_watcher_uses_config_interval_by_default(kservice):
++    w = VaultWatcher(kservice)
++    assert w._interval == config.VAULT_SCAN_INTERVAL_S
+\ No newline at end of file
