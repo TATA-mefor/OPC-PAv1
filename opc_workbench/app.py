@@ -175,8 +175,12 @@ class Application:
         self.cas_service.close()
 
 
-def build_application() -> Application:
-    """唯一组装点：**只构造，不缓存**。任何一步失败原样抛错（fail fast）。"""
+def _compose(*, with_owner_channel: bool):
+    """内部装配：返回 (Application, MainChatChannel | None)。
+
+    只有可信启动入口（main → ApplicationLauncher._build_owner）才请求带 boss
+    通道的实例；公开的 build_application() 永远拿不到通道。
+    """
     db.init_db()                                   # 迁移先行（零播种）
     backend = OwnerChannelBackend()                # app 内部创建
     identity_api = identity._build_identity(backend)
@@ -208,30 +212,60 @@ def build_application() -> Application:
                                knowledge_service=knowledge_service)
         dispatcher = build_dispatcher(
             identity_api=identity_api, registry=registry, backend=backend,
-            owner_credential=backend._entry_credential())
+            owner_credential=backend._entry_credential(),
+            agent_roles=config.AGENT_ROLES,
+            main_chat=with_owner_channel)
         watcher = VaultWatcher(knowledge_service)
-        return Application(identity_api=identity_api, cas_service=cas_service,
-                           disclosure=disclosure, dispatcher=dispatcher,
-                           watcher=watcher)
+        application = Application(
+            identity_api=identity_api, cas_service=cas_service,
+            disclosure=disclosure, dispatcher=dispatcher, watcher=watcher)
+        channel = None
+        if with_owner_channel:
+            channel = object.__getattribute__(dispatcher, "_main_chat")
+        return application, channel
     except BaseException:
         # 装配中途失败：关闭已打开的生产连接后再抛，绝不遗留悬挂连接
         _conn.close()
         raise
 
 
-class ApplicationLauncher:
-    """进程级生命周期持有者：单例装配 + 关停 + 关停后重启。"""
+def build_application() -> Application:
+    """公开组装工厂：**只构造，不缓存，也不产出 boss 通道**。
 
-    __slots__ = ("_application", "_lock")
+    普通业务模块即便反复调用，也只得到有界服务集合；主对话通道只能由
+    可信启动入口（main）创建并交给主窗口适配器。
+    """
+    return _compose(with_owner_channel=False)[0]
+
+
+
+class ApplicationLauncher:
+    """可信启动入口持有的生命周期对象：单例装配 + 关停 + boss 通道。
+
+    `build()` 只装配有界应用（**不含**主对话通道）；`main()` 走
+    `_build_owner()`，额外铸造并持有 MainChatChannel，供主窗口适配器使用。
+    普通模块调用 `build()` 或 `build_application()` 都拿不到 boss 通道。
+    """
+
+    __slots__ = ("_application", "_main_chat", "_lock")
 
     def __init__(self):
         object.__setattr__(self, "_application", None)
+        object.__setattr__(self, "_main_chat", None)
         object.__setattr__(self, "_lock", threading.Lock())
 
     def __getattribute__(self, name):
-        if name == "_application":
-            raise PermissionError("launcher_application_not_exposed")
+        if name in ("_application", "_main_chat"):
+            raise PermissionError("launcher_internal_not_exposed")
         return object.__getattribute__(self, name)
+
+    @property
+    def main_chat(self):
+        """主对话句柄：只有经 main() 启动的启动器才持有，否则拒绝。"""
+        channel = object.__getattribute__(self, "_main_chat")
+        if channel is None:
+            raise PermissionError("owner_channel_not_launched")
+        return channel
 
     def build(self) -> Application:
         with object.__getattribute__(self, "_lock"):
@@ -242,6 +276,17 @@ class ApplicationLauncher:
             object.__setattr__(self, "_application", application)
             return application
 
+    def _build_owner(self) -> Application:
+        """可信启动入口专用：装配应用并持有 boss 通道。"""
+        with object.__getattribute__(self, "_lock"):
+            current = object.__getattribute__(self, "_application")
+            if current is not None:
+                return current
+            application, channel = _compose(with_owner_channel=True)
+            object.__setattr__(self, "_application", application)
+            object.__setattr__(self, "_main_chat", channel)
+            return application
+
     def close(self) -> None:
         """幂等关停：先清状态再关连接，避免关 stopped 实例被再次取用。"""
         with object.__getattribute__(self, "_lock"):
@@ -249,16 +294,17 @@ class ApplicationLauncher:
             if current is None:
                 return
             object.__setattr__(self, "_application", None)
+            object.__setattr__(self, "_main_chat", None)
             current.close()
 
 
 def main() -> ApplicationLauncher:
-    """进程入口：创建并持有启动器，装配一次并启动后台扫描。
+    """进程入口（可信启动点）：装配一次、铸造 boss 通道、启动后台扫描。
 
-    M6 在此接 Gradio launch（仅 127.0.0.1），退出时由 atexit / 显式 close 收尾。
+    通道留给主窗口适配器（M6 Gradio）；退出时由 atexit / 显式 close 收尾。
     """
     launcher = ApplicationLauncher()
-    application = launcher.build()
+    application = launcher._build_owner()
     application.start_background()
     atexit.register(launcher.close)
     return launcher

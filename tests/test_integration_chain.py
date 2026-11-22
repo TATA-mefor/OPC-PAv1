@@ -20,16 +20,9 @@ def application(isolated_env):
     a.close()
 
 
-_CHANNELS: dict = {}
-
-
 def _agent_call(application, action, role="sales", **params):
-    """经调度器 Agent 通道调用：角色由注册信息决定，调用方写不进 _frame_caller。"""
-    key = (id(application), role)
-    channel = _CHANNELS.get(key)
-    if channel is None:
-        channel = application.dispatcher.register_agent(f"test-agent-{role}", role)
-        _CHANNELS[key] = channel
+    """经调度器 Agent 通道调用：角色由框架注册表决定，调用方写不进 _frame_caller。"""
+    channel = application.dispatcher.agent_channel(f"test-agent-{role}")
     return channel.submit(action, params)
 
 

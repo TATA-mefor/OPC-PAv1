@@ -128,6 +128,13 @@ DEFAULT_PRIVATE_ROLES = frozenset(
     k for k, v in ROLES.items() if v["default_visibility"] == "private"
 )
 
+# 可信 Agent 注册表（M5-a B2）：agent_id → 角色。
+# 只由框架/部署方在启动前写入（组合根读取快照）；业务调用方不能通过任何
+# 接口追加条目或指定角色。v1 还没有真实员工 Agent 进程，故默认空表：
+# 生产里不预置任何角色通道，调用方也就拿不到 cfo/sales 的身份句柄。
+AGENT_ROLES: dict[str, str] = {}
+
+
 # 敏感词升级表（PRD §4.2 规则2，M2.1 v3 §四.7）：命中即 private，宁可错杀，
 # 老板可显式改回 public。启发式词表，可调；不追求完备，角色默认兜底。
 SENSITIVE_HINTS = (

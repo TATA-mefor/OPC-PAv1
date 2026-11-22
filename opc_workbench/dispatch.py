@@ -141,7 +141,8 @@ class Dispatcher:
     """
 
     __slots__ = ("_identity_api", "_registry", "_backend", "_owner_credential",
-                 "_agents", "_agent_lock", "_owner_session_id", "_main_chat", "_closed")
+                 "_agent_roles", "_channels", "_agent_lock", "_owner_session_id",
+                 "_main_chat", "_closed")
 
     def __init__(self, *a, **kw):
         raise PermissionError("dispatcher_direct_construction_forbidden")
@@ -150,29 +151,30 @@ class Dispatcher:
         raise PermissionError("dispatcher_immutable")
 
     def __getattribute__(self, name):
-        if name in ("_registry", "_backend", "_owner_credential"):
+        if name in ("_registry", "_backend", "_owner_credential", "_main_chat"):
             raise PermissionError("dispatcher_internal_not_exposed")
         return object.__getattribute__(self, name)
 
-    @property
-    def main_chat(self) -> MainChatChannel:
-        return object.__getattribute__(self, "_main_chat")
+    def agent_channel(self, agent_id: str) -> AgentChannel:
+        """取得**框架已注册** Agent 的句柄。
 
-    def register_agent(self, agent_id: str, role: str) -> AgentChannel:
-        """登记员工 Agent 并发放句柄。角色必须是合法业务角色，且一经登记不可改写。"""
+        角色只取可信注册表（`config.AGENT_ROLES` 在组合根装配时的快照），
+        调用方无法指定角色、无法新增条目、无法改写既有角色。
+        """
         if not isinstance(agent_id, str) or not agent_id:
             raise ValueError("invalid_agent_id")
-        if role not in config.ROLES:
-            raise ValueError(f"unknown_role:{role!r}")
-        agents = object.__getattribute__(self, "_agents")
+        roles = object.__getattribute__(self, "_agent_roles")
+        role = roles.get(agent_id)
+        if role is None:
+            raise PermissionError("agent_not_provisioned")
+        channels = object.__getattribute__(self, "_channels")
         with object.__getattribute__(self, "_agent_lock"):
-            if agent_id in agents:
-                raise PermissionError("agent_already_registered")
-            agents[agent_id] = role
-        channel = object.__new__(AgentChannel)
-        object.__setattr__(channel, "_dispatcher", self)
-        object.__setattr__(channel, "_agent_id", agent_id)
-        audit_log.log("INFO", "agent_registered", actor_role=role, target_id=agent_id)
+            channel = channels.get(agent_id)
+            if channel is None:
+                channel = object.__new__(AgentChannel)
+                object.__setattr__(channel, "_dispatcher", self)
+                object.__setattr__(channel, "_agent_id", agent_id)
+                channels[agent_id] = channel
         return channel
 
     def schemas(self) -> dict:
@@ -219,7 +221,9 @@ class Dispatcher:
         raise PermissionError(f"unknown_source:{source!r}")
 
     def _resolve_main_chat(self, envelope):
-        if object.__getattribute__(envelope, "_channel") is not self.main_chat:
+        main_chat = object.__getattribute__(self, "_main_chat")
+        channel = object.__getattribute__(envelope, "_channel")
+        if main_chat is None or channel is not main_chat:
             raise PermissionError("main_chat_envelope_required")
         identity_api = object.__getattribute__(self, "_identity_api")
         backend = object.__getattribute__(self, "_backend")
@@ -242,29 +246,43 @@ class Dispatcher:
                 object.__getattribute__(envelope, "_agent_id"):
             raise PermissionError("agent_envelope_mismatch")
         agent_id = object.__getattribute__(envelope, "_agent_id")
-        agents = object.__getattribute__(self, "_agents")
-        role = agents.get(agent_id)
+        roles = object.__getattribute__(self, "_agent_roles")
+        role = roles.get(agent_id)
         if role is None:
-            raise PermissionError("agent_not_registered")
+            raise PermissionError("agent_not_provisioned")
         identity_api = object.__getattribute__(self, "_identity_api")
         identity_api.resolve_identity(role, {})
         return role, None
 
 
-def build_dispatcher(*, identity_api, registry: dict, backend, owner_credential) -> Dispatcher:
-    """组合根内部构造入口：装配身份链、入口凭证与注册表。"""
+def build_dispatcher(*, identity_api, registry: dict, backend, owner_credential,
+                     agent_roles: dict | None = None,
+                     main_chat: bool = False) -> Dispatcher:
+    """组合根内部构造入口：装配身份链、入口凭证与注册表。
+
+    `agent_roles` 是可信注册表的**快照**（组合根读取 `config.AGENT_ROLES`），
+    之后调用方无法通过调度器改写。
+    `main_chat=True` 时才铸造主对话句柄，由可信启动入口持有。
+    """
     import threading
     d = object.__new__(Dispatcher)
     object.__setattr__(d, "_identity_api", identity_api)
     object.__setattr__(d, "_registry", registry)
     object.__setattr__(d, "_backend", backend)
     object.__setattr__(d, "_owner_credential", owner_credential)
-    object.__setattr__(d, "_agents", {})
+    roles_snapshot = dict(agent_roles or {})
+    for agent_id, role in roles_snapshot.items():
+        if role not in config.ROLES:
+            raise ValueError(f"unknown_role:{role!r}")
+    object.__setattr__(d, "_agent_roles", roles_snapshot)
+    object.__setattr__(d, "_channels", {})
     object.__setattr__(d, "_agent_lock", threading.Lock())
     object.__setattr__(d, "_owner_session_id", None)
-    main_chat = object.__new__(MainChatChannel)
-    object.__setattr__(main_chat, "_dispatcher", d)
-    object.__setattr__(main_chat, "_credential", owner_credential)
-    object.__setattr__(d, "_main_chat", main_chat)
     object.__setattr__(d, "_closed", False)
+    main = None
+    if main_chat:
+        main = object.__new__(MainChatChannel)
+        object.__setattr__(main, "_dispatcher", d)
+        object.__setattr__(main, "_credential", owner_credential)
+    object.__setattr__(d, "_main_chat", main)
     return d

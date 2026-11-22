@@ -85,6 +85,10 @@ def isolated_env(request, tmp_path, monkeypatch):
     monkeypatch.setattr(config, "LOG_DIR", tmp_path / "logs")
     monkeypatch.setattr(config, "BACKUP_DIR", tmp_path / "backups")
     monkeypatch.setattr(config, "DASHSCOPE_API_KEY", "")  # 默认无 Key，防真客户端
+    # M5-a B2：可信 Agent 注册表由框架预置（测试用固定 id 前缀）；
+    # 生产默认空表，普通调用方无法自行注册角色。
+    monkeypatch.setattr(config, "AGENT_ROLES",
+                        {f"test-agent-{role}": role for role in config.ROLES})
 
     fake = FakeLLM()
     llm_client.set_llm(fake)

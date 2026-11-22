@@ -260,8 +260,8 @@ def test_public_surface_sweep_yields_no_write_capability(isolated_env):
     try:
         assert "writer" not in app.Application.__slots__
         for obj in (a, a.cas_service, a.disclosure, a.identity_api,
-                    a.dispatcher, a.dispatcher.main_chat,
-                    a.dispatcher.register_agent("sweep-agent", "sales")):
+                    a.dispatcher,
+                    a.dispatcher.agent_channel("test-agent-sales")):
             for name in dir(obj):
                 if name.startswith("__"):
                     continue
@@ -305,7 +305,7 @@ def test_attack_ordinary_call_does_not_preempt_startup(isolated_env, db_conn):
     assert not hasattr(started, "writer")
 
     # ③ 端到端回归：调度入口 → CAS 版本推进 → 披露审批链
-    channel = started.dispatcher.register_agent("startup-agent", "sales")
+    channel = started.dispatcher.agent_channel("test-agent-sales")
 
     def call(action, **params):
         return channel.submit(action, params)
@@ -367,7 +367,7 @@ def test_launcher_close_then_rebuild_is_usable(isolated_env, db_conn):
 
     second = launcher.build()
     assert second is not first
-    channel = second.dispatcher.register_agent("rebuild-agent", "sales")
+    channel = second.dispatcher.agent_channel("test-agent-sales")
     r = channel.submit("task.create", {"title": "重启后写入"})
     assert r["version"] == 1
     assert db_conn.execute("SELECT title FROM tasks WHERE id=?",
@@ -418,14 +418,14 @@ def test_launcher_build_failure_caches_nothing_and_retry_works(isolated_env, mon
         raise RuntimeError("assembly_failed")
 
     launcher = app.ApplicationLauncher()
-    monkeypatch.setattr(tools_mod, "build_tools", boom)
-    with pytest.raises(RuntimeError, match="assembly_failed"):
-        launcher.build()
-    monkeypatch.undo()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(tools_mod, "build_tools", boom)
+        with pytest.raises(RuntimeError, match="assembly_failed"):
+            launcher.build()
     a = launcher.build()
     try:
         assert not hasattr(a, "writer")
-        r = a.dispatcher.register_agent("retry-agent", "sales").submit(
+        r = a.dispatcher.agent_channel("test-agent-sales").submit(
             "task.create", {"title": "重试装配"})
         assert r["version"] == 1
     finally:
