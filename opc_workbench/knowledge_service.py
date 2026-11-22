@@ -401,6 +401,13 @@ class KnowledgeService:
         该路径的删除代次，再删 chunks 与文档行。否则 purge 之前已读到文件、
         还在 embedding 的旧轮次，可在文件后来原样重现时凭"快照+旧代次都匹配"
         重新插入一条已清理的文档（用户第三轮裁决）。
+
+        **候选复核（第四轮阻断）**：候选列表是在写事务**之外**查到的，期间文档
+        可能已被 ingest 恢复（status → ready、updated_at 前进）或已被 delete
+        清行。因此每条候选进入写事务后必须重新确认"仍是 missing 且仍早于
+        cutoff"，条件不成立就跳过：不得推进代次、不得删 chunks、不得删行，
+        否则一份已成功恢复并重建索引的文档会被过期清理任务永久删除。
+        复核与清理同在 BEGIN IMMEDIATE 事务内，复核后不存在被抢写的窗口。
         """
         from datetime import datetime, timedelta, timezone
         moment = now or datetime.now(timezone.utc)
@@ -409,9 +416,21 @@ class KnowledgeService:
         rows = conn.execute(
             "SELECT id,stored_path FROM knowledge_docs WHERE status='missing' "
             "AND updated_at IS NOT NULL AND updated_at<? ORDER BY id", (cutoff,)).fetchall()
+        purged = 0
         for row in rows:
             rel = vault.normalize_relpath(row["stored_path"])   # B5：历史行兜底归一
             with self._writer.transaction() as cur:
+                still = cur.execute(
+                    "SELECT stored_path FROM knowledge_docs "
+                    "WHERE id=? AND status='missing' "
+                    "AND updated_at IS NOT NULL AND updated_at<?",
+                    (row["id"], cutoff)).fetchone()
+                if still is None:
+                    audit_log.log("INFO", "knowledge_purge_skip_restored",
+                                  target_table="knowledge_docs", target_id=row["id"],
+                                  result_code="candidate_no_longer_missing", source=rel)
+                    continue
+                rel = vault.normalize_relpath(still["stored_path"])
                 cur.execute(
                     "INSERT INTO vault_path_state(stored_path,generation,updated_at) "
                     "VALUES(?,1,?) ON CONFLICT(stored_path) DO UPDATE SET "
@@ -419,7 +438,8 @@ class KnowledgeService:
                     (rel, db.now_iso()))
                 cur.execute("DELETE FROM knowledge_chunks WHERE doc_id=?", (row["id"],))
                 cur.execute("DELETE FROM knowledge_docs WHERE id=?", (row["id"],))
-        return {"purged": len(rows)}
+                purged += 1
+        return {"purged": purged, "skipped": len(rows) - purged}
 
     def recover(self) -> dict:
         """启动恢复：重放未完成意图 + 复位中断的 processing。"""

@@ -79,6 +79,48 @@ class _FailAfterGate:
         raise RuntimeError("OLD-ROUND-EMBED-FAILURE")
 
 
+@contextlib.contextmanager
+def _purge_scan_gate(monkeypatch):
+    """在 purge_missing 取回候选列表之后、开启写事务之前置位并阻塞。
+
+    purge 的候选是在事务外查的，真实竞态窗口就在这里：候选取到之后文档可能
+    被恢复。替身只拦那一句候选查询的 fetchall，其余连接调用透传。
+    """
+    real_get = db.get_conn
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _GatedCursor:
+        def __init__(self, cur):
+            self._cur = cur
+
+        def fetchall(self):
+            rows = self._cur.fetchall()
+            entered.set()
+            if not release.wait(10):
+                raise RuntimeError("gate_timeout")
+            return rows
+
+    class _Conn:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, params=()):
+            cur = self._inner.execute(sql, params)
+            if "status='missing'" in sql and "ORDER BY id" in sql:
+                return _GatedCursor(cur)
+            return cur
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    monkeypatch.setattr(db, "get_conn", lambda *a, **kw: _Conn(real_get(*a, **kw)))
+    try:
+        yield entered, release
+    finally:
+        release.set()
+
+
 # --- B1 ---------------------------------------------------------------------
 
 
@@ -488,3 +530,60 @@ def test_inflight_ingest_after_purge_missing_cannot_resurrect(
     assert fresh["doc_id"] != old_id
     assert _generation("sales/s.md") == 1
     assert len(kservice.search("PURGED-BODY", "sales")) == 1
+
+
+# --- purge 候选复核（第四轮阻断：误删已恢复文档） -----------------------------
+
+
+def test_purge_skips_doc_restored_between_scan_and_transaction(
+        kservice, isolated_env, write_md, monkeypatch):
+    """A 取到过期 missing 候选后暂停；B 恢复文件并成功 ingest；放行 A 后：
+    文档必须保持 ready、chunks 完整、代次不得被错误推进、purge 必须跳过。"""
+    from datetime import datetime, timedelta, timezone
+
+    from opc_workbench import config
+
+    root = isolated_env["vault_dir"]
+    write_md(root, "sales/s.md", "RESTORED-BODY")
+    old_id = kservice.ingest("sales/s.md")["doc_id"]
+    original_text = (root / "sales" / "s.md").read_text(encoding="utf-8")
+
+    (root / "sales" / "s.md").unlink()
+    assert kservice.mark_missing("sales/s.md")["missing"] is True
+    later = datetime.now(timezone.utc) + timedelta(
+        days=config.MISSING_RETENTION_DAYS + 1)
+
+    result: dict = {}
+    errors: list = []
+
+    def run_purge():
+        try:
+            result["p"] = kservice.purge_missing(now=later)
+        except BaseException as exc:      # noqa: BLE001
+            errors.append(exc)
+
+    with _purge_scan_gate(monkeypatch) as (entered, release):
+        t = threading.Thread(target=run_purge)
+        t.start()
+        try:
+            assert entered.wait(10), "purge 未停在候选取回之后"
+            # B：文件恢复并成功 ingest → status ready、新 chunks 落库
+            (root / "sales" / "s.md").write_text(original_text, encoding="utf-8")
+            fresh = kservice.ingest("sales/s.md")
+            assert fresh["stale"] is False and fresh["reindexed"] is True
+            assert _doc("sales/s.md")["status"] == "ready"
+        finally:
+            release.set()
+            t.join(10)
+    assert not errors, errors
+    assert not t.is_alive()
+
+    # 红证点：事务内不复核候选时，A 会按旧 id 删掉刚恢复的 ready 文档
+    doc = _doc("sales/s.md")
+    assert doc is not None and doc["status"] == "ready"
+    assert [c["content"] for c in _chunks(old_id)] == ["RESTORED-BODY"]
+    assert _generation("sales/s.md") == 0            # 代次不得被过期清理推进
+    assert result["p"]["purged"] == 0
+    assert result["p"]["skipped"] == 1
+    assert len(kservice.search("RESTORED-BODY", "sales")) == 1
+
