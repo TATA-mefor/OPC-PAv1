@@ -10,11 +10,13 @@ M3 先以纯函数 + pydantic 参数校验交付，schema 字典预留 M5 Functi
 from __future__ import annotations
 
 
-def build_tools(*, cas_service, identity_api) -> dict:
+def build_tools(*, cas_service, identity_api, knowledge_service=None) -> dict:
     """组合根装配入口：业务工具只接收注入实例，不拿模块/绑定函数。
 
     注册表仅含 LLM 可触达 action；治理函数（request/resolve/consume_
     bulk_delete 等）不注册（减少暴露面；身份约束来自 resolve_identity）。
+    knowledge 只注册 LLM_ACTIONS（import_doc / search / list_docs），
+    delete_doc 需 UI 确认、reindex 归 watcher，都不进注册表。
     """
     from .task import TaskTool
     registry: dict = {}
@@ -42,5 +44,14 @@ def build_tools(*, cas_service, identity_api) -> dict:
             registry[f"report.{action}"] = {
                 "handler": lambda _a=action, **kw: report_tool.dispatch(_a, **kw),
                 "schema": schema,
+            }
+    if knowledge_service is not None and identity_api is not None:
+        from .knowledge_tool import LLM_ACTIONS, KnowledgeTool
+        ktool = KnowledgeTool(service=knowledge_service, identity_api=identity_api)
+        schemas = ktool.fc_schemas()
+        for action in LLM_ACTIONS:
+            registry[f"knowledge.{action}"] = {
+                "handler": lambda _a=action, **kw: getattr(ktool, _a)(**kw),
+                "schema": schemas[action],
             }
     return registry

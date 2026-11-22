@@ -68,7 +68,14 @@ def snapshot_hash(text: str) -> str:
 
 
 class KnowledgeService:
-    """知识库应用服务。writer 由组合根注入，**不依赖 Application.writer**。"""
+    """知识库应用服务。writer 由组合根注入，**不依赖 Application.writer**。
+
+    M5-a：生产写能力不得经由本服务外泄。普通属性访问 `service._writer` 一律
+    拒绝（与 CASService 同款），内部写路径用 object.__getattribute__ 取用；
+    实例无 __dict__，不存在 __dict__["_writer"] 的第二条出口。
+    """
+
+    __slots__ = ("_writer", "_llm", "_root", "_identity_api")
 
     def __init__(self, writer, *, llm=None, vault_root=None, identity_api=None):
         self._writer = writer
@@ -76,6 +83,11 @@ class KnowledgeService:
         self._root = Path(vault_root) if vault_root is not None else config.VAULT_PATH
         # 删除鉴权唯一可信来源；未注入即"无人可被认证"，删除一律 fail closed
         self._identity_api = identity_api
+
+    def __getattribute__(self, name):
+        if name == "_writer":
+            raise PermissionError("knowledge_service_writer_not_exposed")
+        return object.__getattribute__(self, name)
 
     # -- 内部 ---------------------------------------------------------------
 
@@ -155,7 +167,7 @@ class KnowledgeService:
         #   ② 文件当前快照仍是本轮读到的那个（否则旧快照会覆盖新权限）。
         # 校验与写入同在 BEGIN IMMEDIATE 事务内，避免"检查完再被改"的窗口。
         try:
-            with self._writer.transaction() as cur:
+            with object.__getattribute__(self, "_writer").transaction() as cur:
                 if self._generation_row(cur, rel) != generation:
                     raise _StaleRound("delete_generation_advanced")
                 if self._current_snapshot(path) != snapshot:
@@ -208,7 +220,7 @@ class KnowledgeService:
             # B1 修复：失败状态同样受版本与 missing 保护。旧轮次失败不得把
             # 新版本（或 watcher 判定的 missing）改成 failed，否则新索引会被
             # 挤出检索视图。rowcount==0 即本轮已过期，丢弃失败标记。
-            with self._writer.transaction() as cur:
+            with object.__getattribute__(self, "_writer").transaction() as cur:
                 cur.execute(
                     "UPDATE knowledge_docs SET status='failed',last_error=?,updated_at=? "
                     "WHERE id=? AND source_hash=? AND snapshot_hash=? AND status<>'missing'",
@@ -233,7 +245,7 @@ class KnowledgeService:
         # 否则本轮 chunks 属于过期身份，整事务回滚。
         dim = len(vectors[0]) if vectors else config.EMBEDDING_DIM
         try:
-            with self._writer.transaction() as cur:
+            with object.__getattribute__(self, "_writer").transaction() as cur:
                 cur.execute(
                     "UPDATE knowledge_docs SET indexed_hash=?,chunk_count=?,embed_model=?,"
                     "embed_dim=?,status='ready',last_error=NULL,updated_at=? "
@@ -270,14 +282,14 @@ class KnowledgeService:
         if owner == vault.SHARED_OWNER:
             meta["visibility"] = "public"
         text = vault.serialize_frontmatter(meta, body)
-        with self._writer.transaction() as cur:
+        with object.__getattribute__(self, "_writer").transaction() as cur:
             cur.execute(
                 "INSERT INTO pending_vault_writes(stored_path,content,created_at) "
                 "VALUES(?,?,?) ON CONFLICT(stored_path) DO UPDATE SET "
                 "content=excluded.content,created_at=excluded.created_at",
                 (rel, text, db.now_iso()))
         vault.atomic_write(vault.resolve_safe_path(self._root, rel), text)
-        with self._writer.transaction() as cur:
+        with object.__getattribute__(self, "_writer").transaction() as cur:
             cur.execute("DELETE FROM pending_vault_writes WHERE stored_path=?", (rel,))
         return self.ingest(rel)
 
@@ -323,7 +335,7 @@ class KnowledgeService:
         # B5：删除与导入必须命中同一个身份（反斜杠/正斜杠不算两个路径）
         rel = vault.normalize_relpath(rel)
         vault.resolve_safe_path(self._root, rel)   # 先校验路径，再动盘
-        with self._writer.transaction() as cur:
+        with object.__getattribute__(self, "_writer").transaction() as cur:
             row = self._doc_row(cur, rel)
             doc_id = row["id"] if row is not None else None
             cur.execute(
@@ -359,7 +371,7 @@ class KnowledgeService:
         path = vault.resolve_safe_path(self._root, rel)
         if path.exists():
             path.unlink()
-        with self._writer.transaction() as cur:
+        with object.__getattribute__(self, "_writer").transaction() as cur:
             # B4：显式删除推进持久代次（文档行删掉后本表仍保留墓碑）。
             # 已读取旧文件的 ingest 轮次因此失效，不得重新创建该路径文档。
             cur.execute(
@@ -384,7 +396,7 @@ class KnowledgeService:
         missing 文档不参与检索（视图按 status='ready' 过滤）。
         """
         rel = vault.normalize_relpath(rel)      # B5：与 ingest 同一身份键
-        with self._writer.transaction() as cur:
+        with object.__getattribute__(self, "_writer").transaction() as cur:
             cur.execute(
                 "UPDATE knowledge_docs SET status='missing',updated_at=? "
                 "WHERE stored_path=? AND status<>'missing'", (db.now_iso(), rel))
@@ -419,7 +431,7 @@ class KnowledgeService:
         purged = 0
         for row in rows:
             rel = vault.normalize_relpath(row["stored_path"])   # B5：历史行兜底归一
-            with self._writer.transaction() as cur:
+            with object.__getattribute__(self, "_writer").transaction() as cur:
                 still = cur.execute(
                     "SELECT stored_path FROM knowledge_docs "
                     "WHERE id=? AND status='missing' "
@@ -456,10 +468,10 @@ class KnowledgeService:
         for row in writes:
             rel = vault.normalize_relpath(row["stored_path"])   # B5：与 ingest 同一身份
             vault.atomic_write(vault.resolve_safe_path(self._root, rel), row["content"])
-            with self._writer.transaction() as cur:
+            with object.__getattribute__(self, "_writer").transaction() as cur:
                 cur.execute("DELETE FROM pending_vault_writes WHERE stored_path=?", (rel,))
         for row in stuck:
-            with self._writer.transaction() as cur:
+            with object.__getattribute__(self, "_writer").transaction() as cur:
                 cur.execute(
                     "UPDATE knowledge_docs SET status='failed',last_error=?,updated_at=? "
                     "WHERE id=? AND status='processing'",

@@ -470,12 +470,12 @@ def test_delete_rejects_unregistered_identity(kservice, isolated_env, write_md):
     _no_effect(root)
 
 
-def test_recover_replays_pending_deletion(kservice, isolated_env, write_md):
+def test_recover_replays_pending_deletion(kservice, kwriter, isolated_env, write_md):
     """崩溃点：意图已写、文件与 DB 行尚未删 → 重启幂等重放。"""
     root = isolated_env["vault_dir"]
     write_md(root, "cfo/a.md", "崩溃前正文")
     out = kservice.ingest("cfo/a.md")
-    with kservice._writer.transaction() as cur:
+    with kwriter.transaction() as cur:
         cur.execute("INSERT INTO pending_deletions(doc_id,stored_path,created_at) "
                     "VALUES(?,?,?)", (out["doc_id"], "cfo/a.md", db.now_iso()))
     report = kservice.recover()
@@ -485,14 +485,14 @@ def test_recover_replays_pending_deletion(kservice, isolated_env, write_md):
     assert _chunks(out["doc_id"]) == []
 
 
-def test_recover_replays_pending_vault_write(kservice, isolated_env, write_md):
+def test_recover_replays_pending_vault_write(kservice, kwriter, isolated_env, write_md):
     root = isolated_env["vault_dir"]
     write_md(root, "cfo/a.md", "原始正文")
     kservice.ingest("cfo/a.md")
     pending_text = (root / "cfo" / "a.md").read_text(encoding="utf-8").replace(
         "原始正文", "崩溃后应恢复的正文")
     (root / "cfo" / "a.md").unlink()
-    with kservice._writer.transaction() as cur:
+    with kwriter.transaction() as cur:
         cur.execute("INSERT INTO pending_vault_writes(stored_path,content,created_at) "
                     "VALUES(?,?,?)", ("cfo/a.md", pending_text, db.now_iso()))
     report = kservice.recover()
@@ -502,10 +502,10 @@ def test_recover_replays_pending_vault_write(kservice, isolated_env, write_md):
     assert _rows("SELECT * FROM pending_vault_writes") == []
 
 
-def test_recover_resets_interrupted_processing(kservice, isolated_env, write_md):
+def test_recover_resets_interrupted_processing(kservice, kwriter, isolated_env, write_md):
     root = isolated_env["vault_dir"]
     write_md(root, "cfo/a.md", "中断文档")
-    with kservice._writer.transaction() as cur:
+    with kwriter.transaction() as cur:
         cur.execute(
             "INSERT INTO knowledge_docs(filename,stored_path,file_hash,owner_role,"
             "created_at,status) VALUES('a.md','cfo/a.md','sha256:x','cfo',?,'processing')",

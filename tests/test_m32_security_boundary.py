@@ -259,7 +259,9 @@ def test_public_surface_sweep_yields_no_write_capability(isolated_env):
     a = app.build_application()
     try:
         assert "writer" not in app.Application.__slots__
-        for obj in (a, a.cas_service, a.disclosure, a.identity_api):
+        for obj in (a, a.cas_service, a.disclosure, a.identity_api,
+                    a.dispatcher, a.dispatcher.main_chat,
+                    a.dispatcher.register_agent("sweep-agent", "sales")):
             for name in dir(obj):
                 if name.startswith("__"):
                     continue
@@ -269,29 +271,14 @@ def test_public_surface_sweep_yields_no_write_capability(isolated_env):
                     continue          # 显式拒绝即达标
                 assert not isinstance(val, db.WriteCapability), (
                     f"{type(obj).__name__}.{name} 泄露原始写能力")
+        # 原始工具注册表不在公开面；调度器内部同样取得不到
+        assert not hasattr(a, "tools")
+        with pytest.raises(PermissionError, match="dispatcher_internal_not_exposed"):
+            a.dispatcher._registry
         # 工具类不得再提供公开的 writer 取用方法
         for cls in (TaskTool, ScheduleTool, ReportTool):
             assert not hasattr(cls, "_writer"), f"{cls.__name__}._writer 仍是公开入口"
             assert not hasattr(cls, "writer")
-        # 注册表条目本身不含写能力
-        for key, entry in a.tools.items():
-            for v in entry.values():
-                assert not isinstance(v, db.WriteCapability), f"tools[{key}] 泄露写能力"
-        # handler 闭包里捕获的工具实例同样不得泄露（普通属性访问即可到达）
-        for key, entry in a.tools.items():
-            for cell in (entry["handler"].__closure__ or ()):
-                obj = cell.cell_contents
-                if obj is None or isinstance(obj, (str, int, float, bool, dict, list)):
-                    continue
-                for name in dir(obj):
-                    if name.startswith("__"):
-                        continue
-                    try:
-                        val = getattr(obj, name)
-                    except PermissionError:
-                        continue
-                    assert not isinstance(val, db.WriteCapability), (
-                        f"tools[{key}] 闭包内 {type(obj).__name__}.{name} 泄露写能力")
     finally:
         a.close()
 
@@ -317,9 +304,11 @@ def test_attack_ordinary_call_does_not_preempt_startup(isolated_env, db_conn):
     assert started is not grabbed
     assert not hasattr(started, "writer")
 
-    # ③ 端到端回归：工具注册 → CAS 版本推进 → 披露审批链
-    def call(action, role="sales", **params):
-        return started.tools[action]["handler"](_frame_caller=role, _llm_args={}, **params)
+    # ③ 端到端回归：调度入口 → CAS 版本推进 → 披露审批链
+    channel = started.dispatcher.register_agent("startup-agent", "sales")
+
+    def call(action, **params):
+        return channel.submit(action, params)
 
     r = call("task.create", title="启动后链路")
     assert r["version"] == 1
@@ -378,8 +367,8 @@ def test_launcher_close_then_rebuild_is_usable(isolated_env, db_conn):
 
     second = launcher.build()
     assert second is not first
-    r = second.tools["task.create"]["handler"](
-        _frame_caller="sales", _llm_args={}, title="重启后写入")
+    channel = second.dispatcher.register_agent("rebuild-agent", "sales")
+    r = channel.submit("task.create", {"title": "重启后写入"})
     assert r["version"] == 1
     assert db_conn.execute("SELECT title FROM tasks WHERE id=?",
                            (r["id"],)).fetchone()["title"] == "重启后写入"
@@ -436,8 +425,8 @@ def test_launcher_build_failure_caches_nothing_and_retry_works(isolated_env, mon
     a = launcher.build()
     try:
         assert not hasattr(a, "writer")
-        r = a.tools["task.create"]["handler"](
-            _frame_caller="sales", _llm_args={}, title="重试装配")
+        r = a.dispatcher.register_agent("retry-agent", "sales").submit(
+            "task.create", {"title": "重试装配"})
         assert r["version"] == 1
     finally:
         launcher.close()

@@ -101,6 +101,18 @@ class KnowledgeTool:
         caller = self._caller(_frame_caller, _llm_args, _trusted_ctx)
         return {"docs": self._service.list_docs(caller)}
 
+    # -- FC schema（M5-a 消费；身份字段不在其中） -----------------------------
+
+    @staticmethod
+    def fc_schemas() -> dict:
+        """只导出 LLM 可见的 3 个 action；delete_doc / reindex 不出现在 FC 面。"""
+        out = {}
+        for name, model in (("import_doc", ImportParams),
+                            ("search", SearchParams),
+                            ("list_docs", ListParams)):
+            out[name] = {"parameters": model.model_json_schema()}
+        return out
+
     # -- 非 LLM 面（UI 确认 / watcher） ---------------------------------------
 
     def delete_doc(self, *, _frame_caller, _llm_args, _trusted_ctx=None, **params) -> dict:

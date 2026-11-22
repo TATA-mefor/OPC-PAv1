@@ -65,12 +65,14 @@ def test_single_file_failure_does_not_abort_round(kservice, isolated_env, write_
     write_md(root, "sales/good.md", "好文件")
     original = kservice.ingest
 
-    def flaky(rel):
+    def flaky(self, rel):
         if rel.endswith("bad.md"):
             raise RuntimeError("ingest_boom")
         return original(rel)
 
-    monkeypatch.setattr(kservice, "ingest", flaky)
+    # KnowledgeService 已 __slots__ 化（M5-a 封 writer 出口），实例属性不可改，
+    # 因此在类上打补丁；替身仍走真实 ingest。
+    monkeypatch.setattr(type(kservice), "ingest", flaky)
     w = VaultWatcher(kservice, interval_s=0.01)
     out = w.scan_once()
     statuses = {r["vault_path"]: r["status"] for r in out["results"]}

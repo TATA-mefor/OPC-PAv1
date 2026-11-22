@@ -20,10 +20,17 @@ def application(isolated_env):
     a.close()
 
 
-def _agent_call(app, action, role="sales", **params):
-    """经注册表 handler 的 Agent 通道调用（身份由框架注入）。"""
-    entry = app.tools[action]
-    return entry["handler"](_frame_caller=role, _llm_args={}, **params)
+_CHANNELS: dict = {}
+
+
+def _agent_call(application, action, role="sales", **params):
+    """经调度器 Agent 通道调用：角色由注册信息决定，调用方写不进 _frame_caller。"""
+    key = (id(application), role)
+    channel = _CHANNELS.get(key)
+    if channel is None:
+        channel = application.dispatcher.register_agent(f"test-agent-{role}", role)
+        _CHANNELS[key] = channel
+    return channel.submit(action, params)
 
 
 def test_chain_task_create_update_delete(application, db_conn):
@@ -109,21 +116,23 @@ def test_chain_cross_role_write_denied(application, db_conn):
 
 
 def test_chain_llm_spoof_via_registry(application, db_conn):
-    """LLM 伪造身份字段经注册表入口 → 丢弃，按真实 caller 归属。"""
-    entry = application.tools["task.create"]
-    r = entry["handler"](_frame_caller="sales",
-                         _llm_args={"caller_role": "boss", "owner_role": "cfo"},
-                         title="伪造链")
-    row = db_conn.execute("SELECT owner_role FROM tasks WHERE id=?", (r["id"],)).fetchone()
+    """LLM 在参数里伪造身份字段经调度入口 → 不提升权限，归属仍按真实 caller。"""
+    spoof = _agent_call(application, "task.create", title="伪造链",
+                        owner_role="cfo", caller_role="boss")
+    row = db_conn.execute("SELECT owner_role FROM tasks WHERE id=?",
+                          (spoof["id"],)).fetchone()
     assert row["owner_role"] == "sales"
 
 
 def test_registry_completeness(application):
-    """注册表完整性：6+5+4=15 个 LLM action；治理函数不在其中。"""
-    names = set(application.tools)
-    assert len(names) == 15
+    """注册表完整性：6+5+4+3=18 个 LLM action；治理与破坏性动作不在其中。"""
+    names = set(application.dispatcher.schemas())
+    assert len(names) == 18
     assert sum(n.startswith("task.") for n in names) == 6
     assert sum(n.startswith("schedule.") for n in names) == 5
     assert sum(n.startswith("report.") for n in names) == 4
+    assert sum(n.startswith("knowledge.") for n in names) == 3
+    assert "knowledge.delete_doc" not in names
+    assert "knowledge.reindex" not in names
     for n in names:
         assert "resolve" not in n and "consume" not in n and "request" not in n

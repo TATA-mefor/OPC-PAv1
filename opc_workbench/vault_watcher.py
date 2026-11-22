@@ -18,6 +18,8 @@ from . import audit_log, config, vault
 
 
 class VaultWatcher:
+    __slots__ = ("_service", "_interval", "_stop", "_thread", "_snapshot")
+
     def __init__(self, service, *, interval_s: float | None = None):
         self._service = service
         self._interval = (config.VAULT_SCAN_INTERVAL_S if interval_s is None
@@ -26,19 +28,26 @@ class VaultWatcher:
         self._thread: threading.Thread | None = None
         self._snapshot: dict = {}
 
+    def __getattribute__(self, name):
+        # M5-a：watcher 是组合根持有的后台部件，不得成为 KnowledgeService
+        # （进而写能力）的外泄出口；内部访问一律越过本钩子。
+        if name == "_service":
+            raise PermissionError("watcher_service_not_exposed")
+        return object.__getattribute__(self, name)
+
     @property
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
     def scan_once(self) -> dict:
         """扫描一轮并处理差异。返回本轮差异与逐文件结果（不含正文）。"""
-        new = self._service.snapshot()
+        new = object.__getattribute__(self, "_service").snapshot()
         diff = vault.diff_snapshots(self._snapshot, new)
         self._snapshot = new
         results: list[dict] = []
         for rel in diff["added"] + diff["changed"]:
             try:
-                outcome = self._service.ingest(rel)
+                outcome = object.__getattribute__(self, "_service").ingest(rel)
                 results.append({"vault_path": rel, "status": outcome["status"]})
             except Exception as exc:  # noqa: BLE001 — 单文件失败不拖垮整轮
                 audit_log.log("ERROR", "watcher_ingest_failed",
@@ -47,7 +56,7 @@ class VaultWatcher:
                 results.append({"vault_path": rel, "status": "failed"})
         for rel in diff["removed"]:
             try:
-                self._service.mark_missing(rel)
+                object.__getattribute__(self, "_service").mark_missing(rel)
                 results.append({"vault_path": rel, "status": "missing"})
             except Exception as exc:  # noqa: BLE001
                 audit_log.log("ERROR", "watcher_missing_failed",
