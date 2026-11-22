@@ -12,11 +12,13 @@
   转述不继承原消息权限：Agent 转述老板要求，仍按该 Agent 注册角色授权。
 
 两种来源：
-- `main_chat`：`MainChatChannel` 持有组合根铸造的一次性入口凭证，
-  经 OwnerChannelBackend → register_session → issue_proof →
-  mint_boss_context → resolve_identity("boss") 得到 boss 身份。
-- `agent_message`：角色由 `Dispatcher.register_agent(agent_id, role)` 的
-  注册信息决定，信封里的角色字段不被采信。
+- `main_chat`：`MainChatChannel` 只由可信启动入口（`app.main()`）取得，
+  持有组合根铸造的一次性入口凭证，经 OwnerChannelBackend → register_session →
+  issue_proof → mint_boss_context → resolve_identity("boss") 得到 boss 身份。
+  调度器不公开该通道（`_main_chat` 拒绝普通属性访问）。
+- `agent_message`：角色由组合根传入的 `config.AGENT_ROLES` 快照决定，
+  调度器不提供注册入口（`agent_channel(agent_id)` 只取已登记句柄），
+  信封里的角色字段不被采信。
 
 `parent_message_id` 只做追踪，绝不参与授权。
 """
@@ -105,9 +107,9 @@ class MainChatChannel:
 
 
 class AgentChannel:
-    """员工 Agent 句柄：由 `Dispatcher.register_agent` 按注册信息发放。
+    """员工 Agent 句柄：只对 `config.AGENT_ROLES` 已登记的 agent_id 发放。
 
-    角色固定在注册时确定；本句柄无法写入或覆盖角色。
+    角色固定在该可信注册表里确定；句柄不接受角色参数，也无法写入或覆盖角色。
     """
 
     __slots__ = ("_dispatcher", "_agent_id")
