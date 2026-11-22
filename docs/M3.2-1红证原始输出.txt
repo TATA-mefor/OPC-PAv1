@@ -1,0 +1,284 @@
+红证：把第四轮新增用例放到旧实现树上运行，预期变红
+
+===== A. 旧提交 2d0a539（Application 仍公开 writer） =====
+FFFFFF                                                                   [100%]
+================================== FAILURES ===================================
+____________ test_public_surface_sweep_yields_no_write_capability _____________
+
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-150/test_public_surface_sweep_yiel0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-150/test_public_surface_sweep_yiel0/vault')}
+
+    def test_public_surface_sweep_yields_no_write_capability(isolated_env):
+        """遍历组合根产物的全部公开属性，任一都不得是原始 WriteCapability。"""
+        from opc_workbench.tools.task import TaskTool
+        from opc_workbench.tools.schedule import ScheduleTool
+        from opc_workbench.tools.report import ReportTool
+    
+        a = app.build_application()
+        try:
+>           assert "writer" not in app.Application.__slots__
+E           AssertionError: assert 'writer' not in ('identity_api', 'cas_service', 'writer', 'tools', 'disclosure')
+E            +  where ('identity_api', 'cas_service', 'writer', 'tools', 'disclosure') = <class 'opc_workbench.app.Application'>.__slots__
+E            +    where <class 'opc_workbench.app.Application'> = app.Application
+
+tests\test_m32_security_boundary.py:261: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-150/test_public_surface_sweep_yiel0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-150/test_public_surface_sweep_yiel0/vault')}
+
+    def test_public_surface_sweep_yields_no_write_capability(isolated_env):
+        """遍历组合根产物的全部公开属性，任一都不得是原始 WriteCapability。"""
+        from opc_workbench.tools.task import TaskTool
+        from opc_workbench.tools.schedule import ScheduleTool
+        from opc_workbench.tools.report import ReportTool
+    
+        a = app.build_application()
+        try:
+            assert "writer" not in app.Application.__slots__
+            for obj in (a, a.cas_service, a.disclosure, a.identity_api):
+                for name in dir(obj):
+                    if name.startswith("__"):
+                        continue
+                    try:
+                        val = getattr(obj, name)
+                    except PermissionError:
+                        continue          # 显式拒绝即达标
+                    assert not isinstance(val, db.WriteCapability), (
+                        f"{type(obj).__name__}.{name} 泄露原始写能力")
+            # 工具类不得再提供公开的 writer 取用方法
+            for cls in (TaskTool, ScheduleTool, ReportTool):
+                assert not hasattr(cls, "_writer"), f"{cls.__name__}._writer 仍是公开入口"
+                assert not hasattr(cls, "writer")
+            # 注册表条目本身不含写能力
+            for key, entry in a.tools.items():
+                for v in entry.values():
+                    assert not isinstance(v, db.WriteCapability), f"tools[{key}] 泄露写能力"
+            # handler 闭包里捕获的工具实例同样不得泄露（普通属性访问即可到达）
+            for key, entry in a.tools.items():
+                for cell in (entry["handler"].__closure__ or ()):
+                    obj = cell.cell_contents
+                    if obj is None or isinstance(obj, (str, int, float, bool, dict, list)):
+                        continue
+                    for name in dir(obj):
+                        if name.startswith("__"):
+                            continue
+                        try:
+                            val = getattr(obj, name)
+                        except PermissionError:
+                            continue
+                        assert not isinstance(val, db.WriteCapability), (
+                            f"tools[{key}] 闭包内 {type(obj).__name__}.{name} 泄露写能力")
+        finally:
+>           a.close()
+            ^^^^^^^
+E           AttributeError: 'Application' object has no attribute 'close'
+
+tests\test_m32_security_boundary.py:296: AttributeError
+_____________ test_attack_ordinary_call_does_not_preempt_startup ______________
+
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-150/test_attack_ordinary_call_does0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-150/test_attack_ordinary_call_does0/vault')}
+db_conn = <sqlite3.Connection object at 0x000001C88003D210>
+
+    def test_attack_ordinary_call_does_not_preempt_startup(isolated_env, db_conn):
+        """攻击：普通业务模块抢先调用公开工厂。
+    
+        断言一：拿不到原始生产 writer（任何公开属性）。
+        断言二：不影响真正启动——随后 app.main() 的启动器仍装配出可用应用。
+        断言三：修复后真实调用链（工具注册 / CAS / 披露）端到端仍正常。
+        """
+        # ① 普通模块抢先调用（修复前此处即可取得生产 writer）
+        grabbed = app.build_application()
+>       assert not hasattr(grabbed, "writer")
+E       AssertionError: assert not True
+E        +  where True = hasattr(<opc_workbench.app.Application object at 0x000001C88010FFB0>, 'writer')
+
+tests\test_m32_security_boundary.py:308: AssertionError
+________________ test_no_module_level_mutable_application_slot ________________
+
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-150/test_no_module_level_mutable_a0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-150/test_no_module_level_mutable_a0/vault')}
+
+    def test_no_module_level_mutable_application_slot(isolated_env):
+        """app 模块不得存在任何模块级应用/启动器实例槽（含 _application）。"""
+        assert not hasattr(app, "_application")
+>       assert not hasattr(app, "_production_writer_taken")
+E       AssertionError: assert not True
+E        +  where True = hasattr(app, '_production_writer_taken')
+
+tests\test_m32_security_boundary.py:353: AssertionError
+_________________ test_launcher_close_then_rebuild_is_usable __________________
+
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-150/test_launcher_close_then_rebui0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-150/test_launcher_close_then_rebui0/vault')}
+db_conn = <sqlite3.Connection object at 0x000001C88003EB60>
+
+    def test_launcher_close_then_rebuild_is_usable(isolated_env, db_conn):
+        """关停后重新 build() → 全新实例且真实可写（不是已关闭的旧实例）。"""
+>       launcher = app.ApplicationLauncher()
+                   ^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'opc_workbench.app' has no attribute 'ApplicationLauncher'
+
+tests\test_m32_security_boundary.py:374: AttributeError
+_______________ test_build_failure_closes_production_connection _______________
+
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-150/test_build_failure_closes_prod0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-150/test_build_failure_closes_prod0/vault')}
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001C88009A8B0>
+
+    def test_build_failure_closes_production_connection(isolated_env, monkeypatch):
+        """装配中途失败（writer 已创建）→ 已打开的生产连接必须被关闭。"""
+        import sqlite3
+        from opc_workbench import tools as tools_mod
+    
+        opened = []
+        real_connect = sqlite3.connect
+    
+        def tracking_connect(*a, **kw):
+            conn = real_connect(*a, **kw)
+            opened.append(conn)
+            return conn
+    
+        def boom(**kw):
+            raise RuntimeError("assembly_failed_after_writer")
+    
+        monkeypatch.setattr(app.sqlite3, "connect", tracking_connect)
+        monkeypatch.setattr(tools_mod, "build_tools", boom)
+        with pytest.raises(RuntimeError, match="assembly_failed_after_writer"):
+            app.build_application()
+        assert opened, "未捕获到生产连接"
+>       with pytest.raises(sqlite3.ProgrammingError):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'sqlite3.ProgrammingError'>
+
+tests\test_m32_security_boundary.py:420: Failed
+_________ test_launcher_build_failure_caches_nothing_and_retry_works __________
+
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-150/test_launcher_build_failure_ca0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-150/test_launcher_build_failure_ca0/vault')}
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001C8801B0350>
+
+    def test_launcher_build_failure_caches_nothing_and_retry_works(isolated_env, monkeypatch):
+        """启动器构造失败 → 不缓存半成品；排除故障后重试得到可用应用。"""
+        from opc_workbench import tools as tools_mod
+    
+        def boom(**kw):
+            raise RuntimeError("assembly_failed")
+    
+>       launcher = app.ApplicationLauncher()
+                   ^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'opc_workbench.app' has no attribute 'ApplicationLauncher'
+
+tests\test_m32_security_boundary.py:431: AttributeError
+=========================== short test summary info ===========================
+FAILED tests/test_m32_security_boundary.py::test_public_surface_sweep_yields_no_write_capability
+FAILED tests/test_m32_security_boundary.py::test_attack_ordinary_call_does_not_preempt_startup
+FAILED tests/test_m32_security_boundary.py::test_no_module_level_mutable_application_slot
+FAILED tests/test_m32_security_boundary.py::test_launcher_close_then_rebuild_is_usable
+FAILED tests/test_m32_security_boundary.py::test_build_failure_closes_production_connection
+FAILED tests/test_m32_security_boundary.py::test_launcher_build_failure_caches_nothing_and_retry_works
+6 failed, 12 deselected in 1.34s
+
+===== B. 第三轮实现（模块级 _application 缓存版，由已交付 patch 重建） =====
+.FFFFF                                                                   [100%]
+================================== FAILURES ===================================
+_____________ test_attack_ordinary_call_does_not_preempt_startup ______________
+
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-151/test_attack_ordinary_call_does0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-151/test_attack_ordinary_call_does0/vault')}
+db_conn = <sqlite3.Connection object at 0x000002738AC41210>
+
+    def test_attack_ordinary_call_does_not_preempt_startup(isolated_env, db_conn):
+        """攻击：普通业务模块抢先调用公开工厂。
+    
+        断言一：拿不到原始生产 writer（任何公开属性）。
+        断言二：不影响真正启动——随后 app.main() 的启动器仍装配出可用应用。
+        断言三：修复后真实调用链（工具注册 / CAS / 披露）端到端仍正常。
+        """
+        # ① 普通模块抢先调用（修复前此处即可取得生产 writer）
+        grabbed = app.build_application()
+        assert not hasattr(grabbed, "writer")
+        with pytest.raises(PermissionError, match="cas_service_writer_not_exposed"):
+            grabbed.cas_service._writer
+        with pytest.raises(PermissionError, match="disclosure_service_writer_not_exposed"):
+            grabbed.disclosure._writer
+    
+        # ② 真正启动不受影响：启动器由入口持有，装配出独立可用应用
+        launcher = app.main()
+>       started = launcher.build()
+                  ^^^^^^^^^^^^^^
+E       AttributeError: 'Application' object has no attribute 'build'
+
+tests\test_m32_security_boundary.py:316: AttributeError
+________________ test_no_module_level_mutable_application_slot ________________
+
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-151/test_no_module_level_mutable_a0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-151/test_no_module_level_mutable_a0/vault')}
+
+    def test_no_module_level_mutable_application_slot(isolated_env):
+        """app 模块不得存在任何模块级应用/启动器实例槽（含 _application）。"""
+>       assert not hasattr(app, "_application")
+E       AssertionError: assert not True
+E        +  where True = hasattr(app, '_application')
+
+tests\test_m32_security_boundary.py:352: AssertionError
+_________________ test_launcher_close_then_rebuild_is_usable __________________
+
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-151/test_launcher_close_then_rebui0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-151/test_launcher_close_then_rebui0/vault')}
+db_conn = <sqlite3.Connection object at 0x000002738AD7E020>
+
+    def test_launcher_close_then_rebuild_is_usable(isolated_env, db_conn):
+        """关停后重新 build() → 全新实例且真实可写（不是已关闭的旧实例）。"""
+>       launcher = app.ApplicationLauncher()
+                   ^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'opc_workbench.app' has no attribute 'ApplicationLauncher'
+
+tests\test_m32_security_boundary.py:374: AttributeError
+_______________ test_build_failure_closes_production_connection _______________
+
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-151/test_build_failure_closes_prod0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-151/test_build_failure_closes_prod0/vault')}
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000002738ADD5F20>
+
+    def test_build_failure_closes_production_connection(isolated_env, monkeypatch):
+        """装配中途失败（writer 已创建）→ 已打开的生产连接必须被关闭。"""
+        import sqlite3
+        from opc_workbench import tools as tools_mod
+    
+        opened = []
+        real_connect = sqlite3.connect
+    
+        def tracking_connect(*a, **kw):
+            conn = real_connect(*a, **kw)
+            opened.append(conn)
+            return conn
+    
+        def boom(**kw):
+            raise RuntimeError("assembly_failed_after_writer")
+    
+        monkeypatch.setattr(app.sqlite3, "connect", tracking_connect)
+        monkeypatch.setattr(tools_mod, "build_tools", boom)
+        with pytest.raises(RuntimeError, match="assembly_failed_after_writer"):
+            app.build_application()
+        assert opened, "未捕获到生产连接"
+>       with pytest.raises(sqlite3.ProgrammingError):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'sqlite3.ProgrammingError'>
+
+tests\test_m32_security_boundary.py:420: Failed
+_________ test_launcher_build_failure_caches_nothing_and_retry_works __________
+
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-151/test_launcher_build_failure_ca0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-151/test_launcher_build_failure_ca0/vault')}
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000002738ADA7850>
+
+    def test_launcher_build_failure_caches_nothing_and_retry_works(isolated_env, monkeypatch):
+        """启动器构造失败 → 不缓存半成品；排除故障后重试得到可用应用。"""
+        from opc_workbench import tools as tools_mod
+    
+        def boom(**kw):
+            raise RuntimeError("assembly_failed")
+    
+>       launcher = app.ApplicationLauncher()
+                   ^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'opc_workbench.app' has no attribute 'ApplicationLauncher'
+
+tests\test_m32_security_boundary.py:431: AttributeError
+=========================== short test summary info ===========================
+FAILED tests/test_m32_security_boundary.py::test_attack_ordinary_call_does_not_preempt_startup
+FAILED tests/test_m32_security_boundary.py::test_no_module_level_mutable_application_slot
+FAILED tests/test_m32_security_boundary.py::test_launcher_close_then_rebuild_is_usable
+FAILED tests/test_m32_security_boundary.py::test_build_failure_closes_production_connection
+FAILED tests/test_m32_security_boundary.py::test_launcher_build_failure_caches_nothing_and_retry_works
+5 failed, 1 passed, 12 deselected in 1.40s
