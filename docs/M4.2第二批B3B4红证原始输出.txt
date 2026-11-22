@@ -1,0 +1,176 @@
+# M4 第二批 B3/B4 红证原始输出（逐条撤销一处保护）
+# 基线：本批实现工作树副本；替换命中数由脚本断言非零
+# 结果：3 个变体全部变红
+
+# red_b3_no_snapshot_guard: B3：TX1 不再复核文件快照
+# cmd: C:\Users\1\AppData\Local\Doubao\User Data\Default\.doubao\agent_mode\workspace\.sessions\38455536748631554\agents\m_0cweYiCX2vW\wt\m4ingest\.venv\Scripts\python.exe -m pytest tests/test_knowledge_race_guards.py -k stale_frontmatter -m not live -q --no-header -p no:cacheprovider
+
+F                                                                        [100%]
+================================== FAILURES ===================================
+__________ test_stale_frontmatter_cannot_overwrite_newer_visibility ___________
+
+kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x0000021C2B9C4980>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-217/test_stale_frontmatter_cannot_0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-217/test_stale_frontmatter_cannot_0/vault')}
+write_md = <function write_md.<locals>._write at 0x0000021C2B9CF740>
+
+    def test_stale_frontmatter_cannot_overwrite_newer_visibility(
+            kservice, isolated_env, write_md):
+        """A 读到 public 后暂停；B 把文件改成 private 并完成 ingest；放行 A。
+    
+        正文 hash 不变（C6 口径），单靠 source_hash 无法拦截；快照必须拦截。
+        最终 DB 必须保持 private：sales 搜不到，boss 能搜到。
+        """
+        root = isolated_env["vault_dir"]
+        write_md(root, "cfo/secret.md", "SENSITIVE-BODY", visibility="public")
+        kservice.ingest("cfo/secret.md")
+        assert _doc("cfo/secret.md")["visibility"] == "public"
+    
+        out: dict = {}
+        errors: list = []
+    
+        def run_a():
+            try:
+                out["a"] = kservice.ingest("cfo/secret.md")
+            except BaseException as exc:      # noqa: BLE001
+                errors.append(exc)
+    
+        with _first_read_gate("secret.md") as (entered, release):
+            t = threading.Thread(target=run_a)
+            t.start()
+            try:
+                assert entered.wait(10), "A 未停在读完文件之后"
+                write_md(root, "cfo/secret.md", "SENSITIVE-BODY", visibility="private")
+                out["b"] = kservice.ingest("cfo/secret.md")
+                # 正文未变 → 不应重新嵌入，但权限必须立即落库
+                assert out["b"]["reindexed"] is False
+                assert _doc("cfo/secret.md")["visibility"] == "private"
+            finally:
+                release.set()
+                t.join(10)
+        assert not errors, errors
+        assert not t.is_alive()
+    
+        doc = _doc("cfo/secret.md")
+        # 红证点：无快照保护时旧轮次会把这里写回 public
+>       assert doc["visibility"] == "private"
+E       AssertionError: assert 'public' == 'private'
+E         
+E         - private
+E         + public
+
+tests\test_knowledge_race_guards.py:305: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_knowledge_race_guards.py::test_stale_frontmatter_cannot_overwrite_newer_visibility
+1 failed, 10 deselected in 1.12s
+
+
+==========================================================================================
+
+# red_b4_no_generation_guard: B4：TX1 不再比对删除代次
+# cmd: C:\Users\1\AppData\Local\Doubao\User Data\Default\.doubao\agent_mode\workspace\.sessions\38455536748631554\agents\m_0cweYiCX2vW\wt\m4ingest\.venv\Scripts\python.exe -m pytest tests/test_knowledge_race_guards.py -k ingest_after_delete_cannot_resurrect_doc -m not live -q --no-header -p no:cacheprovider
+
+F                                                                        [100%]
+================================== FAILURES ===================================
+________________ test_ingest_after_delete_cannot_resurrect_doc ________________
+
+kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x000001EBB2188AD0>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-218/test_ingest_after_delete_canno0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-218/test_ingest_after_delete_canno0/vault')}
+write_md = <function write_md.<locals>._write at 0x000001EBB2197740>
+
+    def test_ingest_after_delete_cannot_resurrect_doc(kservice, isolated_env, write_md):
+        """删除代次的独立作用：文件被"原样字节"恢复时快照相同，仍不得被旧轮次重建。"""
+        root = isolated_env["vault_dir"]
+        write_md(root, "sales/s.md", "DELETED-BODY")
+        old_id = kservice.ingest("sales/s.md")["doc_id"]
+        original_text = (root / "sales" / "s.md").read_text(encoding="utf-8")
+    
+        out: dict = {}
+        errors: list = []
+    
+        def run_a():
+            try:
+                out["a"] = kservice.ingest("sales/s.md")
+            except BaseException as exc:      # noqa: BLE001
+                errors.append(exc)
+    
+        with _first_read_gate("s.md") as (entered, release):
+            t = threading.Thread(target=run_a)
+            t.start()
+            try:
+                assert entered.wait(10), "A 未停在读完文件之后"
+                kservice.delete("sales/s.md")
+                # 原样恢复同一份字节（模拟同步盘/备份回写）：快照校验拦不住
+                (root / "sales" / "s.md").write_text(original_text, encoding="utf-8")
+            finally:
+                release.set()
+                t.join(10)
+        assert not errors, errors
+        assert not t.is_alive()
+    
+        # 红证点：无代次保护时旧轮次会 INSERT 一篇已删除文档并写 chunks
+>       assert _doc("sales/s.md") is None
+E       AssertionError: assert <sqlite3.Row object at 0x000001EBB2182200> is None
+E        +  where <sqlite3.Row object at 0x000001EBB2182200> = _doc('sales/s.md')
+
+tests\test_knowledge_race_guards.py:404: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_knowledge_race_guards.py::test_ingest_after_delete_cannot_resurrect_doc
+1 failed, 10 deselected in 1.06s
+
+
+==========================================================================================
+
+# red_b4_no_delete_tombstone: B4：删除不推进代次（墓碑不落库）
+# cmd: C:\Users\1\AppData\Local\Doubao\User Data\Default\.doubao\agent_mode\workspace\.sessions\38455536748631554\agents\m_0cweYiCX2vW\wt\m4ingest\.venv\Scripts\python.exe -m pytest tests/test_knowledge_race_guards.py -k ingest_after_delete_cannot_resurrect_doc -m not live -q --no-header -p no:cacheprovider
+
+F                                                                        [100%]
+================================== FAILURES ===================================
+________________ test_ingest_after_delete_cannot_resurrect_doc ________________
+
+kservice = <opc_workbench.knowledge_service.KnowledgeService object at 0x00000259E7690AD0>
+isolated_env = {'data_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-219/test_ingest_after_delete_canno0/data'),...'vault_dir': WindowsPath('C:/Users/1/AppData/Local/Temp/pytest-of-1/pytest-219/test_ingest_after_delete_canno0/vault')}
+write_md = <function write_md.<locals>._write at 0x00000259E769F740>
+
+    def test_ingest_after_delete_cannot_resurrect_doc(kservice, isolated_env, write_md):
+        """删除代次的独立作用：文件被"原样字节"恢复时快照相同，仍不得被旧轮次重建。"""
+        root = isolated_env["vault_dir"]
+        write_md(root, "sales/s.md", "DELETED-BODY")
+        old_id = kservice.ingest("sales/s.md")["doc_id"]
+        original_text = (root / "sales" / "s.md").read_text(encoding="utf-8")
+    
+        out: dict = {}
+        errors: list = []
+    
+        def run_a():
+            try:
+                out["a"] = kservice.ingest("sales/s.md")
+            except BaseException as exc:      # noqa: BLE001
+                errors.append(exc)
+    
+        with _first_read_gate("s.md") as (entered, release):
+            t = threading.Thread(target=run_a)
+            t.start()
+            try:
+                assert entered.wait(10), "A 未停在读完文件之后"
+                kservice.delete("sales/s.md")
+                # 原样恢复同一份字节（模拟同步盘/备份回写）：快照校验拦不住
+                (root / "sales" / "s.md").write_text(original_text, encoding="utf-8")
+            finally:
+                release.set()
+                t.join(10)
+        assert not errors, errors
+        assert not t.is_alive()
+    
+        # 红证点：无代次保护时旧轮次会 INSERT 一篇已删除文档并写 chunks
+>       assert _doc("sales/s.md") is None
+E       AssertionError: assert <sqlite3.Row object at 0x00000259E768A590> is None
+E        +  where <sqlite3.Row object at 0x00000259E768A590> = _doc('sales/s.md')
+
+tests\test_knowledge_race_guards.py:404: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_knowledge_race_guards.py::test_ingest_after_delete_cannot_resurrect_doc
+1 failed, 10 deselected in 1.05s
+
+
+==========================================================================================
+
