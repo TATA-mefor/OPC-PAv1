@@ -1,18 +1,23 @@
-"""M5-a 组合根接线 + 统一调度入口验收（含 B1/B2 边界）。
+"""M5-a 组合根接线 + 统一调度入口验收（含 B1/B2 最终边界）。
 
 覆盖：
-1. main_chat → import_doc → search 真实链路（通道只由可信启动入口持有）；
-2. 公开 build_application() 拿不到 boss 通道；dict 冒充信封无效；
-3. 正文自称 boss、转述、参数伪造身份均不提升权限；
-4. Agent 角色由框架注册表决定，调用方无法注册/改角色；
-5. watcher 无 boss 凭证，正常扫描不重复 embedding；
-6. watcher 启停、应用关闭与 writer 关闭顺序；
-7. 公开面取不到生产 writer，也绕不过 dispatch；原始注册表不在公开面。
+1. 主聊天提交端口 → import_doc → search 真实链路（端口只由 __main__ 入口注入）；
+2. 普通模块调用 main()/launcher/_compose 都拿不到 boss 来源；
+3. dict 冒充信封、直构信封、参数伪造身份均无效；
+4. 正文自称 boss、转述、跨 Agent 冒充均不提升权限；
+5. Agent 角色只来自部署配置快照，普通模块改不动注册表；
+6. watcher 无 boss 来源，正常扫描不重复 embedding；
+7. watcher 启停、应用关闭与 writer 关闭顺序；
+8. 公开面取不到生产 writer，也绕不过 dispatch；原始注册表不在公开面。
 """
 from __future__ import annotations
 
+import os
 import sqlite3
+import subprocess
+import sys
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -22,20 +27,10 @@ from opc_workbench.dispatch import MessageEnvelope
 
 @pytest.fixture()
 def application(isolated_env, kdim):
-    """公开工厂产出的应用：按定义**不含** boss 通道。"""
+    """公开工厂产出的应用：按定义**不含** boss 来源。"""
     a = app.build_application()
     yield a
     a.close()
-
-
-@pytest.fixture()
-def owner(isolated_env, kdim):
-    """可信启动入口（app.main）：返回 (launcher, application, main_chat)。"""
-    launcher = app.main()
-    try:
-        yield launcher, launcher.build(), launcher.main_chat
-    finally:
-        launcher.close()
 
 
 def _embed_calls(fake) -> int:
@@ -52,46 +47,78 @@ def _doc_row(rel):
         conn.close()
 
 
-# --- 1. 可信通道真实链路 -----------------------------------------------------
+# --- 1. 可信入口真实链路 -----------------------------------------------------
 
 
-def test_main_chat_import_then_search(owner, isolated_env, write_md):
-    _launcher, application, main_chat = owner
+def test_main_chat_import_then_search(owner_entry, isolated_env, write_md):
+    _application, submit = owner_entry()
     root = isolated_env["vault_dir"]
     write_md(root, "sales/product.md", "主窗口导入的正文-ALPHA")
 
-    out = main_chat.submit("knowledge.import_doc",
-                           {"vault_path": "sales/product.md"})
+    out = submit("knowledge.import_doc", {"vault_path": "sales/product.md"})
     assert out["status"] == "ready", out
     assert out["owner_corrected"] is False
 
-    hits = main_chat.submit("knowledge.search",
-                            {"query": "主窗口导入的正文-ALPHA"})
+    hits = submit("knowledge.search", {"query": "主窗口导入的正文-ALPHA"})
     assert len(hits["hits"]) == 1
     assert hits["hits"][0]["vault_path"] == "sales/product.md"
 
-    listing = main_chat.submit("knowledge.list_docs", {})
+    listing = submit("knowledge.list_docs", {})
     assert "sales/product.md" in [d["vault_path"] for d in listing["docs"]]
 
 
-# --- 2. B1：公开 API 拿不到 boss 通道 ----------------------------------------
+# --- 2. B1：普通模块拿不到 boss 来源 ----------------------------------------
 
 
-def test_build_application_has_no_boss_channel(application):
+def test_build_application_has_no_boss_source(application):
     assert not hasattr(application.dispatcher, "main_chat")
     with pytest.raises(AttributeError):
         application.dispatcher.main_chat
     with pytest.raises(PermissionError, match="dispatcher_internal_not_exposed"):
-        application.dispatcher._main_chat
+        application.dispatcher._owner_provenance
+    # 调度器里没有可外发的通道/令牌，也没有 owner 提交入口
+    assert not hasattr(application.dispatcher, "owner_submit")
 
     launcher = app.ApplicationLauncher()
     built = launcher.build()
     try:
-        with pytest.raises(PermissionError, match="owner_channel_not_launched"):
-            launcher.main_chat
+        assert not hasattr(launcher, "main_chat")
+        assert not hasattr(launcher, "_build_owner")
     finally:
         launcher.close()
         built.close()
+
+
+def test_ordinary_module_cannot_enter_owner_boundary():
+    """普通模块（测试模块）调用入口 = 被拒，不是"拿到但没用"。"""
+    with pytest.raises(PermissionError, match="owner_entry_point_only"):
+        app.main()
+    with pytest.raises(PermissionError, match="owner_entry_point_only"):
+        app._compose(with_owner_channel=True)
+
+
+class _Adapter:
+    def __init__(self):
+        self.submit = None
+
+    def bind(self, submit):
+        self.submit = submit
+
+
+def _enter_owner():
+    """再次以 __main__ 身份进入入口（用于会话上限验证）。"""
+    g = {"__name__": "__main__", "adapter": _Adapter()}
+    exec(compile("from opc_workbench import app\n"
+                 "result = app.main(adapter)\n", "<entry>", "exec"), g)
+    return g["result"]
+
+
+def test_owner_session_is_entry_scoped(owner_entry):
+    """同一进程只允许一个活动 owner 会话；关停后才可再次进入。"""
+    application, _submit = owner_entry()
+    with pytest.raises(PermissionError, match="owner_session_already_active"):
+        _enter_owner()
+    application.close()          # owner_entry 的清理再次 close 是幂等的
 
 
 def test_dict_envelope_cannot_forge_boss(application, db_conn):
@@ -105,7 +132,6 @@ def test_dict_envelope_cannot_forge_boss(application, db_conn):
 
     with pytest.raises(PermissionError):
         MessageEnvelope()
-    # 拿不到通道就没有主窗口信封，dispatch 也不可能走到 boss 分支
     assert not hasattr(application.dispatcher, "main_chat")
 
 
@@ -133,38 +159,96 @@ def test_agent_content_cannot_claim_boss(application, isolated_env, write_md, db
     assert spoof["error"]["code"] == "invalid_param"
 
 
-# --- 4. B2：角色由可信注册表决定 --------------------------------------------
+def test_agent_cannot_impersonate_another_agent(application):
+    """信封来源必须是本 agent 自己的句柄；跨 Agent 冒用一律 identity_denied。"""
+    from opc_workbench import dispatch as dispatch_mod
+
+    sales = application.dispatcher.agent_channel("test-agent-sales")
+    minted = dispatch_mod._mint_envelope(
+        source="agent_message", agent_id="test-agent-cfo",
+        parent_message_id=None, origin=sales)
+    out = application.dispatcher.dispatch(minted, "task.create", {"title": "冒用"})
+    assert out["error"]["code"] == "identity_denied"
+    assert "agent_envelope_mismatch" in out["error"]["message"]
 
 
-def test_agent_roles_come_from_framework_registry(application):
-    # 框架预置的 id 能取到句柄，角色固定；调度器没有"自注册"方法
+# --- 4. B2：角色只来自部署配置快照 ------------------------------------------
+
+
+def test_agent_roles_come_from_configured_snapshot(application):
     assert not hasattr(application.dispatcher, "register_agent")
     channel = application.dispatcher.agent_channel("test-agent-sales")
     assert channel.agent_id == "test-agent-sales"
     assert application.dispatcher.agent_channel("test-agent-sales") is channel
 
-    # 未注册 id / 角色名本身都不是可取得通道的入口
     with pytest.raises(PermissionError, match="agent_not_provisioned"):
         application.dispatcher.agent_channel("cfo")
     with pytest.raises(PermissionError, match="agent_not_provisioned"):
-        application.dispatcher.agent_channel("test-agent-unknown")
+        application.dispatcher.agent_channel("my-agent")
+
+    snapshot = config.agent_roles()
+    assert not hasattr(snapshot, "update")        # 不提供写入方法
+    with pytest.raises(TypeError):
+        snapshot["my-agent"] = "cfo"             # 快照本体不可改
 
 
-def test_production_registry_is_empty_by_default(monkeypatch, isolated_env, kdim):
-    """生产默认没有员工 Agent：普通调用方不可能因此拿到 cfo/sales 身份。"""
-    monkeypatch.setattr(config, "AGENT_ROLES", {})
+def test_ordinary_module_cannot_register_roles(monkeypatch, isolated_env, kdim):
+    """改公开属性 / 换公开函数 / 改快照副本都不能进入装配结果。"""
+    original_snapshot = config.agent_roles
+    # ① 重新绑一个同名公开属性：组合根不读它
+    monkeypatch.setattr(config, "AGENT_ROLES",
+                        {"my-agent": "cfo"}, raising=False)
     a = app.build_application()
     try:
-        assert not hasattr(a.dispatcher, "register_agent")
         with pytest.raises(PermissionError, match="agent_not_provisioned"):
-            a.dispatcher.agent_channel("cfo")
-        with pytest.raises(PermissionError, match="agent_not_provisioned"):
-            a.dispatcher.agent_channel("sales")
+            a.dispatcher.agent_channel("my-agent")
     finally:
         a.close()
 
+    # ② 替换公开快照函数：组合根持有的是导入期函数对象，不受影响
+    monkeypatch.setattr(config, "agent_roles", lambda: {"my-agent": "cfo"})
+    b = app.build_application()
+    try:
+        with pytest.raises(PermissionError, match="agent_not_provisioned"):
+            b.dispatcher.agent_channel("my-agent")
+    finally:
+        b.close()
 
-# --- 5. watcher 无 boss 凭证、不重复 embedding ------------------------------
+    # ③ 快照返回的是不可变对象，改不了本体，也就影响不到下一次装配
+    real_snapshot = original_snapshot()
+    assert "my-agent" not in real_snapshot
+
+
+def test_production_registry_is_empty_by_default(tmp_path):
+    """未配置 OPC_AGENT_ROLES 的新进程里，生产没有任何员工 Agent 通道。
+
+    用子进程加载干净配置，避免依赖本进程的测试注入。
+    """
+    env = {k: v for k, v in os.environ.items()
+           if k not in (config.AGENT_ROLES_ENV, "PYTHONPATH")}
+    env["PA_DB_PATH"] = str(tmp_path / "prod.db")
+    env["VAULT_PATH"] = str(tmp_path / "vault")
+    code = (
+        "from opc_workbench import app\n"
+        "a = app.build_application()\n"
+        "codes = []\n"
+        "for aid in ('cfo', 'sales'):\n"
+        "    try:\n"
+        "        a.dispatcher.agent_channel(aid)\n"
+        "        codes.append('granted')\n"
+        "    except PermissionError as exc:\n"
+        "        codes.append(str(exc))\n"
+        "a.close()\n"
+        "print('|'.join(codes))\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", code],
+                          cwd=str(Path(__file__).resolve().parent.parent),
+                          env=env, capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "agent_not_provisioned|agent_not_provisioned"
+
+
+# --- 5. watcher 无 boss 来源、不重复 embedding ------------------------------
 
 
 def test_watcher_scan_needs_no_boss_credential(application, isolated_env, write_md):
@@ -175,8 +259,7 @@ def test_watcher_scan_needs_no_boss_credential(application, isolated_env, write_
     rounds = application.scan_once()
     assert [r["vault_path"] for r in rounds["results"]] == ["sales/watched.md"]
     assert rounds["results"][0]["status"] == "ready"
-    row = _doc_row("sales/watched.md")
-    assert row["status"] == "ready"
+    assert _doc_row("sales/watched.md")["status"] == "ready"
 
     embeds = _embed_calls(fake)
     second = application.scan_once()
@@ -213,7 +296,6 @@ def test_watcher_start_stop_and_close_order(isolated_env, kdim):
 
 
 def test_knowledge_service_seals_writer(kwriter):
-    """知识服务本体也不外泄 writer：普通属性访问被拒，且无 __dict__ 第二出口。"""
     from opc_workbench.knowledge_service import KnowledgeService
     svc = KnowledgeService(kwriter)
     with pytest.raises(PermissionError,
@@ -227,6 +309,8 @@ def test_public_surface_has_no_writer_or_registry(application):
     assert "writer" not in app.Application.__slots__
     with pytest.raises(PermissionError, match="dispatcher_internal_not_exposed"):
         application.dispatcher._registry
+    with pytest.raises(PermissionError, match="dispatcher_internal_not_exposed"):
+        application.dispatcher._owner_provenance
     with pytest.raises(PermissionError, match="application_watcher_not_exposed"):
         application._watcher
 
@@ -239,7 +323,6 @@ def test_public_surface_has_no_writer_or_registry(application):
             continue
         assert not isinstance(val, db.WriteCapability), f"{name} 泄露写能力"
 
-    # 无入口凭证就无法取得 boss：字符串/None 一律 None
     backend = app.OwnerChannelBackend()
     assert backend.authenticate("main_chat") is None
     assert backend.authenticate(None) is None

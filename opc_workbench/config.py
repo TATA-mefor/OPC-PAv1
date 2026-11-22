@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import MappingProxyType
 
 from dotenv import load_dotenv
 
@@ -129,10 +130,41 @@ DEFAULT_PRIVATE_ROLES = frozenset(
 )
 
 # 可信 Agent 注册表（M5-a B2）：agent_id → 角色。
-# 只由框架/部署方在启动前写入（组合根读取快照）；业务调用方不能通过任何
-# 接口追加条目或指定角色。v1 还没有真实员工 Agent 进程，故默认空表：
-# 生产里不预置任何角色通道，调用方也就拿不到 cfo/sales 的身份句柄。
-AGENT_ROLES: dict[str, str] = {}
+# 唯一来源是**进程启动时**的部署配置 `OPC_AGENT_ROLES`（JSON 对象字符串），
+# 在模块导入时解析成不可变快照；本模块不提供运行期写入/重载接口。
+# 组合根在装配时取副本传给 dispatcher，因此运行期改环境变量或改公开属性都
+# 不会影响已/新装配实例。v1 无真实员工 Agent，默认空快照。
+AGENT_ROLES_ENV = "OPC_AGENT_ROLES"
+
+
+def _parse_agent_roles(raw: str) -> dict[str, str]:
+    import json
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid_agent_roles_json:{exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError("invalid_agent_roles_json:not_object")
+    snapshot: dict[str, str] = {}
+    for agent_id, role in data.items():
+        if not isinstance(agent_id, str) or not agent_id:
+            raise ValueError("invalid_agent_id")
+        if role not in ROLES:
+            raise ValueError(f"unknown_role:{role!r}")
+        snapshot[agent_id] = role
+    return snapshot
+
+
+_AGENT_ROLES_SNAPSHOT = MappingProxyType(
+    _parse_agent_roles(os.getenv(AGENT_ROLES_ENV, "")))
+
+
+def agent_roles():
+    """返回启动时固化的角色快照（不可变；没有写入方法）。"""
+    return _AGENT_ROLES_SNAPSHOT
+
 
 
 # 敏感词升级表（PRD §4.2 规则2，M2.1 v3 §四.7）：命中即 private，宁可错杀，

@@ -17,25 +17,74 @@
   / Dispatcher 都不公开原始 WriteCapability；普通属性访问取不到。
 - 业务调用只能经 `Application.dispatcher.dispatch(envelope, ...)` 或两个
   Channel 句柄；原始工具注册表不对外暴露。
-- boss 身份只由主对话入口（MainChatChannel → OwnerChannelBackend →
-  register_session → issue_proof → mint_boss_context）产出；本机单用户 v1
-  不校验自然人身份，也**不接受**任何调用方传入 source="main_chat"。
+- boss 身份只由主聊天入口（OwnerChannelBackend → register_session →
+  issue_proof → mint_boss_context）产出；来源令牌由组合根在 `__main__` 入口
+  装配时铸造，只交给主窗口适配器持有的提交端口——没有可获取的通道对象，
+  也不接受任何调用方传入 source="main_chat"。
 - `confirm_action` 继续 fail closed（delete_doc 的 UI 确认留到 M5-b）。
 
 生命周期：build_application() 只构造不缓存；进程级单例与关停由
-ApplicationLauncher 实例持有，启动器由 main 创建并持有。
+ApplicationLauncher 实例持有；boss 来源只在 `__main__` 入口（main）铸造
+一次，并直接交给主窗口适配器。
 """
 from __future__ import annotations
 
 import atexit
+import os
 import secrets
 import sqlite3
+import sys
 import threading
 
 from . import cas, config, db, identity, llm_client, visibility
-from .dispatch import build_dispatcher
+from .config import agent_roles as _agent_roles_snapshot
+from .dispatch import _mint_envelope, build_dispatcher
 from .knowledge_service import KnowledgeService
 from .vault_watcher import VaultWatcher
+
+
+# ---------------------------------------------------------------------------
+# 可信启动边界（M5-a B1）
+# 主聊天来源不是"可获取的通道对象"，而是框架在 `__main__` 入口装配时铸造的
+# 内部令牌 + 提交端口。下面两个守卫保证：普通模块既调不到带 boss 来源的
+# 装配，也不能在进程内并存第二个 owner 会话。
+# ---------------------------------------------------------------------------
+_ENTRY_POINT_MODULE = "__main__"
+_APP_FILE = os.path.abspath(__file__)
+_OWNER_SESSION_LOCK = threading.Lock()
+_OWNER_SESSION_STATE = {"active": False}
+
+
+def _require_entry_point() -> None:
+    """调用链上必须出现真正的进程入口帧，否则拒绝。
+
+    两种合法形态：
+    - `python -m opc_workbench.app`：本模块自身以 `__main__` 身份执行；
+    - 入口脚本/适配层以 `__main__` 身份调用 `main()`。
+    普通被导入模块（`__name__` 为包名或测试模块名）一律拒绝。
+    """
+    frame = sys._getframe(1)
+    while frame is not None:
+        name = frame.f_globals.get("__name__")
+        if name == _ENTRY_POINT_MODULE:
+            return
+        if os.path.abspath(frame.f_code.co_filename) != _APP_FILE:
+            break
+        frame = frame.f_back
+    raise PermissionError("owner_entry_point_only")
+
+
+def _claim_owner_session() -> None:
+    with _OWNER_SESSION_LOCK:
+        if _OWNER_SESSION_STATE["active"]:
+            raise PermissionError("owner_session_already_active")
+        _OWNER_SESSION_STATE["active"] = True
+
+
+def _release_owner_session() -> None:
+    with _OWNER_SESSION_LOCK:
+        _OWNER_SESSION_STATE["active"] = False
+
 
 
 class _OwnerEntryCredential:
@@ -173,23 +222,29 @@ class Application:
         object.__setattr__(self, "_closed", True)
         object.__getattribute__(self, "_watcher").stop()
         self.cas_service.close()
+        _release_owner_session()
 
 
 def _compose(*, with_owner_channel: bool):
     """内部装配：返回 (Application, MainChatChannel | None)。
 
-    只有可信启动入口（main → ApplicationLauncher._build_owner）才请求带 boss
-    通道的实例；公开的 build_application() 永远拿不到通道。
+    带 boss 通道的装配是**入口点专属**：调用链上最近的非本模块帧必须是
+    `__main__`（真实进程入口），且同一进程只允许一个活动 owner 会话。
+    因此普通模块直接 import 调用本函数也拿不到通道。
     """
-    db.init_db()                                   # 迁移先行（零播种）
-    backend = OwnerChannelBackend()                # app 内部创建
-    identity_api = identity._build_identity(backend)
-    # 生产写能力铸造：**只存在于本函数体内部**，不暴露为任何模块级可调用
-    # 对象，也不经 Application / CASService / 工具实例向外泄露。
-    _conn = sqlite3.connect(str(config.DB_PATH),
-                            timeout=config.DB_BUSY_TIMEOUT_MS / 1000,
-                            check_same_thread=False)
+    if with_owner_channel:
+        _require_entry_point()
+        _claim_owner_session()
+    _conn = None
     try:
+        db.init_db()                                   # 迁移先行（零播种）
+        backend = OwnerChannelBackend()                # app 内部创建
+        identity_api = identity._build_identity(backend)
+        # 生产写能力铸造：**只存在于本函数体内部**，不暴露为任何模块级可调用
+        # 对象，也不经 Application / CASService / 工具实例向外泄露。
+        _conn = sqlite3.connect(str(config.DB_PATH),
+                                timeout=config.DB_BUSY_TIMEOUT_MS / 1000,
+                                check_same_thread=False)
         _conn.row_factory = sqlite3.Row
         db.apply_write_pragmas(_conn)
         production_writer = object.__new__(db.WriteCapability)
@@ -213,19 +268,29 @@ def _compose(*, with_owner_channel: bool):
         dispatcher = build_dispatcher(
             identity_api=identity_api, registry=registry, backend=backend,
             owner_credential=backend._entry_credential(),
-            agent_roles=config.AGENT_ROLES,
+            agent_roles=_agent_roles_snapshot(),
             main_chat=with_owner_channel)
         watcher = VaultWatcher(knowledge_service)
         application = Application(
             identity_api=identity_api, cas_service=cas_service,
             disclosure=disclosure, dispatcher=dispatcher, watcher=watcher)
-        channel = None
+        owner_submit = None
         if with_owner_channel:
-            channel = object.__getattribute__(dispatcher, "_main_chat")
-        return application, channel
+            provenance = object.__getattribute__(dispatcher, "_owner_provenance")
+
+            def owner_submit(action: str, params: dict | None = None) -> dict:
+                """主聊天提交端口：来源令牌由框架在此注入，调用方无从指定。"""
+                env = _mint_envelope(source="main_chat", agent_id=None,
+                                     parent_message_id=None, origin=provenance)
+                return dispatcher.dispatch(env, action, params)
+
+        return application, owner_submit
     except BaseException:
         # 装配中途失败：关闭已打开的生产连接后再抛，绝不遗留悬挂连接
-        _conn.close()
+        if _conn is not None:
+            _conn.close()
+        if with_owner_channel:
+            _release_owner_session()
         raise
 
 
@@ -233,39 +298,28 @@ def build_application() -> Application:
     """公开组装工厂：**只构造，不缓存，也不产出 boss 通道**。
 
     普通业务模块即便反复调用，也只得到有界服务集合；主对话通道只能由
-    可信启动入口（main）创建并交给主窗口适配器。
+    `__main__` 进程入口铸造，并直接交给主窗口适配器。
     """
     return _compose(with_owner_channel=False)[0]
 
 
-
 class ApplicationLauncher:
-    """可信启动入口持有的生命周期对象：单例装配 + 关停 + boss 通道。
+    """进程级生命周期持有者：单例装配 + 关停。
 
-    `build()` 只装配有界应用（**不含**主对话通道）；`main()` 走
-    `_build_owner()`，额外铸造并持有 MainChatChannel，供主窗口适配器使用。
-    普通模块调用 `build()` 或 `build_application()` 都拿不到 boss 通道。
+    `build()` 只装配有界应用（**不含**主对话通道）；boss 通道只由
+    `main()` 在入口点铸造并交给适配器，不挂在启动器上。
     """
 
-    __slots__ = ("_application", "_main_chat", "_lock")
+    __slots__ = ("_application", "_lock")
 
     def __init__(self):
         object.__setattr__(self, "_application", None)
-        object.__setattr__(self, "_main_chat", None)
         object.__setattr__(self, "_lock", threading.Lock())
 
     def __getattribute__(self, name):
-        if name in ("_application", "_main_chat"):
-            raise PermissionError("launcher_internal_not_exposed")
+        if name == "_application":
+            raise PermissionError("launcher_application_not_exposed")
         return object.__getattribute__(self, name)
-
-    @property
-    def main_chat(self):
-        """主对话句柄：只有经 main() 启动的启动器才持有，否则拒绝。"""
-        channel = object.__getattribute__(self, "_main_chat")
-        if channel is None:
-            raise PermissionError("owner_channel_not_launched")
-        return channel
 
     def build(self) -> Application:
         with object.__getattribute__(self, "_lock"):
@@ -276,17 +330,6 @@ class ApplicationLauncher:
             object.__setattr__(self, "_application", application)
             return application
 
-    def _build_owner(self) -> Application:
-        """可信启动入口专用：装配应用并持有 boss 通道。"""
-        with object.__getattribute__(self, "_lock"):
-            current = object.__getattribute__(self, "_application")
-            if current is not None:
-                return current
-            application, channel = _compose(with_owner_channel=True)
-            object.__setattr__(self, "_application", application)
-            object.__setattr__(self, "_main_chat", channel)
-            return application
-
     def close(self) -> None:
         """幂等关停：先清状态再关连接，避免关 stopped 实例被再次取用。"""
         with object.__getattribute__(self, "_lock"):
@@ -294,20 +337,23 @@ class ApplicationLauncher:
             if current is None:
                 return
             object.__setattr__(self, "_application", None)
-            object.__setattr__(self, "_main_chat", None)
             current.close()
 
 
-def main() -> ApplicationLauncher:
-    """进程入口（可信启动点）：装配一次、铸造 boss 通道、启动后台扫描。
+def main(adapter=None) -> Application:
+    """进程入口（唯一可信启动点）：只有 `__main__` 帧可调用。
 
-    通道留给主窗口适配器（M6 Gradio）；退出时由 atexit / 显式 close 收尾。
+    装配一次后，把**主聊天提交端口**（普通函数，来源由框架注入）交给
+    `adapter.bind(submit)`（主窗口适配器，M6 接 Gradio）；不返回、不挂载
+    任何"老板通道对象"。返回有界 Application 供显式收尾（不含 boss 能力）。
     """
-    launcher = ApplicationLauncher()
-    application = launcher._build_owner()
+    _require_entry_point()
+    application, owner_submit = _compose(with_owner_channel=True)
     application.start_background()
-    atexit.register(launcher.close)
-    return launcher
+    if adapter is not None:
+        adapter.bind(owner_submit)
+    atexit.register(application.close)
+    return application
 
 
 if __name__ == "__main__":

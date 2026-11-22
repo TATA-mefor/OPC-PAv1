@@ -12,19 +12,21 @@
   转述不继承原消息权限：Agent 转述老板要求，仍按该 Agent 注册角色授权。
 
 两种来源：
-- `main_chat`：`MainChatChannel` 只由可信启动入口（`app.main()`）取得，
-  持有组合根铸造的一次性入口凭证，经 OwnerChannelBackend → register_session →
-  issue_proof → mint_boss_context → resolve_identity("boss") 得到 boss 身份。
-  调度器不公开该通道（`_main_chat` 拒绝普通属性访问）。
-- `agent_message`：角色由组合根传入的 `config.AGENT_ROLES` 快照决定，
-  调度器不提供注册入口（`agent_channel(agent_id)` 只取已登记句柄），
-  信封里的角色字段不被采信。
+- `main_chat`：来源由**主聊天入口在框架边界内注入**——组合根在
+  `__main__` 入口装配时铸造一枚内部来源令牌（provenance），并只把
+  `submit(action, params)` 提交端口交给主窗口适配器；信封携带该令牌，
+  `Dispatcher` 校验令牌同一性后才走 boss 身份链（OwnerChannelBackend →
+  register_session → issue_proof → mint_boss_context → resolve_identity）。
+  没有"老板通道对象"，也不存在可另行获取的句柄。
+- `agent_message`：角色由组合根传入的 `config.agent_roles()` 不可变快照决定，
+  信封必须由该 agent_id 自己的 `AgentChannel` 铸造；调度器没有注册入口。
 
 `parent_message_id` 只做追踪，绝不参与授权。
 """
 from __future__ import annotations
 
 import uuid
+from types import MappingProxyType
 
 from . import audit_log, config
 
@@ -36,10 +38,12 @@ def _err(code: str, message: str = "") -> dict:
 class MessageEnvelope:
     """框架铸造的消息信封（不可直构、不可变）。
 
-    只承载来源与追踪信息；**不承载正文**，因此不存在"正文自称 boss"的入口。
+    只承载来源、来源令牌与追踪信息；**不承载正文**，因此不存在
+    "正文自称 boss"的入口；`_origin` 不对外提供 property。
     """
 
-    __slots__ = ("_source", "_agent_id", "_message_id", "_parent_message_id", "_channel")
+    __slots__ = ("_source", "_agent_id", "_message_id", "_parent_message_id",
+                 "_origin")
 
     def __init__(self, *a, **kw):
         raise PermissionError("message_envelope_direct_construction_forbidden")
@@ -64,9 +68,10 @@ class MessageEnvelope:
         return object.__getattribute__(self, "_parent_message_id")
 
 
-def _mint_envelope(*, source: str, agent_id: str | None, parent_message_id: str | None,
-                   channel: object) -> MessageEnvelope:
-    """内部铸造入口（模块私有）：只有两个 Channel 句柄会调用。"""
+def _mint_envelope(*, source: str, agent_id: str | None,
+                   parent_message_id: str | None,
+                   origin: object) -> MessageEnvelope:
+    """内部铸造入口（模块私有）：只由主聊天提交端口与 AgentChannel 调用。"""
     if source not in ("main_chat", "agent_message"):
         raise ValueError(f"invalid_source:{source!r}")
     env = object.__new__(MessageEnvelope)
@@ -74,36 +79,8 @@ def _mint_envelope(*, source: str, agent_id: str | None, parent_message_id: str 
     object.__setattr__(env, "_agent_id", agent_id)
     object.__setattr__(env, "_message_id", uuid.uuid4().hex)
     object.__setattr__(env, "_parent_message_id", parent_message_id)
-    object.__setattr__(env, "_channel", channel)
+    object.__setattr__(env, "_origin", origin)
     return env
-
-
-class MainChatChannel:
-    """主对话入口句柄：组合根创建并交给主窗口适配层。
-
-    只暴露 `submit()`；入口凭证与身份链细节不外露。**不接受外部传入的
-    source/role**——来源硬编码为 main_chat，身份由 OwnerChannelBackend 签发。
-    """
-
-    __slots__ = ("_dispatcher", "_credential")
-
-    def __init__(self, *a, **kw):
-        raise PermissionError("main_chat_channel_direct_construction_forbidden")
-
-    def __setattr__(self, *a):
-        raise PermissionError("main_chat_channel_immutable")
-
-    def __getattribute__(self, name):
-        if name == "_credential":
-            raise PermissionError("main_chat_credential_not_exposed")
-        return object.__getattribute__(self, name)
-
-    def submit(self, action: str, params: dict | None = None) -> dict:
-        """提交一次老板动作。params 原样进工具校验，绝不影响来源与角色。"""
-        dispatcher = object.__getattribute__(self, "_dispatcher")
-        env = _mint_envelope(source="main_chat", agent_id=None,
-                             parent_message_id=None, channel=self)
-        return dispatcher.dispatch(env, action, params)
 
 
 class AgentChannel:
@@ -130,21 +107,22 @@ class AgentChannel:
         dispatcher = object.__getattribute__(self, "_dispatcher")
         env = _mint_envelope(source="agent_message",
                              agent_id=object.__getattribute__(self, "_agent_id"),
-                             parent_message_id=parent_message_id, channel=self)
+                             parent_message_id=parent_message_id, origin=self)
         return dispatcher.dispatch(env, action, params)
 
 
 class Dispatcher:
     """调度器：唯一业务入口 + 身份解析 + 注册表隔离。
 
-    - `_registry` / `_backend` / `_owner_credential` 经普通属性访问一律拒绝，
-      防止拿到调度器后绕过 dispatch 直接取工具闭包或入口凭证；
+    - `_registry` / `_backend` / `_owner_credential` / `_owner_provenance`
+      经普通属性访问一律拒绝，防止拿到调度器后绕过 dispatch 直接取工具闭包、
+      入口凭证或主聊天来源令牌；
     - `schemas()` 只返回 schema 副本，供 Function Calling 使用，不含 handler。
     """
 
     __slots__ = ("_identity_api", "_registry", "_backend", "_owner_credential",
                  "_agent_roles", "_channels", "_agent_lock", "_owner_session_id",
-                 "_main_chat", "_closed")
+                 "_owner_provenance", "_closed")
 
     def __init__(self, *a, **kw):
         raise PermissionError("dispatcher_direct_construction_forbidden")
@@ -153,7 +131,8 @@ class Dispatcher:
         raise PermissionError("dispatcher_immutable")
 
     def __getattribute__(self, name):
-        if name in ("_registry", "_backend", "_owner_credential", "_main_chat"):
+        if name in ("_registry", "_backend", "_owner_credential",
+                    "_owner_provenance"):
             raise PermissionError("dispatcher_internal_not_exposed")
         return object.__getattribute__(self, name)
 
@@ -223,10 +202,10 @@ class Dispatcher:
         raise PermissionError(f"unknown_source:{source!r}")
 
     def _resolve_main_chat(self, envelope):
-        main_chat = object.__getattribute__(self, "_main_chat")
-        channel = object.__getattribute__(envelope, "_channel")
-        if main_chat is None or channel is not main_chat:
-            raise PermissionError("main_chat_envelope_required")
+        provenance = object.__getattribute__(self, "_owner_provenance")
+        origin = object.__getattribute__(envelope, "_origin")
+        if provenance is None or origin is not provenance:
+            raise PermissionError("main_chat_provenance_required")
         identity_api = object.__getattribute__(self, "_identity_api")
         backend = object.__getattribute__(self, "_backend")
         credential = object.__getattribute__(self, "_owner_credential")
@@ -244,10 +223,11 @@ class Dispatcher:
         return "boss", ctx
 
     def _resolve_agent(self, envelope):
-        if object.__getattribute__(envelope, "_channel").agent_id != \
-                object.__getattribute__(envelope, "_agent_id"):
-            raise PermissionError("agent_envelope_mismatch")
         agent_id = object.__getattribute__(envelope, "_agent_id")
+        origin = object.__getattribute__(envelope, "_origin")
+        channels = object.__getattribute__(self, "_channels")
+        if channels.get(agent_id) is not origin:
+            raise PermissionError("agent_envelope_mismatch")
         roles = object.__getattribute__(self, "_agent_roles")
         role = roles.get(agent_id)
         if role is None:
@@ -262,9 +242,10 @@ def build_dispatcher(*, identity_api, registry: dict, backend, owner_credential,
                      main_chat: bool = False) -> Dispatcher:
     """组合根内部构造入口：装配身份链、入口凭证与注册表。
 
-    `agent_roles` 是可信注册表的**快照**（组合根读取 `config.AGENT_ROLES`），
-    之后调用方无法通过调度器改写。
-    `main_chat=True` 时才铸造主对话句柄，由可信启动入口持有。
+    `agent_roles` 是**不可变角色快照**（`config.agent_roles()` 提供），
+    构造时复制；调用方无法通过调度器改写。
+    `main_chat=True` 时额外铸造一枚内部来源令牌，只有组合根能拿到并交给
+    主聊天提交端口；调度器不持有任何可外发句柄。
     """
     import threading
     d = object.__new__(Dispatcher)
@@ -276,15 +257,10 @@ def build_dispatcher(*, identity_api, registry: dict, backend, owner_credential,
     for agent_id, role in roles_snapshot.items():
         if role not in config.ROLES:
             raise ValueError(f"unknown_role:{role!r}")
-    object.__setattr__(d, "_agent_roles", roles_snapshot)
+    object.__setattr__(d, "_agent_roles", MappingProxyType(roles_snapshot))
     object.__setattr__(d, "_channels", {})
     object.__setattr__(d, "_agent_lock", threading.Lock())
     object.__setattr__(d, "_owner_session_id", None)
     object.__setattr__(d, "_closed", False)
-    main = None
-    if main_chat:
-        main = object.__new__(MainChatChannel)
-        object.__setattr__(main, "_dispatcher", d)
-        object.__setattr__(main, "_credential", owner_credential)
-    object.__setattr__(d, "_main_chat", main)
+    object.__setattr__(d, "_owner_provenance", object() if main_chat else None)
     return d

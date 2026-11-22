@@ -283,7 +283,8 @@ def test_public_surface_sweep_yields_no_write_capability(isolated_env):
         a.close()
 
 
-def test_attack_ordinary_call_does_not_preempt_startup(isolated_env, db_conn):
+def test_attack_ordinary_call_does_not_preempt_startup(isolated_env, db_conn,
+                                                       owner_entry):
     """攻击：普通业务模块抢先调用公开工厂。
 
     断言一：拿不到原始生产 writer（任何公开属性）。
@@ -298,9 +299,10 @@ def test_attack_ordinary_call_does_not_preempt_startup(isolated_env, db_conn):
     with pytest.raises(PermissionError, match="disclosure_service_writer_not_exposed"):
         grabbed.disclosure._writer
 
-    # ② 真正启动不受影响：启动器由入口持有，装配出独立可用应用
-    launcher = app.main()
-    started = launcher.build()
+    # ② 普通模块调用入口被拒；真实入口（__main__）仍装配出独立可用应用
+    with pytest.raises(PermissionError, match="owner_entry_point_only"):
+        app.main()
+    started, _submit = owner_entry()
     assert started is not grabbed
     assert not hasattr(started, "writer")
 
@@ -327,7 +329,7 @@ def test_attack_ordinary_call_does_not_preempt_startup(isolated_env, db_conn):
     visibility.resolve_disclosure(started.disclosure, ap, "approved", actor="boss")
     grant = visibility.consume_grant(started.disclosure, ap, to_role="sales")
     assert grant["id"] == pid and grant["owner_role"] == "cfo"
-    launcher.close()
+    started.close()
     grabbed.close()
 
 

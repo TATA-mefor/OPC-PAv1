@@ -8,7 +8,9 @@ autouse fixture 保证：
 from __future__ import annotations
 
 import hashlib
+import json
 import math
+import os
 import socket
 import sys
 from pathlib import Path
@@ -18,6 +20,14 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+# M5-a B2：角色快照在 config 导入时从部署配置固化，测试必须在导入前注入。
+# 这里是测试专用的部署配置替身（生产不设置该变量 → 空快照）。
+if "OPC_AGENT_ROLES" not in os.environ:
+    os.environ["OPC_AGENT_ROLES"] = json.dumps(
+        {f"test-agent-{role}": role for role in (
+            "customer_service", "sales", "cfo", "legal", "product",
+            "research", "marketing", "hr", "personal", "coordinator")})
 
 from opc_workbench import app, config, db, llm_client, cas, visibility  # noqa: E402
 
@@ -85,10 +95,7 @@ def isolated_env(request, tmp_path, monkeypatch):
     monkeypatch.setattr(config, "LOG_DIR", tmp_path / "logs")
     monkeypatch.setattr(config, "BACKUP_DIR", tmp_path / "backups")
     monkeypatch.setattr(config, "DASHSCOPE_API_KEY", "")  # 默认无 Key，防真客户端
-    # M5-a B2：可信 Agent 注册表由框架预置（测试用固定 id 前缀）；
-    # 生产默认空表，普通调用方无法自行注册角色。
-    monkeypatch.setattr(config, "AGENT_ROLES",
-                        {f"test-agent-{role}": role for role in config.ROLES})
+    # M5-a B2：角色快照已在导入期固化（见文件头部）；生产默认空快照。
 
     fake = FakeLLM()
     llm_client.set_llm(fake)
@@ -341,3 +348,39 @@ def gated_embedder_cls():
             return self.inner.embed(texts, deadline=deadline)
 
     return GatedEmbedder
+
+
+class OwnerAdapter:
+    """主窗口适配器替身：只接收框架注入的提交端口，不接触任何身份对象。"""
+
+    def __init__(self):
+        self.submit = None
+
+    def bind(self, submit):
+        self.submit = submit
+
+
+def _call_as_entry_point(adapter):
+    """以 `__main__` 身份调用 app.main(adapter)，模拟真实进程入口。"""
+    g = {"__name__": "__main__", "adapter": adapter}
+    exec(compile("from opc_workbench import app\n"
+                 "result = app.main(adapter)\n", "<entry>", "exec"), g)
+    return g["result"]
+
+
+@pytest.fixture()
+def owner_entry(isolated_env):
+    """可信入口工厂：(application, submit_port) 成对返回，测试结束自动关停。"""
+    opened = []
+
+    def run():
+        adapter = OwnerAdapter()
+        application = _call_as_entry_point(adapter)
+        assert adapter.submit is not None, "主聊天提交端口未注入"
+        opened.append(application)
+        return application, adapter.submit
+
+    yield run
+    for application in opened:
+        application.close()
+
